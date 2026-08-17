@@ -159,11 +159,12 @@ impl SerialConnection {
 
         let frame_timeout = config.frame_timeout;
         let path = config.path.clone();
-        let shutdown = Arc::clone(&config.shutdown);
         let log_service = config.log_service.clone();
         let read_path = path.clone();
         let write_path = path.clone();
         let writer_log = log_service.clone();
+        let read_shutdown = Arc::clone(&config.shutdown);
+        let write_shutdown = Arc::clone(&config.shutdown);
 
         // 后台读线程：异步读取字节 → 剥离前导 → 拆帧 → 送入队列
         tokio::spawn(async move {
@@ -172,7 +173,7 @@ impl SerialConnection {
             let mut last_byte_at = std::time::Instant::now();
 
             loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if read_shutdown.load(Ordering::Relaxed) {
                     info!("[Serial({})] Reader task stopped", read_path);
                     break;
                 }
@@ -209,66 +210,93 @@ impl SerialConnection {
 
         // 后台写线程：单独处理所有应答输出，避免读线程长时间持锁导致写线程阻塞
         tokio::spawn(async move {
-            while let Some(response) = write_rx.recv().await {
-                let write_total_start = std::time::Instant::now();
-                info!(
-                    "[Serial({})] TX begin: response_len={}, first_bytes={:02X?}",
-                    write_path,
-                    response.len(),
-                    &response[..response.len().min(16)]
-                );
+            let shutdown_probe = || async {
+                loop {
+                    if write_shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
 
-                match write_half.write_all(&response).await {
-                    Ok(_) => {
+            loop {
+                if write_shutdown.load(Ordering::Relaxed) {
+                    info!("[Serial({})] Writer task stopped by shutdown", write_path);
+                    break;
+                }
+
+                tokio::select! {
+                    _ = shutdown_probe() => {
+                        info!("[Serial({})] Writer task stopped by shutdown", write_path);
+                        break;
+                    }
+                    response = write_rx.recv() => {
+                        let Some(response) = response else {
+                            info!("[Serial({})] Writer task stopped: channel closed", write_path);
+                            break;
+                        };
+
+                        let write_total_start = std::time::Instant::now();
                         info!(
-                            "[Serial({})] TX write_all completed: response_len={}, write_elapsed={:?}",
+                            "[Serial({})] TX begin: response_len={}, first_bytes={:02X?}",
+                            write_path,
+                            response.len(),
+                            &response[..response.len().min(16)]
+                        );
+
+                        match write_half.write_all(&response).await {
+                            Ok(_) => {
+                                info!(
+                                    "[Serial({})] TX write_all completed: response_len={}, write_elapsed={:?}",
+                                    write_path,
+                                    response.len(),
+                                    write_total_start.elapsed()
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[Serial({})] TX write_all failed: response_len={}, elapsed={:?}, error={}",
+                                    write_path,
+                                    response.len(),
+                                    write_total_start.elapsed(),
+                                    e
+                                );
+                                break;
+                            }
+                        }
+
+                        match write_half.flush().await {
+                            Ok(_) => {
+                                info!(
+                                    "[Serial({})] TX flush completed: response_len={}, total_tx_elapsed={:?}",
+                                    write_path,
+                                    response.len(),
+                                    write_total_start.elapsed()
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "[Serial({})] TX flush failed: response_len={}, total_tx_elapsed={:?}, error={}",
+                                    write_path,
+                                    response.len(),
+                                    write_total_start.elapsed(),
+                                    e
+                                );
+                                break;
+                            }
+                        }
+
+                        if let Some(log) = &writer_log {
+                            log.record("TX", &write_path, &response);
+                        }
+                        info!(
+                            "[Serial({})] TX response fully sent: len={}, total_tx_elapsed={:?}",
                             write_path,
                             response.len(),
                             write_total_start.elapsed()
                         );
                     }
-                    Err(e) => {
-                        error!(
-                            "[Serial({})] TX write_all failed: response_len={}, elapsed={:?}, error={}",
-                            write_path,
-                            response.len(),
-                            write_total_start.elapsed(),
-                            e
-                        );
-                        break;
-                    }
                 }
-
-                match write_half.flush().await {
-                    Ok(_) => {
-                        info!(
-                            "[Serial({})] TX flush completed: response_len={}, total_tx_elapsed={:?}",
-                            write_path,
-                            response.len(),
-                            write_total_start.elapsed()
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "[Serial({})] TX flush failed: response_len={}, total_tx_elapsed={:?}, error={}",
-                            write_path,
-                            response.len(),
-                            write_total_start.elapsed(),
-                            e
-                        );
-                        break;
-                    }
-                }
-
-                if let Some(log) = &writer_log {
-                    log.record("TX", &write_path, &response);
-                }
-                info!(
-                    "[Serial({})] TX response fully sent: len={}, total_tx_elapsed={:?}",
-                    write_path,
-                    response.len(),
-                    write_total_start.elapsed()
-                );
             }
         });
 

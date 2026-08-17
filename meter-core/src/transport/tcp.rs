@@ -126,12 +126,15 @@ impl TcpConnection {
         let read_log = log_service.clone();
         let write_log = log_service.clone();
 
+        let read_shutdown = Arc::clone(&config.shutdown);
+        let write_shutdown = Arc::clone(&config.shutdown);
+
         tokio::spawn(async move {
             let mut buffer = Vec::with_capacity(4096);
             let mut read_half = read_half;
 
             loop {
-                if shutdown.load(Ordering::Relaxed) {
+                if read_shutdown.load(Ordering::Relaxed) {
                     info!("[{}] Connection closed", read_desc);
                     break;
                 }
@@ -176,34 +179,73 @@ impl TcpConnection {
         });
 
         tokio::spawn(async move {
-            while let Some(response) = write_rx.recv().await {
-                let write_total_start = std::time::Instant::now();
-                info!(
-                    "[{}] TX begin: response_len={}, first_bytes={:02X?}",
-                    write_desc,
-                    response.len(),
-                    &response[..response.len().min(16)]
-                );
-
-                if let Err(e) = write_half.write_all(&response).await {
-                    error!("[{}] Failed to send response: {}", write_desc, e);
+            loop {
+                if write_shutdown.load(Ordering::Relaxed) {
+                    info!("[{}] Writer task stopped by shutdown", write_desc);
                     break;
                 }
 
-                if let Err(e) = write_half.flush().await {
-                    error!("[{}] Failed to flush response: {}", write_desc, e);
-                    break;
-                }
+                tokio::select! {
+                    _ = async {
+                        loop {
+                            if write_shutdown.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    } => {
+                        info!("[{}] Writer task stopped by shutdown", write_desc);
+                        break;
+                    }
+                    response = write_rx.recv() => {
+                        let Some(response) = response else {
+                            info!("[{}] Writer task stopped: channel closed", write_desc);
+                            break;
+                        };
 
-                if let Some(log) = &write_log {
-                    log.record("TX", &write_desc, &response);
+                        let write_total_start = std::time::Instant::now();
+                        info!(
+                            "[{}] TX begin: response_len={}, first_bytes={:02X?}",
+                            write_desc,
+                            response.len(),
+                            &response[..response.len().min(16)]
+                        );
+
+                        if let Err(e) = write_half.write_all(&response).await {
+                            error!("[{}] Failed to send response: {}", write_desc, e);
+                            break;
+                        }
+
+                        info!(
+                            "[{}] TX write_all completed: response_len={}, write_elapsed={:?}",
+                            write_desc,
+                            response.len(),
+                            write_total_start.elapsed()
+                        );
+
+                        if let Err(e) = write_half.flush().await {
+                            error!("[{}] Failed to flush response: {}", write_desc, e);
+                            break;
+                        }
+
+                        info!(
+                            "[{}] TX flush completed: response_len={}, total_tx_elapsed={:?}",
+                            write_desc,
+                            response.len(),
+                            write_total_start.elapsed()
+                        );
+
+                        if let Some(log) = &write_log {
+                            log.record("TX", &write_desc, &response);
+                        }
+                        info!(
+                            "[{}] TX response fully sent: len={}, total_tx_elapsed={:?}",
+                            write_desc,
+                            response.len(),
+                            write_total_start.elapsed()
+                        );
+                    }
                 }
-                info!(
-                    "[{}] TX response fully sent: len={}, total_tx_elapsed={:?}",
-                    write_desc,
-                    response.len(),
-                    write_total_start.elapsed()
-                );
             }
         });
 
@@ -230,10 +272,18 @@ impl TcpConnection {
 impl FrameSource for TcpConnection {
     async fn next_frame(&mut self) -> Option<RawFrame> {
         let bytes = self.frame_rx.recv().await?;
+        let rx_start = std::time::Instant::now();
         debug!(
             "[{}] Extracted frame: {} bytes",
             self.description,
             bytes.len()
+        );
+        info!(
+            "[{}] RX frame accepted: len={}, first_bytes={:02X?}, elapsed_after_read={:?}",
+            self.description,
+            bytes.len(),
+            &bytes[..bytes.len().min(16)],
+            rx_start.elapsed()
         );
 
         Some(RawFrame {
