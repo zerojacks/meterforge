@@ -12,7 +12,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -54,31 +53,165 @@ impl Default for TcpChannelConfig {
 
 /// TCP 连接处理器
 pub struct TcpConnection {
-    /// TCP 流（用Arc<Mutex>包装以支持响应写入）
-    stream: Arc<Mutex<TcpStream>>,
-
     /// 连接描述
     description: String,
 
-    /// 配置
-    config: TcpChannelConfig,
-
-    /// 读缓冲区
-    buffer: Vec<u8>,
-
     /// 连接 ID
     conn_id: u64,
+
+    /// 读线程提取出的完整帧队列
+    frame_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+
+    /// 全局写通道：所有响应都通过它发送给后台 writer
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+fn extract_tcp_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    // 查找起始符 68H
+    let start_pos = buffer.iter().position(|&b| b == 0x68)?;
+
+    // 确保至少有 12 字节（最小帧长度）
+    if buffer.len() < start_pos + 12 {
+        return None;
+    }
+
+    // 检查第二个 68H（位置 7）
+    if start_pos + 7 < buffer.len() && buffer[start_pos + 7] != 0x68 {
+        buffer.drain(0..=start_pos);
+        return extract_tcp_frame(buffer);
+    }
+
+    // 确保有第二个 68H
+    if buffer.len() < start_pos + 8 {
+        return None;
+    }
+
+    // 提取数据域长度 L（位置 9）
+    if buffer.len() < start_pos + 10 {
+        return None;
+    }
+
+    let data_len = buffer[start_pos + 9] as usize;
+    let frame_len = 12 + data_len;
+
+    // 检查是否有完整帧
+    if buffer.len() < start_pos + frame_len {
+        return None;
+    }
+
+    // 检查结束符 16H
+    if buffer[start_pos + frame_len - 1] != 0x16 {
+        buffer.drain(0..=start_pos);
+        return extract_tcp_frame(buffer);
+    }
+
+    let frame_bytes = buffer.drain(start_pos..start_pos + frame_len).collect();
+    Some(frame_bytes)
 }
 
 impl TcpConnection {
     /// 创建新的 TCP 连接处理器（从已建立的流）
     pub fn new(stream: TcpStream, peer_addr: String, config: TcpChannelConfig) -> Self {
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        let description = format!("TCP({})", peer_addr);
+        let read_desc = description.clone();
+        let write_desc = description.clone();
+        let read_buffer_size = config.read_buffer_size;
+        let frame_timeout = config.frame_timeout;
+        let shutdown = Arc::clone(&config.shutdown);
+        let log_service = config.log_service.clone();
+        let read_log = log_service.clone();
+        let write_log = log_service.clone();
+
+        tokio::spawn(async move {
+            let mut buffer = Vec::with_capacity(4096);
+            let mut read_half = read_half;
+
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("[{}] Connection closed", read_desc);
+                    break;
+                }
+
+                let mut temp_buf = vec![0u8; read_buffer_size];
+                match timeout(frame_timeout, read_half.read(&mut temp_buf)).await {
+                    Ok(Ok(0)) => {
+                        info!("[{}] Connection closed", read_desc);
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        buffer.extend_from_slice(&temp_buf[0..n]);
+                        while let Some(frame) = extract_tcp_frame(&mut buffer) {
+                            if let Some(log) = &read_log {
+                                log.record("RX", &read_desc, &frame);
+                            }
+                            debug!("[{}] Extracted frame: {} bytes", read_desc, frame.len());
+                            if frame_tx.send(frame).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        error!("[{}] Read error: {}", read_desc, e);
+                        break;
+                    }
+                    Err(_) => {
+                        if !buffer.is_empty() {
+                            warn!(
+                                "[{}] Frame timeout with {} bytes in buffer, discarding",
+                                read_desc,
+                                buffer.len()
+                            );
+                            buffer.clear();
+                        }
+                    }
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            while let Some(response) = write_rx.recv().await {
+                let write_total_start = std::time::Instant::now();
+                info!(
+                    "[{}] TX begin: response_len={}, first_bytes={:02X?}",
+                    write_desc,
+                    response.len(),
+                    &response[..response.len().min(16)]
+                );
+
+                if let Err(e) = write_half.write_all(&response).await {
+                    error!("[{}] Failed to send response: {}", write_desc, e);
+                    break;
+                }
+
+                if let Err(e) = write_half.flush().await {
+                    error!("[{}] Failed to flush response: {}", write_desc, e);
+                    break;
+                }
+
+                if let Some(log) = &write_log {
+                    log.record("TX", &write_desc, &response);
+                }
+                info!(
+                    "[{}] TX response fully sent: len={}, total_tx_elapsed={:?}",
+                    write_desc,
+                    response.len(),
+                    write_total_start.elapsed()
+                );
+            }
+        });
+
         Self {
-            stream: Arc::new(Mutex::new(stream)),
-            description: format!("TCP({})", peer_addr),
-            config,
-            buffer: Vec::with_capacity(4096),
+            description,
             conn_id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
+            frame_rx,
+            write_tx,
         }
     }
 
@@ -91,169 +224,23 @@ impl TcpConnection {
             })??;
         Ok(Self::new(stream, addr, config))
     }
-
-    /// 从缓冲区中提取一个完整帧
-    ///
-    /// DL/T 645-2007 帧格式：68H A0~A5 68H C L DATA CS 16H
-    /// 最小长度：12 字节
-    fn extract_frame(&mut self) -> Option<Vec<u8>> {
-        // 查找起始符 68H
-        let start_pos = self.buffer.iter().position(|&b| b == 0x68)?;
-
-        // 确保至少有 12 字节（最小帧长度）
-        if self.buffer.len() < start_pos + 12 {
-            return None;
-        }
-
-        // 检查第二个 68H（位置 7）
-        if start_pos + 7 < self.buffer.len() && self.buffer[start_pos + 7] != 0x68 {
-            // 不是有效帧，丢弃第一个 68H 继续查找
-            self.buffer.drain(0..=start_pos);
-            return self.extract_frame();
-        }
-
-        // 确保有第二个 68H
-        if self.buffer.len() < start_pos + 8 {
-            return None;
-        }
-
-        // 提取数据域长度 L（位置 9）
-        if self.buffer.len() < start_pos + 10 {
-            return None;
-        }
-
-        let data_len = self.buffer[start_pos + 9] as usize;
-
-        // 计算完整帧长度
-        // 68H(1) + ADDR(6) + 68H(1) + C(1) + L(1) + DATA(data_len) + CS(1) + 16H(1)
-        let frame_len = 12 + data_len;
-
-        // 检查是否有完整帧
-        if self.buffer.len() < start_pos + frame_len {
-            return None;
-        }
-
-        // 检查结束符 16H
-        if self.buffer[start_pos + frame_len - 1] != 0x16 {
-            // 不是有效帧，丢弃到第一个 68H 之后继续查找
-            self.buffer.drain(0..=start_pos);
-            return self.extract_frame();
-        }
-
-        // 提取完整帧
-        let frame_bytes = self
-            .buffer
-            .drain(start_pos..start_pos + frame_len)
-            .collect();
-
-        Some(frame_bytes)
-    }
-
-    /// 读取并提取帧
-    async fn read_frame(&mut self) -> std::io::Result<Option<Vec<u8>>> {
-        loop {
-            if self.config.shutdown.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            // 先尝试从缓冲区提取
-            if let Some(frame) = self.extract_frame() {
-                return Ok(Some(frame));
-            }
-
-            // 缓冲区没有完整帧，读取更多数据
-            let mut temp_buf = vec![0u8; self.config.read_buffer_size];
-
-            let read_result = {
-                let mut stream = self.stream.lock().await;
-                timeout(self.config.frame_timeout, stream.read(&mut temp_buf)).await
-            };
-
-            match read_result {
-                Ok(Ok(0)) => {
-                    // 连接关闭
-                    return Ok(None);
-                }
-                Ok(Ok(n)) => {
-                    // 读取到数据
-                    self.buffer.extend_from_slice(&temp_buf[0..n]);
-                    debug!(
-                        "[{}] Read {} bytes, buffer size: {}",
-                        self.description,
-                        n,
-                        self.buffer.len()
-                    );
-                }
-                Ok(Err(e)) => {
-                    // 读取错误
-                    return Err(e);
-                }
-                Err(_) => {
-                    // 超时，检查是否有部分数据
-                    if !self.buffer.is_empty() {
-                        warn!(
-                            "[{}] Frame timeout with {} bytes in buffer, discarding",
-                            self.description,
-                            self.buffer.len()
-                        );
-                        self.buffer.clear();
-                    }
-                    // 继续等待下一个帧
-                    continue;
-                }
-            }
-        }
-    }
 }
 
 #[async_trait::async_trait]
 impl FrameSource for TcpConnection {
     async fn next_frame(&mut self) -> Option<RawFrame> {
-        match self.read_frame().await {
-            Ok(Some(bytes)) => {
-                debug!(
-                    "[{}] Extracted frame: {} bytes",
-                    self.description,
-                    bytes.len()
-                );
-                if let Some(log) = &self.config.log_service {
-                    log.record("RX", &self.description, &bytes);
-                }
+        let bytes = self.frame_rx.recv().await?;
+        debug!(
+            "[{}] Extracted frame: {} bytes",
+            self.description,
+            bytes.len()
+        );
 
-                // 创建回复通道（mpsc：支持通配多表应答与续传多片段），后台逐个写回 socket
-                let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-                let stream_clone = Arc::clone(&self.stream);
-                let desc = self.description.clone();
-                let log_service = self.config.log_service.clone();
-                tokio::spawn(async move {
-                    while let Some(response) = reply_rx.recv().await {
-                        let mut stream = stream_clone.lock().await;
-                        if let Err(e) = stream.write_all(&response).await {
-                            error!("[{}] Failed to send response: {}", desc, e);
-                            break;
-                        }
-                        let _ = stream.flush().await;
-                        if let Some(log) = &log_service {
-                            log.record("TX", &desc, &response);
-                        }
-                        debug!("[{}] Response sent: {} bytes", desc, response.len());
-                    }
-                });
-
-                Some(RawFrame {
-                    conn_id: self.conn_id,
-                    bytes,
-                    reply_channel: reply_tx,
-                })
-            }
-            Ok(None) => {
-                info!("[{}] Connection closed", self.description);
-                None
-            }
-            Err(e) => {
-                error!("[{}] Read error: {}", self.description, e);
-                None
-            }
-        }
+        Some(RawFrame {
+            conn_id: self.conn_id,
+            bytes,
+            reply_channel: self.write_tx.clone(),
+        })
     }
 
     fn description(&self) -> String {

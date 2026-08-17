@@ -8,12 +8,12 @@
 
 use super::{FrameSource, RawFrame};
 use crate::communication_log::CommunicationLogService;
-use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, error, info, warn};
 
 /// 全局串口连接 ID 计数器
@@ -129,9 +129,6 @@ impl FrameExtractor {
 
 /// 串口连接（实现 FrameSource）
 pub struct SerialConnection {
-    /// 串口（Arc<Mutex> 包装以支持后台线程读 + 响应写）
-    port: Arc<Mutex<Box<dyn serialport::SerialPort>>>,
-
     /// 连接描述
     description: String,
 
@@ -140,81 +137,147 @@ pub struct SerialConnection {
 
     /// 读线程提取出的完整帧队列
     frame_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+
+    /// 全局写通道：所有响应都通过它发送给后台 writer
+    write_tx: mpsc::UnboundedSender<Vec<u8>>,
     log_service: Option<CommunicationLogService>,
 }
 
 impl SerialConnection {
     /// 打开串口并启动后台读线程
     pub fn open(config: SerialChannelConfig) -> Result<Self, String> {
-        let port = serialport::new(&config.path, config.baud_rate)
+        let port = tokio_serial::new(&config.path, config.baud_rate)
             .data_bits(config.data_bits)
             .parity(config.parity)
             .stop_bits(config.stop_bits)
-            .timeout(Duration::from_millis(50))
-            .open()
+            .open_native_async()
             .map_err(|e| format!("Failed to open serial port {}: {}", config.path, e))?;
 
-        let port = Arc::new(Mutex::new(port));
+        let (mut read_half, mut write_half) = tokio::io::split(port);
         let (frame_tx, frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        // 后台读线程：读字节 → 剥离前导 → 拆帧 → 送入队列
-        let port_clone = Arc::clone(&port);
         let frame_timeout = config.frame_timeout;
         let path = config.path.clone();
         let shutdown = Arc::clone(&config.shutdown);
-        std::thread::spawn(move || {
+        let log_service = config.log_service.clone();
+        let read_path = path.clone();
+        let write_path = path.clone();
+        let writer_log = log_service.clone();
+
+        // 后台读线程：异步读取字节 → 剥离前导 → 拆帧 → 送入队列
+        tokio::spawn(async move {
             let mut extractor = FrameExtractor::new();
             let mut buf = [0u8; 512];
             let mut last_byte_at = std::time::Instant::now();
 
-            while !shutdown.load(Ordering::Relaxed) {
-                let mut port = match port_clone.lock() {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
+            loop {
+                if shutdown.load(Ordering::Relaxed) {
+                    info!("[Serial({})] Reader task stopped", read_path);
+                    break;
+                }
 
-                match port.read(&mut buf) {
-                    Ok(0) => {
-                        drop(port);
-                        std::thread::sleep(Duration::from_millis(10));
+                match tokio::time::timeout(Duration::from_millis(50), read_half.read(&mut buf)).await {
+                    Ok(Ok(0)) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    Ok(n) => {
+                    Ok(Ok(n)) => {
                         last_byte_at = std::time::Instant::now();
-                        drop(port);
                         for frame in extractor.push_and_extract(&buf[..n]) {
                             if frame_tx.send(frame).is_err() {
-                                return; // 接收端已关闭
+                                return;
                             }
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                        drop(port);
-                        // 帧间超时：丢弃残留的半帧
+                    Ok(Err(e)) => {
+                        error!("[Serial({})] Read error: {}", read_path, e);
+                        break;
+                    }
+                    Err(_) => {
                         if !extractor.is_empty() && last_byte_at.elapsed() > frame_timeout {
                             warn!(
                                 "[Serial({})] Frame timeout, discarding {} pending bytes",
-                                path,
+                                read_path,
                                 extractor.pending()
                             );
                             extractor.clear();
                         }
                     }
+                }
+            }
+        });
+
+        // 后台写线程：单独处理所有应答输出，避免读线程长时间持锁导致写线程阻塞
+        tokio::spawn(async move {
+            while let Some(response) = write_rx.recv().await {
+                let write_total_start = std::time::Instant::now();
+                info!(
+                    "[Serial({})] TX begin: response_len={}, first_bytes={:02X?}",
+                    write_path,
+                    response.len(),
+                    &response[..response.len().min(16)]
+                );
+
+                match write_half.write_all(&response).await {
+                    Ok(_) => {
+                        info!(
+                            "[Serial({})] TX write_all completed: response_len={}, write_elapsed={:?}",
+                            write_path,
+                            response.len(),
+                            write_total_start.elapsed()
+                        );
+                    }
                     Err(e) => {
-                        error!("[Serial({})] Read error: {}", path, e);
+                        error!(
+                            "[Serial({})] TX write_all failed: response_len={}, elapsed={:?}, error={}",
+                            write_path,
+                            response.len(),
+                            write_total_start.elapsed(),
+                            e
+                        );
                         break;
                     }
                 }
-            }
 
-            info!("[Serial({})] Reader thread stopped", path);
+                match write_half.flush().await {
+                    Ok(_) => {
+                        info!(
+                            "[Serial({})] TX flush completed: response_len={}, total_tx_elapsed={:?}",
+                            write_path,
+                            response.len(),
+                            write_total_start.elapsed()
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "[Serial({})] TX flush failed: response_len={}, total_tx_elapsed={:?}, error={}",
+                            write_path,
+                            response.len(),
+                            write_total_start.elapsed(),
+                            e
+                        );
+                        break;
+                    }
+                }
+
+                if let Some(log) = &writer_log {
+                    log.record("TX", &write_path, &response);
+                }
+                info!(
+                    "[Serial({})] TX response fully sent: len={}, total_tx_elapsed={:?}",
+                    write_path,
+                    response.len(),
+                    write_total_start.elapsed()
+                );
+            }
         });
 
         Ok(Self {
-            port,
             description: format!("Serial({})", config.path),
             conn_id: NEXT_SERIAL_CONN_ID.fetch_add(1, Ordering::Relaxed),
             frame_rx,
-            log_service: config.log_service,
+            write_tx,
+            log_service,
         })
     }
 }
@@ -241,118 +304,10 @@ impl FrameSource for SerialConnection {
             rx_start.elapsed()
         );
 
-        // 创建回复通道（mpsc），后台逐个写回串口
-        let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let port = Arc::clone(&self.port);
-        let desc = self.description.clone();
-        let log_service = self.log_service.clone();
-        tokio::spawn(async move {
-            while let Some(response) = reply_rx.recv().await {
-                let write_total_start = std::time::Instant::now();
-                let lock_start = std::time::Instant::now();
-                info!(
-                    "[{}] TX begin: response_len={}, before_lock_elapsed={:?}, first_bytes={:02X?}",
-                    desc,
-                    response.len(),
-                    lock_start.elapsed(),
-                    &response[..response.len().min(16)]
-                );
-
-                let mut port = match port.lock() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        error!(
-                            "[{}] TX aborted: failed to acquire serial port lock after {:?}",
-                            desc,
-                            lock_start.elapsed()
-                        );
-                        break;
-                    }
-                };
-
-                let lock_elapsed = lock_start.elapsed();
-                info!(
-                    "[{}] TX lock acquired: response_len={}, lock_elapsed={:?}",
-                    desc,
-                    response.len(),
-                    lock_elapsed
-                );
-
-                let write_start = std::time::Instant::now();
-                let write_result = port.write_all(&response);
-                let write_elapsed = write_start.elapsed();
-                match write_result {
-                    Ok(_) => {
-                        info!(
-                            "[{}] TX write_all completed: response_len={}, write_elapsed={:?}",
-                            desc,
-                            response.len(),
-                            write_elapsed
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "[{}] TX write_all failed: response_len={}, write_elapsed={:?}, error={}",
-                            desc,
-                            response.len(),
-                            write_elapsed,
-                            e
-                        );
-                        break;
-                    }
-                }
-
-                let flush_start = std::time::Instant::now();
-                let flush_result = port.flush();
-                let flush_elapsed = flush_start.elapsed();
-                match flush_result {
-                    Ok(_) => {
-                        info!(
-                            "[{}] TX flush completed: response_len={}, flush_elapsed={:?}, total_tx_elapsed={:?}",
-                            desc,
-                            response.len(),
-                            flush_elapsed,
-                            write_total_start.elapsed()
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "[{}] TX flush failed: response_len={}, flush_elapsed={:?}, total_tx_elapsed={:?}, error={}",
-                            desc,
-                            response.len(),
-                            flush_elapsed,
-                            write_total_start.elapsed(),
-                            e
-                        );
-                        break;
-                    }
-                }
-
-                if let Some(log) = &log_service {
-                    log.record("TX", &desc, &response);
-                }
-                debug!(
-                    "[{}] Response sent: {} bytes in {:?}",
-                    desc,
-                    response.len(),
-                    write_total_start.elapsed()
-                );
-                info!(
-                    "[{}] TX response fully sent: len={}, total_tx_elapsed={:?}, lock_elapsed={:?}, write_elapsed={:?}, flush_elapsed={:?}",
-                    desc,
-                    response.len(),
-                    write_total_start.elapsed(),
-                    lock_elapsed,
-                    write_elapsed,
-                    flush_elapsed
-                );
-            }
-        });
-
         Some(RawFrame {
             conn_id: self.conn_id,
             bytes,
-            reply_channel: reply_tx,
+            reply_channel: self.write_tx.clone(),
         })
     }
 

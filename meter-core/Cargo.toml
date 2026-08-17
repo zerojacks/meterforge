@@ -19,6 +19,7 @@ async-trait = "0.1"
 
 # 串口（RS485 总线仿真）
 serialport = "4"
+tokio-serial = "5.0"
 
 # SQLite persistence
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "json", "chrono", "migrate"] }
