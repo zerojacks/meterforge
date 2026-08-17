@@ -1,0 +1,286 @@
+// 表A.6 冻结数据读取（DI3=05）
+
+use chrono::{Datelike, Timelike};
+
+use super::encoding::*;
+use super::MeterState;
+use crate::simulation::di_handler::DIHandler;
+
+impl DIHandler {
+    /// 处理冻结数据读取（DI3=05）
+    ///
+    /// 冻结数据格式：05-DI2-DI1-DI0
+    /// - DI2：触发类型
+    /// - DI1：数据类别
+    /// - DI0：快照序号
+    ///
+    /// 读取策略（按设计方案4.6.4节）：
+    /// - DI0=00: 当前数据（实时查询）
+    /// - DI0=01-0C: 内存环形缓冲（定时12次/瞬时3次）
+    /// - DI0>0C: 数据库查询（日冻结62次/月冻结24次）
+    pub(super) fn handle_freeze_data_read(
+        &self,
+        di: [u8; 4],
+        state: &MeterState,
+    ) -> Result<Vec<u8>, String> {
+        use crate::simulation::state::{FreezeDataCategory, FreezeTrigger};
+        use chrono::{Datelike, Timelike};
+
+        // 解析 DI 字段
+        let di0 = di[0]; // 快照序号
+        let di1 = di[1]; // 数据类别
+        let di2 = di[2]; // 触发类型
+
+        // 解析触发类型
+        let trigger = FreezeTrigger::from_di2(di2)
+            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di2))?;
+
+        // DI0=00 表示"当前"数据，直接从 MeterState 当前状态读取
+        if di0 == 0x00 {
+            return self.read_current_freeze_data(di1, state);
+        }
+
+        // 检查是否需要从数据库查询
+        let max_memory_index = trigger.max_history_count();
+
+        if di0 > max_memory_index {
+            // DI0 > 内存容量，需要从数据库查询
+            return Err(format!(
+                "历史冻结数据查询需要数据库支持: trigger={:?}, index={:02X}, max_memory={:02X}. \
+                 请使用异步版本 handle_read_async() 并提供数据库连接池",
+                trigger, di0, max_memory_index
+            ));
+        }
+
+        // DI0=01-0C 表示历史快照，从内存环形缓冲区读取
+        let snapshot = state
+            .get_freeze_snapshot(trigger, di0)
+            .ok_or_else(|| format!("冻结快照不存在: trigger={:?}, index={:02X}", trigger, di0))?;
+
+        // 根据 DI1 返回对应的数据
+        self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time)
+    }
+
+    /// 异步版本：处理冻结数据读取（支持数据库查询）
+    ///
+    /// 此方法应在异步上下文中调用，用于支持 DI0 > 0C 的历史数据查询
+    pub async fn handle_freeze_data_read_async(
+        &self,
+        di: [u8; 4],
+        state: &MeterState,
+        address: &str,
+        db_pool: &sqlx::SqlitePool,
+    ) -> Result<Vec<u8>, String> {
+        use crate::persistence::worker::PersistenceWorker;
+        use crate::simulation::state::FreezeTrigger;
+
+        let di0 = di[0];
+        let di1 = di[1];
+        let di2 = di[2];
+
+        let trigger = FreezeTrigger::from_di2(di2)
+            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di2))?;
+
+        // DI0=00: 当前数据
+        if di0 == 0x00 {
+            return self.read_current_freeze_data(di1, state);
+        }
+
+        let max_memory_index = trigger.max_history_count();
+
+        // DI0 ≤ max_memory_index: 从内存读取
+        if di0 <= max_memory_index {
+            let snapshot = state.get_freeze_snapshot(trigger, di0).ok_or_else(|| {
+                format!("冻结快照不存在: trigger={:?}, index={:02X}", trigger, di0)
+            })?;
+
+            return self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time);
+        }
+
+        // DI0 > max_memory_index: 从数据库查询
+        let snapshot_row =
+            PersistenceWorker::query_freeze_snapshot(db_pool, address, di2, di1, di0)
+                .await
+                .map_err(|e| format!("数据库查询失败: {}", e))?
+                .ok_or_else(|| {
+                    format!(
+                        "数据库中无此冻结快照: trigger={:?}, index={:02X}",
+                        trigger, di0
+                    )
+                })?;
+
+        // 从数据库行解析数据
+        self.encode_freeze_data_from_db_row(di1, &snapshot_row)
+    }
+
+    /// 从数据库行编码冻结数据
+    fn encode_freeze_data_from_db_row(
+        &self,
+        di1: u8,
+        row: &crate::persistence::FreezeSnapshotRow,
+    ) -> Result<Vec<u8>, String> {
+        // 整体反序列化为 FreezeData 后复用与内存快照一致的编码路径；
+        // 旧数据行缺失的字段由 serde default 兜底（值为 0）
+        let freeze_data: crate::simulation::state::FreezeData =
+            serde_json::from_value(row.payload.clone())
+                .map_err(|e| format!("解析冻结快照 payload 失败: {}", e))?;
+        self.encode_freeze_data_item(di1, &freeze_data, &row.snapshot_time)
+    }
+
+    /// 读取"当前"冻结数据（DI0=00）
+    ///
+    /// 当 DI0=00 时，不读取历史快照，而是直接返回当前 MeterState 的实时数据
+    fn read_current_freeze_data(&self, di1: u8, state: &MeterState) -> Result<Vec<u8>, String> {
+        // 当前数据（DI0=00）与历史快照共用同一编码路径
+        let freeze_data = crate::simulation::state::FreezeData::from_meter_state(state);
+        self.encode_freeze_data_item(di1, &freeze_data, &state.virtual_time)
+    }
+
+    /// 编码冻结快照数据项
+    ///
+    /// 根据 DI1 从快照中提取对应的数据并编码。
+    ///
+    /// 电能类（DI1=01~08）按附录A.6输出 总 + 费率1~n（4×(1+n) 字节）；
+    /// 需量类（09/0A）输出 总 + 各费率的（需量3字节 + 发生时间5字节）；
+    /// 变量块（10）输出 8 项 × 3 字节瞬时变量；
+    /// FF 数据块 = 00 + 01~0A 顺序拼接。
+    fn encode_freeze_data_item(
+        &self,
+        di1: u8,
+        freeze_data: &crate::simulation::state::FreezeData,
+        snapshot_time: &chrono::DateTime<chrono::Local>,
+    ) -> Result<Vec<u8>, String> {
+        // 电能项：总 + 各费率
+        let energy_item = |total: f64, rates: &[f64]| -> Vec<u8> {
+            let mut data = encode_bcd_energy(total);
+            for &value in rates {
+                data.extend(encode_bcd_energy(value));
+            }
+            data
+        };
+        // 需量项：总 + 各费率，每项 = 需量(3B XX.XXXX) + 发生时间(5B YYMMDDhhmm)
+        let demand_item = |total: f64,
+                           total_time: &chrono::DateTime<chrono::Local>,
+                           rates: &[(f64, chrono::DateTime<chrono::Local>)]|
+         -> Vec<u8> {
+            let mut data = encode_bcd_power(total);
+            data.extend(encode_freeze_datetime(total_time));
+            for (value, time) in rates {
+                data.extend(encode_bcd_power(*value));
+                data.extend(encode_freeze_datetime(time));
+            }
+            data
+        };
+
+        match di1 {
+            // 00: 冻结时间 YYMMDDWW hh:mm:ss
+            0x00 => {
+                let mut data = encode_datetime(snapshot_time);
+                let weekday = snapshot_time.weekday().num_days_from_sunday() as u8;
+                data.insert(3, to_bcd(weekday));
+                Ok(data)
+            }
+            // 01~04: 正/反向有功、正/反向无功（总+费率）
+            0x01 => Ok(energy_item(
+                freeze_data.forward_active_total,
+                &freeze_data.forward_active_rates,
+            )),
+            0x02 => Ok(energy_item(
+                freeze_data.reverse_active_total,
+                &freeze_data.reverse_active_rates,
+            )),
+            0x03 => Ok(energy_item(
+                freeze_data.forward_reactive_total,
+                &freeze_data.forward_reactive_rates,
+            )),
+            0x04 => Ok(energy_item(
+                freeze_data.reverse_reactive_total,
+                &freeze_data.reverse_reactive_rates,
+            )),
+            // 05~08: 第一~四象限无功（总+费率）
+            0x05 => Ok(energy_item(
+                freeze_data.quadrant1_reactive_total,
+                &freeze_data.quadrant1_reactive_rates,
+            )),
+            0x06 => Ok(energy_item(
+                freeze_data.quadrant2_reactive_total,
+                &freeze_data.quadrant2_reactive_rates,
+            )),
+            0x07 => Ok(energy_item(
+                freeze_data.quadrant3_reactive_total,
+                &freeze_data.quadrant3_reactive_rates,
+            )),
+            0x08 => Ok(energy_item(
+                freeze_data.quadrant4_reactive_total,
+                &freeze_data.quadrant4_reactive_rates,
+            )),
+            // 09: 正向有功最大需量及发生时间（总+费率）
+            0x09 => Ok(demand_item(
+                freeze_data.max_demand_active,
+                &freeze_data.max_demand_active_time,
+                &freeze_data.max_demand_active_rates,
+            )),
+            // 0A: 反向有功最大需量及发生时间（总+费率，复用无功需量数据）
+            0x0A => Ok(demand_item(
+                freeze_data.max_demand_reactive,
+                &freeze_data.max_demand_reactive_time,
+                &freeze_data.max_demand_reactive_rates,
+            )),
+            // 10: 瞬时变量数据块（8项 × 3字节 XX.XXXX）：
+            // A/B/C 相电压、三相电流、有功、无功、功率因数（格式按协议 3×8）
+            0x10 => {
+                let empty3 = || [0.0f64; 3];
+                let voltages = freeze_data.voltages.unwrap_or_else(empty3);
+                let currents = freeze_data.currents.unwrap_or_else(empty3);
+                let mut data = Vec::new();
+                for value in [
+                    voltages[0],
+                    voltages[1],
+                    voltages[2],
+                    currents[0],
+                    currents[1],
+                    currents[2],
+                    freeze_data.active_power.unwrap_or(0.0),
+                    freeze_data.reactive_power.unwrap_or(0.0),
+                ] {
+                    data.extend(encode_bcd_power(value));
+                }
+                Ok(data)
+            }
+            // 15/16/17: A/B/C 相电压（单项）
+            0x15 | 0x16 | 0x17 => {
+                if let Some(voltages) = freeze_data.voltages {
+                    let idx = (di1 - 0x15) as usize;
+                    Ok(encode_bcd_voltage(voltages[idx]))
+                } else {
+                    Err("快照中无电压数据".to_string())
+                }
+            }
+            // FF: 数据块（时间 + 全部电能/需量类别）
+            0xFF => {
+                let mut data = Vec::new();
+                for category in 0x00..=0x0A {
+                    data.extend(self.encode_freeze_data_item(
+                        category,
+                        freeze_data,
+                        snapshot_time,
+                    )?);
+                }
+                Ok(data)
+            }
+            _ => Err(format!("未支持的冻结数据类别: DI1={:02X}", di1)),
+        }
+    }
+}
+
+/// 冻结需量发生时间编码（YYMMDDhhmm，5字节BCD）
+fn encode_freeze_datetime(dt: &chrono::DateTime<chrono::Local>) -> Vec<u8> {
+    use chrono::{Datelike, Timelike};
+    vec![
+        to_bcd((dt.year() % 100) as u8),
+        to_bcd(dt.month() as u8),
+        to_bcd(dt.day() as u8),
+        to_bcd(dt.hour() as u8),
+        to_bcd(dt.minute() as u8),
+    ]
+}

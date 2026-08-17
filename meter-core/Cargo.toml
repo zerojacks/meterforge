@@ -1,0 +1,28 @@
+[package]
+name = "meter-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+async-trait = "0.1"
+
+# 串口（RS485 总线仿真）
+serialport = "4"
+
+# SQLite persistence
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "json", "chrono", "migrate"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"

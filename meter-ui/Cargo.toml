@@ -1,0 +1,40 @@
+[package]
+name = "meter-ui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meter-ui"
+path = "src/main.rs"
+
+[dependencies]
+meter-core = { path = "../meter-core" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+rand.workspace = true
+
+# GPUI
+gpui.workspace = true
+gpui_macros.workspace = true
+gpui_platform.workspace = true
+
+# gpui-component
+gpui-component.workspace = true
+gpui-component-assets.workspace = true
+
+# 并发原语
+parking_lot = "0.12"
+
+# 异步工具
+futures = "0.3"
+smol = "2.0"
+
+# 其他 UI 依赖
+anyhow = "1.0"
