@@ -15,6 +15,7 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use super::types::*;
+use serde_json::{json, Value};
 
 /// 持久化配置
 #[derive(Debug, Clone)]
@@ -45,16 +46,18 @@ pub struct PersistenceWorker {
 }
 
 impl PersistenceWorker {
-    /// 创建新的持久化工作器
-    pub async fn new(
-        config: PersistenceConfig,
-        rx: mpsc::Receiver<PersistRequest>,
-    ) -> Result<Self, sqlx::Error> {
+    /// 创建/打开一个 SqlitePool 并跑完 migration。
+    ///
+    /// 拆成独立函数是为了让调用方（bootstrap 层）能拿到同一个 `SqlitePool`：
+    /// 一份给 `PersistenceWorker` 做批量写，一份（clone，sqlx 的 Pool 内部是 Arc）
+    /// 挂到 `MeterActorConfig::db_pool` 上做低频的 admin 配置直写。
+    /// 两边共用同一个连接池 / 同一份 WAL 配置，避免各起一个 pool 打同一个 db 文件。
+    pub async fn connect_pool(config: &PersistenceConfig) -> Result<SqlitePool, sqlx::Error> {
         // 确保数据目录存在
         if let Some(parent) = Path::new(&config.db_path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
-
+        info!("db {:?}", config.db_path);
         // 创建连接池
         let pool = SqlitePoolOptions::new()
             .max_connections(config.max_connections)
@@ -70,17 +73,42 @@ impl PersistenceWorker {
 
         // 运行数据库迁移
         sqlx::migrate!("./migrations").run(&pool).await?;
+        Self::ensure_meter_schema(&pool).await?;
+
+        info!("PersistenceWorker pool ready: db_path={}", config.db_path);
+
+        Ok(pool)
+    }
+
+    /// 创建新的持久化工作器（内部自建连接池）。
+    ///
+    /// 保留给单元测试 / 独立小工具使用；`meter-ui` 的正式启动路径请改用
+    /// [`PersistenceWorker::with_pool`]，以便和 `MeterActorConfig::db_pool`
+    /// 共用同一个 `SqlitePool`。
+    pub async fn new(
+        config: PersistenceConfig,
+        rx: mpsc::Receiver<PersistRequest>,
+    ) -> Result<Self, sqlx::Error> {
+        let pool = Self::connect_pool(&config).await?;
+        Ok(Self::with_pool(pool, config, rx))
+    }
+
+    /// 用一个已经建好（并已跑过 migration）的 `SqlitePool` 构造持久化工作器。
+    pub fn with_pool(
+        pool: SqlitePool,
+        config: PersistenceConfig,
+        rx: mpsc::Receiver<PersistRequest>,
+    ) -> Self {
+        let batch_max_size = config.batch_max_size; // 保存值，避免移动后使用
 
         info!("PersistenceWorker initialized: db_path={}", config.db_path);
 
-        let batch_max_size = config.batch_max_size; // 保存值，避免移动后使用
-
-        Ok(Self {
+        Self {
             pool,
             config,
             rx,
             buffer: Vec::with_capacity(batch_max_size),
-        })
+        }
     }
 
     /// 启动持久化工作循环
@@ -188,6 +216,13 @@ impl PersistenceWorker {
                 self.write_load_profile_sample_tx(tx, &address, &sample)
                     .await
             }
+
+            PersistRequest::SaveVirtualTime {
+                address,
+                virtual_time,
+                time_scale,
+                simulation_config,
+            } => self.save_virtual_time_tx(tx, &address, virtual_time, time_scale, &simulation_config).await,
         }
     }
 
@@ -491,6 +526,121 @@ impl PersistenceWorker {
         Ok(())
     }
 
+    /// 在事务内保存虚拟时间和配置（用于定期持久化）
+    /// 
+    /// 此函数会更新所有仿真相关的配置参数，但不会覆盖协议相关的配置（如冻结模式、负荷记录模式等）
+    async fn save_virtual_time_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        address: &str,
+        virtual_time: chrono::DateTime<chrono::Local>,
+        time_scale: f64,
+        simulation_config: &crate::simulation::SimulationConfig,
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let virtual_time_ms = virtual_time.timestamp_millis();
+
+        // 转换配置参数
+        let meter_constant = simulation_config.meter_constant as i64;
+        let rated_voltage_mv = (simulation_config.rated_voltage * 1000.0).round() as i64;
+        let rated_current_ma = (simulation_config.rated_current * 1000.0).round() as i64;
+        let demand_period_min = simulation_config.demand_period_minutes as i64;
+        let rated_frequency_hz = simulation_config.rated_frequency;
+        let initial_power_factor = simulation_config.power_factor;
+
+        // 序列化 load_model
+        let profile_val = match simulation_config.load_model.profile {
+            crate::simulation::physics_engine::LoadProfile::Residential => {
+                serde_json::Value::String("Residential".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Industrial => {
+                serde_json::Value::String("Industrial".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Commercial => {
+                serde_json::Value::String("Commercial".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Fixed(f) => serde_json::json!({"Fixed": f}),
+        };
+
+        let load_model_json = serde_json::json!({
+            "profile": profile_val,
+            "voltage_noise_v": simulation_config.load_model.voltage_noise_v,
+            "frequency_noise_hz": simulation_config.load_model.frequency_noise_hz,
+            "power_factor_noise": simulation_config.load_model.power_factor_noise,
+            "power_factor_min": simulation_config.load_model.power_factor_min,
+            "power_factor_max": simulation_config.load_model.power_factor_max,
+            "phase_current_factors": simulation_config.load_model.phase_current_factors,
+        })
+        .to_string();
+
+        // 尝试更新现有记录
+        let result = sqlx::query(
+            r#"
+            UPDATE meters
+            SET meter_constant = ?,
+                rated_voltage_mv = ?,
+                rated_current_ma = ?,
+                demand_period_min = ?,
+                load_model_json = ?,
+                virtual_time_ms = ?,
+                time_scale = ?,
+                rated_frequency_hz = ?,
+                initial_power_factor = ?,
+                updated_at_ms = ?
+            WHERE address = ?
+            "#
+        )
+        .bind(meter_constant)
+        .bind(rated_voltage_mv)
+        .bind(rated_current_ma)
+        .bind(demand_period_min)
+        .bind(&load_model_json)
+        .bind(virtual_time_ms)
+        .bind(time_scale)
+        .bind(rated_frequency_hz)
+        .bind(initial_power_factor)
+        .bind(now_ms)
+        .bind(address)
+        .execute(&mut **tx)
+        .await?;
+
+        // 如果记录不存在，插入新记录（使用默认值）
+        if result.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO meters (
+                    address, meter_constant, rated_voltage_mv, rated_current_ma,
+                    demand_period_min, sliding_window_min, freeze_mode_word, load_record_mode_word,
+                    settlement_days_json, tou_config_json, passwords_json, comm_baud_json, load_model_json,
+                    virtual_time_ms, time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#
+            )
+            .bind(address)
+            .bind(meter_constant)
+            .bind(rated_voltage_mv)
+            .bind(rated_current_ma)
+            .bind(demand_period_min)
+            .bind(0) // sliding_window_min - 默认值
+            .bind(0) // freeze_mode_word - 默认值
+            .bind(0) // load_record_mode_word - 默认值
+            .bind("[]") // settlement_days_json - 默认空数组
+            .bind("{}") // tou_config_json - 默认空对象
+            .bind("{}") // passwords_json - 默认空对象
+            .bind("{}") // comm_baud_json - 默认空对象
+            .bind(load_model_json)
+            .bind(virtual_time_ms)
+            .bind(time_scale)
+            .bind(rated_frequency_hz)
+            .bind(initial_power_factor)
+            .bind(now_ms)
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        Ok(())
+    }
+
     /// 查询冻结快照（供 DIHandler 读取使用）
     pub async fn query_freeze_snapshot(
         pool: &SqlitePool,
@@ -673,10 +823,11 @@ impl PersistenceWorker {
         }
     }
 
-    /// 保存或更新meters表记录
+    /// 保存虚拟时间和时间倍率
     ///
-    /// 用于保存虚拟时钟和配置参数
-    pub async fn save_meter_state(
+    /// 用于快速保存虚拟时钟状态，不更新其他配置字段
+    /// 如需更新完整的仿真配置，请使用 save_simulation_config
+    pub async fn save_virtual_time(
         pool: &SqlitePool,
         address: &str,
         virtual_time: chrono::DateTime<chrono::Local>,
@@ -685,41 +836,519 @@ impl PersistenceWorker {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let virtual_time_ms = virtual_time.timestamp_millis();
 
-        // 简化版本：只保存最小必要字段，其他字段使用默认值
+        // 只更新虚拟时间和时间倍率，不覆盖其他配置字段
         sqlx::query(
             r#"
-            INSERT INTO meters (
-                address, meter_constant, rated_voltage_mv, rated_current_ma,
-                demand_period_min, sliding_window_min, freeze_mode_word, load_record_mode_word,
-                settlement_days_json, tou_config_json, passwords_json, comm_baud_json, load_model_json,
-                virtual_time_ms, time_scale, updated_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(address)
-            DO UPDATE SET
-                virtual_time_ms = excluded.virtual_time_ms,
-                time_scale = excluded.time_scale,
-                updated_at_ms = excluded.updated_at_ms
+            UPDATE meters
+            SET virtual_time_ms = ?,
+                time_scale = ?,
+                updated_at_ms = ?
+            WHERE address = ?
             "#
         )
-        .bind(address)
-        .bind(1600)  // meter_constant: 1600 imp/kWh (默认值)
-        .bind(220000)  // rated_voltage_mv: 220V
-        .bind(5000)    // rated_current_ma: 5A
-        .bind(15)      // demand_period_min: 15分钟
-        .bind(0)       // sliding_window_min: 0（无滑差）
-        .bind(0)       // freeze_mode_word: 默认不启用
-        .bind(0)       // load_record_mode_word: 默认不启用
-        .bind("[]")    // settlement_days_json
-        .bind("{}")    // tou_config_json
-        .bind("{}")    // passwords_json
-        .bind("{}")    // comm_baud_json
-        .bind("{}")    // load_model_json
         .bind(virtual_time_ms)
         .bind(time_scale)
         .bind(now_ms)
+        .bind(address)
         .execute(pool)
         .await?;
 
         Ok(())
     }
+
+    /// 确保 `meters` 表包含协议参数字段（兼容历史库）
+    async fn ensure_meter_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+        let rows = sqlx::query("PRAGMA table_info(meters)")
+            .fetch_all(pool)
+            .await?;
+
+        let mut names = std::collections::HashSet::new();
+        for row in rows {
+            let name: String = row.get("name");
+            names.insert(name);
+        }
+
+        for (column, default) in [("rated_frequency_hz", "50.0"), ("initial_power_factor", "0.95")] {
+            if !names.contains(column) {
+                let sql = format!(
+                    "ALTER TABLE meters ADD COLUMN {} REAL NOT NULL DEFAULT {}",
+                    column, default
+                );
+                sqlx::query(&sql).execute(pool).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 确保 `meters` 表存在该地址的默认行（INSERT OR IGNORE）
+    /// 
+    /// 使用的默认值：
+    /// - meter_constant: 1600 (脉冲常数)
+    /// - rated_voltage: 220V
+    /// - rated_current: 5A
+    /// - demand_period: 15min
+    /// - rated_frequency: 50Hz
+    /// - initial_power_factor: 0.95
+    /// 
+    /// 注意：这些默认值仅在首次创建记录时使用，后续会通过 save_simulation_config 等函数更新
+    async fn ensure_meter_row(pool: &SqlitePool, address: &str) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO meters (
+                address, meter_constant, rated_voltage_mv, rated_current_ma,
+                demand_period_min, sliding_window_min, freeze_mode_word, load_record_mode_word,
+                settlement_days_json, tou_config_json, passwords_json, comm_baud_json, load_model_json,
+                virtual_time_ms, time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms
+            ) VALUES (?, 1600, 220000, 5000, 15, 0, 0, 0, '[]', '{}', '{}', '{}', '{}', 0, 1.0, 50.0, 0.95, ?)
+            "#,
+        )
+        .bind(address)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取并规范化 `tou_config_json`（兼容旧版整段 freeze JSON）
+    async fn read_extra_config(pool: &SqlitePool, address: &str) -> Result<Value, sqlx::Error> {
+        let row = sqlx::query("SELECT tou_config_json FROM meters WHERE address = ?")
+            .bind(address)
+            .fetch_optional(pool)
+            .await?;
+
+        let mut root = row
+            .map(|row| {
+                let raw: String = row.get("tou_config_json");
+                serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+            })
+            .unwrap_or_else(|| json!({}));
+
+        if root.get("freeze").is_none() && root.get("timed_mode").is_some() {
+            let legacy = std::mem::take(&mut root);
+            root = json!({ "freeze": legacy });
+        }
+
+        Ok(root)
+    }
+
+    fn parse_load_profile(value: &Value) -> crate::simulation::physics_engine::LoadProfile {
+        use crate::simulation::physics_engine::LoadProfile;
+        match value {
+            Value::String(name) => match name.as_str() {
+                "Industrial" => LoadProfile::Industrial,
+                "Commercial" => LoadProfile::Commercial,
+                "Fixed" => LoadProfile::Fixed(0.5),
+                _ => LoadProfile::Residential,
+            },
+            Value::Object(map) if map.contains_key("Fixed") => {
+                let factor = map
+                    .get("Fixed")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.5);
+                LoadProfile::Fixed(factor)
+            }
+            _ => LoadProfile::Residential,
+        }
+    }
+
+    fn load_model_from_json(raw: &str) -> crate::simulation::physics_engine::LoadModelConfig {
+        use crate::simulation::physics_engine::LoadModelConfig;
+        let v: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({}));
+        let default = LoadModelConfig::default();
+        let factors: Vec<f64> = v
+            .get("phase_current_factors")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_f64())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut phase = default.phase_current_factors;
+        for (i, value) in factors.into_iter().take(3).enumerate() {
+            phase[i] = value;
+        }
+        LoadModelConfig {
+            profile: v
+                .get("profile")
+                .map(Self::parse_load_profile)
+                .unwrap_or(default.profile),
+            voltage_noise_v: v
+                .get("voltage_noise_v")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default.voltage_noise_v),
+            frequency_noise_hz: v
+                .get("frequency_noise_hz")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default.frequency_noise_hz),
+            power_factor_noise: v
+                .get("power_factor_noise")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default.power_factor_noise),
+            power_factor_min: v
+                .get("power_factor_min")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default.power_factor_min),
+            power_factor_max: v
+                .get("power_factor_max")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(default.power_factor_max),
+            phase_current_factors: phase,
+        }
+    }
+
+    fn simulation_from_row(
+        meter_constant: i64,
+        rated_voltage_mv: i64,
+        rated_current_ma: i64,
+        demand_period_min: i64,
+        time_scale: f64,
+        rated_frequency_hz: f64,
+        initial_power_factor: f64,
+        load_model_json: &str,
+    ) -> crate::simulation::SimulationConfig {
+        use crate::simulation::SimulationConfig;
+        let load_model = Self::load_model_from_json(load_model_json);
+        SimulationConfig {
+            load_model,
+            rated_voltage: rated_voltage_mv as f64 / 1000.0,
+            rated_current: rated_current_ma as f64 / 1000.0,
+            rated_frequency: rated_frequency_hz,
+            power_factor: initial_power_factor,
+            meter_constant: meter_constant.max(1) as u32,
+            demand_period_minutes: demand_period_min.clamp(1, 120) as u16,
+            time_scale,
+        }
+    }
+
+    fn freeze_fields_from_json(freeze: &Value) -> (
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        [u8; 2],
+        [u8; 5],
+        u8,
+        [u8; 5],
+    ) {
+        let u8_at = |key: &str| freeze.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let arr2 = |key: &str| -> [u8; 2] {
+            let a = freeze
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u8))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            [a.first().copied().unwrap_or(0), a.get(1).copied().unwrap_or(0)]
+        };
+        let arr5 = |key: &str| -> [u8; 5] {
+            let a = freeze
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_u64().map(|n| n as u8))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            [
+                a.first().copied().unwrap_or(0),
+                a.get(1).copied().unwrap_or(0),
+                a.get(2).copied().unwrap_or(0),
+                a.get(3).copied().unwrap_or(0),
+                a.get(4).copied().unwrap_or(0),
+            ]
+        };
+        (
+            u8_at("timed_mode"),
+            u8_at("instant_mode"),
+            u8_at("appointment_mode"),
+            u8_at("hourly_mode"),
+            u8_at("daily_mode"),
+            arr2("daily_time"),
+            arr5("hourly_start"),
+            u8_at("hourly_interval_min"),
+            arr5("appointment_time"),
+        )
+    }
+
+    /// 保存或更新仿真/协议相关的表参量
+    pub async fn save_simulation_config(
+        pool: &SqlitePool,
+        address: &str,
+        sim: &crate::simulation::SimulationConfig,
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+
+        let profile_val = match sim.load_model.profile {
+            crate::simulation::physics_engine::LoadProfile::Residential => {
+                Value::String("Residential".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Industrial => {
+                Value::String("Industrial".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Commercial => {
+                Value::String("Commercial".into())
+            }
+            crate::simulation::physics_engine::LoadProfile::Fixed(f) => json!({"Fixed": f}),
+        };
+
+        let load_model_json = json!({
+            "profile": profile_val,
+            "voltage_noise_v": sim.load_model.voltage_noise_v,
+            "frequency_noise_hz": sim.load_model.frequency_noise_hz,
+            "power_factor_noise": sim.load_model.power_factor_noise,
+            "power_factor_min": sim.load_model.power_factor_min,
+            "power_factor_max": sim.load_model.power_factor_max,
+            "phase_current_factors": sim.load_model.phase_current_factors,
+        })
+        .to_string();
+
+        let rated_voltage_mv = (sim.rated_voltage * 1000.0).round() as i64;
+        let rated_current_ma = (sim.rated_current * 1000.0).round() as i64;
+
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            r#"
+            UPDATE meters SET
+                meter_constant = ?,
+                rated_voltage_mv = ?,
+                rated_current_ma = ?,
+                demand_period_min = ?,
+                rated_frequency_hz = ?,
+                initial_power_factor = ?,
+                load_model_json = ?,
+                time_scale = ?,
+                updated_at_ms = ?
+            WHERE address = ?
+            "#,
+        )
+        .bind(sim.meter_constant as i64)
+        .bind(rated_voltage_mv)
+        .bind(rated_current_ma)
+        .bind(sim.demand_period_minutes as i64)
+        .bind(sim.rated_frequency)
+        .bind(sim.power_factor)
+        .bind(load_model_json)
+        .bind(sim.time_scale)
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// 保存或更新结算日到 `meters.settlement_days_json`
+    pub async fn save_settlement_days(
+        pool: &SqlitePool,
+        address: &str,
+        days: [u8; 3],
+        hours: [u8; 3],
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        let settlement_json = json!({"days": days, "hours": hours}).to_string();
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            "UPDATE meters SET settlement_days_json = ?, updated_at_ms = ? WHERE address = ?",
+        )
+        .bind(settlement_json)
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 保存或更新负荷记录配置（模式字 + `tou_config_json.load_record`）
+    pub async fn save_load_record_config(
+        pool: &SqlitePool,
+        address: &str,
+        mode_word: u8,
+        start_time: [u8; 4],
+        intervals: [u16; 6],
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut extra = Self::read_extra_config(pool, address).await?;
+        extra["load_record"] = json!({
+            "start_time": start_time,
+            "intervals": intervals,
+        });
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            r#"
+            UPDATE meters
+            SET load_record_mode_word = ?, tou_config_json = ?, updated_at_ms = ?
+            WHERE address = ?
+            "#,
+        )
+        .bind(mode_word as i64)
+        .bind(extra.to_string())
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 保存或更新冻结配置（`freeze_mode_word` + `tou_config_json.freeze`）
+    pub async fn save_freeze_config(
+        pool: &SqlitePool,
+        address: &str,
+        timed_mode: u8,
+        instant_mode: u8,
+        appointment_mode: u8,
+        hourly_mode: u8,
+        daily_mode: u8,
+        daily_time: [u8; 2],
+        hourly_start: [u8; 5],
+        hourly_interval_min: u8,
+        appointment_time: [u8; 5],
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut extra = Self::read_extra_config(pool, address).await?;
+        extra["freeze"] = json!({
+            "timed_mode": timed_mode,
+            "instant_mode": instant_mode,
+            "appointment_mode": appointment_mode,
+            "hourly_mode": hourly_mode,
+            "daily_mode": daily_mode,
+            "daily_time": daily_time,
+            "hourly_start": hourly_start,
+            "hourly_interval_min": hourly_interval_min,
+            "appointment_time": appointment_time,
+        });
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            r#"
+            UPDATE meters
+            SET freeze_mode_word = ?, tou_config_json = ?, updated_at_ms = ?
+            WHERE address = ?
+            "#,
+        )
+        .bind(timed_mode as i64)
+        .bind(extra.to_string())
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 从 `meters` 表恢复一表完整配置
+    pub async fn restore_meter_config(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<Option<PersistedMeterSettings>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT meter_constant, rated_voltage_mv, rated_current_ma, demand_period_min,
+                   time_scale, rated_frequency_hz, initial_power_factor,
+                   load_model_json, settlement_days_json, tou_config_json,
+                   freeze_mode_word, load_record_mode_word
+            FROM meters
+            WHERE address = ?
+            "#,
+        )
+        .bind(address)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let load_model_json: String = row.get("load_model_json");
+        let rated_frequency_hz: f64 = row.get("rated_frequency_hz");
+        let initial_power_factor: f64 = row.get("initial_power_factor");
+        let simulation = Self::simulation_from_row(
+            row.get("meter_constant"),
+            row.get("rated_voltage_mv"),
+            row.get("rated_current_ma"),
+            row.get("demand_period_min"),
+            row.get("time_scale"),
+            rated_frequency_hz,
+            initial_power_factor,
+            &load_model_json,
+        );
+
+        let extra: Value = {
+            let raw: String = row.get("tou_config_json");
+            serde_json::from_str(&raw).unwrap_or_else(|_| json!({}))
+        };
+        let extra = if extra.get("freeze").is_none() && extra.get("timed_mode").is_some() {
+            json!({ "freeze": extra })
+        } else {
+            extra
+        };
+        let freeze = extra.get("freeze").cloned().unwrap_or_else(|| json!({}));
+        let (
+            timed_mode,
+            instant_mode,
+            appointment_mode,
+            hourly_mode,
+            daily_mode,
+            daily_time,
+            hourly_start,
+            hourly_interval_min,
+            appointment_time,
+        ) = Self::freeze_fields_from_json(&freeze);
+
+        let settlement: Value = {
+            let raw: String = row.get("settlement_days_json");
+            serde_json::from_str(&raw).unwrap_or_else(|_| json!({"days": [0, 0, 0], "hours": [0, 0, 0]}))
+        };
+        let mut settlement_days = [0u8; 3];
+        let mut settlement_hours = [0u8; 3];
+        if let Some(days) = settlement.get("days").and_then(|v| v.as_array()) {
+            for (i, value) in days.iter().take(3).enumerate() {
+                settlement_days[i] = value.as_u64().unwrap_or(0) as u8;
+            }
+        }
+        if let Some(hours) = settlement.get("hours").and_then(|v| v.as_array()) {
+            for (i, value) in hours.iter().take(3).enumerate() {
+                settlement_hours[i] = value.as_u64().unwrap_or(0) as u8;
+            }
+        }
+
+        let load_record = extra.get("load_record").cloned().unwrap_or_else(|| json!({}));
+        let load_record_mode_word: i64 = row.get("load_record_mode_word");
+        let mut load_record_start_time = [0u8; 4];
+        if let Some(st) = load_record.get("start_time").and_then(|v| v.as_array()) {
+            for (i, value) in st.iter().take(4).enumerate() {
+                load_record_start_time[i] = value.as_u64().unwrap_or(0) as u8;
+            }
+        }
+        let mut load_record_intervals = [0u16; 6];
+        if let Some(intervals) = load_record.get("intervals").and_then(|v| v.as_array()) {
+            for (i, value) in intervals.iter().take(6).enumerate() {
+                load_record_intervals[i] = value.as_u64().unwrap_or(0) as u16;
+            }
+        }
+
+        Ok(Some(PersistedMeterSettings {
+            simulation,
+            timed_freeze_mode: timed_mode,
+            instant_freeze_mode: instant_mode,
+            appointment_freeze_mode: appointment_mode,
+            hourly_freeze_mode: hourly_mode,
+            daily_freeze_mode: daily_mode,
+            daily_freeze_time: daily_time,
+            hourly_freeze_start: hourly_start,
+            hourly_freeze_interval_min: hourly_interval_min,
+            appointment_freeze_time: appointment_time,
+            settlement_days,
+            settlement_hours,
+            load_record_mode_word: load_record_mode_word as u8,
+            load_record_start_time,
+            load_record_intervals,
+        }))
+    }
+
 }

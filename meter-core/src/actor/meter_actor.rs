@@ -139,12 +139,6 @@ impl MeterActor {
                         EngineMsg::AdminCommand { cmd, reply_tx } => {
                             let should_shutdown = matches!(cmd, AdminCommand::Shutdown);
                             self.on_admin_command(cmd, reply_tx).await;
-
-                            if should_shutdown {
-                                info!("[MeterActor {}] Shutdown requested", address_str);
-                                self.graceful_shutdown().await;
-                                break;
-                            }
                         }
                     }
                 }
@@ -1182,10 +1176,26 @@ impl MeterActor {
                     format!("Load model set: {voltage:.1} V, {current:.3} A, PF {power_factor:.3}")
                 }),
 
-            AdminCommand::ApplySimulationConfig { config } => self
-                .meter
-                .apply_simulation_config(config)
-                .map(|_| "Simulation configuration applied".to_string()),
+            AdminCommand::ApplySimulationConfig { config } => {
+                // clone for persistence after apply
+                let config_for_persist = config.clone();
+                let apply_res = self.meter.apply_simulation_config(config);
+                if apply_res.is_ok() {
+                    if let Some(pool) = &self.config.db_pool {
+                        let addr = format_address(&self.config.address);
+                        if let Err(e) = crate::persistence::PersistenceWorker::save_simulation_config(
+                            pool,
+                            &addr,
+                            &config_for_persist,
+                        )
+                        .await
+                        {
+                            warn!("[MeterActor {}] Failed to persist simulation config: {}", addr, e);
+                        }
+                    }
+                }
+                apply_res.map(|_| "Simulation configuration applied".to_string())
+            }
 
             AdminCommand::ChangePassword {
                 level,
@@ -1271,6 +1281,27 @@ impl MeterActor {
                     // 新的约定冻结时间允许再次触发
                     state.appointment_freeze_fired = false;
                 }
+                // 持久化冻结配置
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    if let Err(e) = crate::persistence::PersistenceWorker::save_freeze_config(
+                        pool,
+                        &addr,
+                        timed_mode,
+                        instant_mode,
+                        appointment_mode,
+                        hourly_mode,
+                        daily_mode,
+                        daily_time,
+                        hourly_start,
+                        hourly_interval_min,
+                        appointment_time,
+                    )
+                    .await
+                    {
+                        warn!("[MeterActor {}] Failed to persist freeze config: {}", addr, e);
+                    }
+                }
                 Ok("Freeze configuration applied".to_string())
             }
 
@@ -1283,6 +1314,22 @@ impl MeterActor {
                     let state = self.meter.state_mut();
                     state.settlement_days = days;
                     state.settlement_hours = hours;
+
+                    // 持久化结算日
+                    if let Some(pool) = &self.config.db_pool {
+                        let addr = format_address(&self.config.address);
+                        if let Err(e) = crate::persistence::PersistenceWorker::save_settlement_days(
+                            pool,
+                            &addr,
+                            days,
+                            hours,
+                        )
+                        .await
+                        {
+                            warn!("[MeterActor {}] Failed to persist settlement days: {}", addr, e);
+                        }
+                    }
+
                     Ok("Settlement days applied".to_string())
                 }
             }
@@ -1296,6 +1343,23 @@ impl MeterActor {
                 state.load_record_config.mode_word = mode_word;
                 state.load_record_start_time = start_time;
                 state.load_record_config.intervals = intervals;
+
+                // 持久化负荷记录配置
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    if let Err(e) = crate::persistence::PersistenceWorker::save_load_record_config(
+                        pool,
+                        &addr,
+                        mode_word,
+                        start_time,
+                        intervals,
+                    )
+                    .await
+                    {
+                        warn!("[MeterActor {}] Failed to persist load record config: {}", addr, e);
+                    }
+                }
+
                 Ok("Load record configuration applied".to_string())
             }
 
@@ -1363,7 +1427,10 @@ impl MeterActor {
                 Ok(format_address(&addr))
             }
 
-            AdminCommand::Shutdown => Ok("Shutting down...".to_string()),
+            AdminCommand::Shutdown => {
+                self.graceful_shutdown().await;
+                Ok("Shutting down...".to_string())
+            },
 
             AdminCommand::SaveState => {
                 // TODO: 触发最终flush
@@ -1394,19 +1461,20 @@ impl MeterActor {
             address_str
         );
 
-        // 1. 强制flush电能寄存器
+        // 强制flush电能寄存器和虚拟时间
+        // 这里不仅发送到 PersistenceWorker 队列，还要直接写数据库确保数据保存
+        
+        // 方案1：通过 PersistenceWorker 队列（异步，可能丢失）
         if let Some(_persist_tx) = self.meter.force_flush_energy() {
-            debug!("[MeterActor {}] Flushed energy registers", address_str);
-
-            // 等待一小段时间让持久化完成
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            debug!("[MeterActor {}] Sent flush request to PersistenceWorker", address_str);
         }
 
-        // 2. 保存虚拟时钟（如果有数据库连接池）
+        // 方案2：直接写数据库（同步，保证成功）
         if let Some(pool) = &self.config.db_pool {
+            // 保存虚拟时钟
             match self.meter.save_virtual_time(pool).await {
                 Ok(_) => {
-                    debug!("[MeterActor {}] Saved virtual time", address_str);
+                    debug!("[MeterActor {}] Saved virtual time to database", address_str);
                 }
                 Err(e) => {
                     warn!(
@@ -1416,9 +1484,6 @@ impl MeterActor {
                 }
             }
         }
-
-        // 3. 再等待一小段时间确保所有持久化完成
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
         info!("[MeterActor {}] Graceful shutdown completed", address_str);
     }

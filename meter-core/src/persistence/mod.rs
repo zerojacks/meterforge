@@ -5,6 +5,6 @@ pub mod worker;
 
 pub use types::{
     EnergyRegisterRow, EventRecordRow, FreezeSnapshotRow, LoadProfileRecordRow,
-    LoadProfileSampleRow, MaxDemandRow, PersistRequest,
+    LoadProfileSampleRow, MaxDemandRow, PersistedMeterSettings, PersistRequest,
 };
 pub use worker::{PersistenceConfig, PersistenceWorker};

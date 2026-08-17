@@ -21,7 +21,9 @@ use state::{ConnectionStatusStore, GlobalConnectionStatus, GlobalMeterRegistry, 
 use std::sync::Arc;
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+    .with_max_level(tracing::Level::INFO)
+    .init();
     let app = gpui_platform::application().with_assets(Assets);
 
     app.run(move |cx| {
@@ -60,5 +62,20 @@ fn main() {
             .expect("failed to open meter window");
         })
         .detach();
+
+        // 注册退出回调，确保优雅关闭所有电表
+        // 因为不能在闭包中借用 cx，我们先获取 backend 的克隆
+        let backend_for_quit = cx.global::<backend::AppBackend>().clone();
+        cx.on_app_quit(move |_| {
+            let backend = backend_for_quit.clone();
+            async move {
+                tracing::info!("应用退出，正在优雅关闭所有电表...");
+                backend.shutdown_all_meters();
+                tracing::info!("所有电表已关闭");
+            }
+        })
+        .detach();
     });
+    
+    tracing::info!("应用已退出");
 }

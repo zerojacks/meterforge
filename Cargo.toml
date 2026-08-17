@@ -35,3 +35,4 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 # spec-engine integration (假设在同级目录)
 # spec-engine = { path = "../spec-engine/spec-engine" }
 
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "json", "chrono", "migrate"] }

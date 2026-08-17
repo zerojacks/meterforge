@@ -104,7 +104,7 @@ async fn test_energy_register_recovery() {
 
     // 保存虚拟时钟
     let virtual_time = meter.state().virtual_time;
-    PersistenceWorker::save_meter_state(&pool, &address_str, virtual_time, 1.0)
+    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time, 1.0)
         .await
         .unwrap();
 
@@ -238,7 +238,7 @@ async fn test_full_lifecycle_with_recovery() {
         .unwrap();
 
     let virtual_time1 = meter1.state().virtual_time;
-    PersistenceWorker::save_meter_state(&pool, &address_str, virtual_time1, 1.0)
+    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time1, 1.0)
         .await
         .unwrap();
 

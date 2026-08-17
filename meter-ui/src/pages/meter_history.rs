@@ -119,7 +119,7 @@ pub fn freezes(snapshot: &MeterSnapshot, theme: &Theme) -> impl IntoElement {
                                 .text_sm(),
                         )
                         .child(
-                            Label::new(format!("最大需量 {:.2} kW", freeze.max_demand_kw))
+                            Label::new(format!("最大需量 {:4} kW", freeze.max_demand_kw))
                                 .text_sm(),
                         )
                         .child(

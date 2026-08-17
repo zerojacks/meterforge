@@ -3,6 +3,28 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
+use crate::simulation::SimulationConfig;
+
+/// 从 `meters` 表恢复的一表完整配置（协议参变量 + 仿真自定义项）
+#[derive(Debug, Clone)]
+pub struct PersistedMeterSettings {
+    pub simulation: SimulationConfig,
+    pub timed_freeze_mode: u8,
+    pub instant_freeze_mode: u8,
+    pub appointment_freeze_mode: u8,
+    pub hourly_freeze_mode: u8,
+    pub daily_freeze_mode: u8,
+    pub daily_freeze_time: [u8; 2],
+    pub hourly_freeze_start: [u8; 5],
+    pub hourly_freeze_interval_min: u8,
+    pub appointment_freeze_time: [u8; 5],
+    pub settlement_days: [u8; 3],
+    pub settlement_hours: [u8; 3],
+    pub load_record_mode_word: u8,
+    pub load_record_start_time: [u8; 4],
+    pub load_record_intervals: [u16; 6],
+}
+
 /// 持久化请求枚举
 #[derive(Debug, Clone)]
 pub enum PersistRequest {
@@ -25,6 +47,14 @@ pub enum PersistRequest {
     WriteLoadProfileSample {
         address: String,
         sample: crate::simulation::state::LoadProfileSample,
+    },
+
+    /// 保存虚拟时间和配置（用于定期持久化，防止异常退出丢失）
+    SaveVirtualTime {
+        address: String,
+        virtual_time: DateTime<Local>,
+        time_scale: f64,
+        simulation_config: SimulationConfig,
     },
 }
 

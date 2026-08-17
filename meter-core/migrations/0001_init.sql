@@ -89,6 +89,8 @@ CREATE TABLE meters (
     load_model_json      TEXT NOT NULL,          -- 负荷模型
     virtual_time_ms      INTEGER NOT NULL,       -- 虚拟时钟
     time_scale           REAL NOT NULL DEFAULT 1.0,
+    rated_frequency_hz   REAL NOT NULL DEFAULT 50.0,
+    initial_power_factor REAL NOT NULL DEFAULT 0.95,
     updated_at_ms        INTEGER NOT NULL
 );
 

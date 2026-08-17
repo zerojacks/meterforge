@@ -7,15 +7,18 @@
 
 use crate::actor::MeterRegistry;
 use crate::communication_log::{CommunicationLogEntry, CommunicationLogService};
+use crate::persistence::{PersistRequest, PersistenceConfig, PersistenceWorker};
 use crate::router::{RouterConfig, RouterRunner};
 use crate::transport::{
     FrameSource, SerialChannel, SerialChannelConfig, TcpChannel, TcpChannelConfig, TcpConnection,
 };
+use sqlx::SqlitePool;
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// UI / 外部适配层可提交的连接命令。
@@ -181,6 +184,48 @@ impl ConnectionManager {
         self.runtime.spawn(async move {
             RouterRunner::new(registry, config, conn_rx).run().await;
         });
+    }
+
+    /// 连接层专属 runtime 的 Handle。
+    ///
+    /// `MeterActor`、`PersistenceWorker` 等依赖 tokio（`tokio::select!` /
+    /// `tokio::time` / `sqlx` 的 `runtime-tokio` feature）的任务，一律要通过
+    /// 这个 handle 的 `spawn`，不能扔给 GPUI/smol 的 `cx.background_executor()`
+    /// —— 那边没有 tokio Runtime 上下文，涉及 tokio::time / sqlx 的代码会直接
+    /// panic（"there is no reactor running..."）。
+    pub fn runtime_handle(&self) -> Handle {
+        self.runtime.handle().clone()
+    }
+
+    /// 在连接层专属 runtime 上 spawn 一个任务（`MeterActor::run()` 等）。
+    pub fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime.spawn(future)
+    }
+
+    /// 建立（或打开）SQLite 连接池、启动 `PersistenceWorker` 并将其 spawn 到
+    /// 连接层专属 runtime 上。
+    ///
+    /// 返回值：
+    /// - `SqlitePool`：可以 clone 后塞进每个 `MeterActorConfig::db_pool`，
+    ///   供低频的 admin 配置写入（ApplySimulationConfig / 冻结配置 /
+    ///   结算日 / 密码变更等）直接使用——和 `PersistenceWorker` 共用同一份
+    ///   连接池 / WAL 配置，不会各起一个 pool 打同一个 db 文件。
+    /// - `mpsc::Sender<PersistRequest>`：挂到每个 `VirtualMeter`
+    ///   （`with_persistence`）上，供高频、可容忍短暂丢失的 tick 驱动数据
+    ///   （电能寄存器 flush / 负荷记录采样 / 冻结快照）走批量队列。
+    pub fn start_persistence(
+        &self,
+        config: PersistenceConfig,
+    ) -> Result<(SqlitePool, mpsc::Sender<PersistRequest>), sqlx::Error> {
+        let pool = self.runtime.block_on(PersistenceWorker::connect_pool(&config))?;
+        let (persist_tx, persist_rx) = mpsc::channel(config.batch_max_size * 2);
+        let worker = PersistenceWorker::with_pool(pool.clone(), config, persist_rx);
+        self.runtime.spawn(worker.run());
+        Ok((pool, persist_tx))
     }
 
     /// 连接配置的唯一应用入口。

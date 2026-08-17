@@ -22,7 +22,7 @@ serialport = "4"
 tokio-serial = "5.0"
 
 # SQLite persistence
-sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "json", "chrono", "migrate"] }
+sqlx.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"

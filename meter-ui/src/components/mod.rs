@@ -2,8 +2,6 @@
 
 mod app_titlebar;
 mod meter_card;
-mod stats_panel;
 
 pub use app_titlebar::{AppTitleBar, SettingsTitleBar};
 pub use meter_card::MeterCard;
-pub use stats_panel::StatsPanel;

@@ -175,17 +175,17 @@ pub fn render(
                 ))
                 .child(metric(
                     "A相电流",
-                    format!("{:.2} A", snapshot.current_a),
+                    format!("{:.3} A", snapshot.current_a),
                     theme,
                 ))
                 .child(metric(
                     "有功功率",
-                    format!("{:.2} kW", snapshot.active_power_kw),
+                    format!("{:.4} kW", snapshot.active_power_kw),
                     theme,
                 ))
                 .child(metric(
                     "总电能",
-                    format!("{:.1} kWh", snapshot.energy_total_kwh),
+                    format!("{:.2} kWh", snapshot.energy_total_kwh),
                     theme,
                 )),
         )
@@ -315,7 +315,7 @@ pub fn render(
             vec![
                 (
                     "有功功率".into(),
-                    format!("{:.2} kW", snapshot.active_power_kw),
+                    format!("{:.4} kW", snapshot.active_power_kw),
                     theme.colors.red,
                 ),
                 (
@@ -341,7 +341,7 @@ pub fn render(
                 ),
                 (
                     "最大需量".into(),
-                    format!("{:.2} kW", snapshot.max_demand_kw),
+                    format!("{:.4} kW", snapshot.max_demand_kw),
                     theme.foreground,
                 ),
             ],

@@ -134,7 +134,7 @@ pub fn render(
                 .small()
                 .danger()
                 .on_click(cx.listener(MeterDetailView::show_clear_demand_dialog)),
-            Label::new(format!("当前最大需量：{:.2} kW", snapshot.max_demand_kw)).text_sm(),
+            Label::new(format!("当前最大需量：{:.4} kW", snapshot.max_demand_kw)).text_sm(),
             theme,
         ))
         .child(card(

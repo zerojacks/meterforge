@@ -3,8 +3,9 @@
 use super::di_handler::DIHandler;
 use super::physics_engine::{PhysicsConfig, PhysicsEngine, SimulationConfig};
 use super::state::MeterState;
-use crate::persistence::PersistRequest;
+use crate::persistence::{PersistRequest, PersistedMeterSettings};
 use tokio::sync::mpsc;
+use tracing::warn;
 
 /// 虚拟电表
 ///
@@ -125,7 +126,58 @@ impl VirtualMeter {
             }
         }
 
+        // 3. 恢复表配置（仿真参数 / 冻结模式 / 结算日 / 负荷记录配置）
+        //
+        // 对应 admin 命令实时下发时写的那份数据（save_simulation_config /
+        // save_freeze_config / save_settlement_days / save_load_record_config），
+        // 之前只在 UI 里改的时候写进去，从没在启动时读出来过，所以重启后
+        // UI 上看到的一直是代码里的默认值，跟数据库里存的对不上。
+        match PersistenceWorker::restore_meter_config(pool, &address_str).await {
+            Ok(Some(settings)) => {
+                self.apply_persisted_settings(&settings);
+                println!("[VirtualMeter] Restored meter config for {}", address_str);
+            }
+            Ok(None) => {
+                // 没有历史配置记录，保留当前（默认）配置即可
+            }
+            Err(e) => {
+                return Err(format!("Failed to restore meter config: {}", e));
+            }
+        }
+
         Ok(true)
+    }
+
+    /// 把从数据库读回的 [`PersistedMeterSettings`] 应用到当前电表状态。
+    ///
+    /// 字段和写入逻辑与 `MeterActor::on_admin_command` 里
+    /// `ApplyFreezeConfig` / `ApplySettlementDays` / `ApplyLoadRecordConfig`
+    /// 分支实时应用时完全一致——这里只是把上次持久化的值灌回内存，
+    /// 不会再触发一次持久化写入。
+    pub fn apply_persisted_settings(&mut self, settings: &PersistedMeterSettings) {
+        if let Err(e) = self.apply_simulation_config(settings.simulation.clone()) {
+            warn!("[VirtualMeter] 恢复仿真配置失败，保留默认值: {}", e);
+        }
+
+        let state = self.state_mut();
+        state.freeze_config.timed_freeze_mode = settings.timed_freeze_mode;
+        state.freeze_config.instant_freeze_mode = settings.instant_freeze_mode;
+        state.freeze_config.appointment_freeze_mode = settings.appointment_freeze_mode;
+        state.hourly_freeze_mode = settings.hourly_freeze_mode;
+        state.daily_freeze_mode = settings.daily_freeze_mode;
+        state.daily_freeze_time = settings.daily_freeze_time;
+        state.hourly_freeze_start = settings.hourly_freeze_start;
+        state.hourly_freeze_interval_min = settings.hourly_freeze_interval_min;
+        state.appointment_freeze_time = settings.appointment_freeze_time;
+        // 恢复的约定冻结时间允许重新触发一次
+        state.appointment_freeze_fired = false;
+
+        state.settlement_days = settings.settlement_days;
+        state.settlement_hours = settings.settlement_hours;
+
+        state.load_record_config.mode_word = settings.load_record_mode_word;
+        state.load_record_start_time = settings.load_record_start_time;
+        state.load_record_config.intervals = settings.load_record_intervals;
     }
 
     /// 创建默认虚拟电表
@@ -698,20 +750,25 @@ impl VirtualMeter {
     }
 
     /// 将负荷记录采样提交到 PersistenceWorker
+    ///
+    /// 注意：`tick()` 是同步函数，这里不能 `.await`，也不能 `tokio::spawn`
+    /// （`VirtualMeter` 可能运行在没有 tokio Runtime 上下文的执行器里，
+    /// `tokio::spawn` 会直接 panic）。改用 `try_send`：非阻塞、不需要 Runtime，
+    /// 队列满/已关闭时立刻 `warn!`，而不是把失败信息丢进一个可能永远不会
+    /// 被 poll 的任务里。
     fn persist_load_profile_samples(&self, samples: Vec<super::state::LoadProfileSample>) {
         if let Some(persist_tx) = &self.persist_tx {
             let address_str = address_to_string(&self.state.address);
             for sample in samples {
-                let tx = persist_tx.clone();
                 let address = address_str.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tx
-                        .send(PersistRequest::WriteLoadProfileSample { address, sample })
-                        .await
-                    {
-                        eprintln!("[VirtualMeter] 负荷记录采样持久化失败: {}", e);
-                    }
-                });
+                if let Err(e) = persist_tx
+                    .try_send(PersistRequest::WriteLoadProfileSample { address, sample })
+                {
+                    warn!(
+                        "[VirtualMeter {}] 负荷记录采样持久化队列已满或已关闭: {}",
+                        address_str, e
+                    );
+                }
             }
         }
     }
@@ -751,16 +808,17 @@ impl VirtualMeter {
                 // 转换地址为字符串
                 let address_str = address_to_string(&self.state.address);
 
-                // 提交到 PersistenceWorker（异步发送，不等待）
-                let tx = persist_tx.clone();
+                // 提交到 PersistenceWorker（非阻塞、不需要 tokio Runtime，见
+                // persist_load_profile_samples 上方注释）
                 let mut row = snapshot_row;
-                row.meter_address = address_str;
+                row.meter_address = address_str.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = tx.send(PersistRequest::WriteFreezeSnapshot(row)).await {
-                        eprintln!("[VirtualMeter] 持久化请求发送失败: {}", e);
-                    }
-                });
+                if let Err(e) = persist_tx.try_send(PersistRequest::WriteFreezeSnapshot(row)) {
+                    warn!(
+                        "[VirtualMeter {}] 冻结快照持久化队列已满或已关闭: {}",
+                        address_str, e
+                    );
+                }
 
                 // 日志记录（可选，用于调试）
                 #[cfg(debug_assertions)]
@@ -829,7 +887,7 @@ impl VirtualMeter {
 
     /// 执行电能寄存器 flush
     ///
-    /// 将当前电能寄存器值提交到 PersistenceWorker
+    /// 将当前电能寄存器值和虚拟时间提交到 PersistenceWorker
     fn flush_energy_registers(&mut self) {
         if let Some(persist_tx) = &self.persist_tx {
             use super::state::EnergyType;
@@ -847,7 +905,7 @@ impl VirtualMeter {
             };
 
             let row = EnergyRegisterRow {
-                meter_address: address_str,
+                meter_address: address_str.clone(),
                 timestamp: self.state.virtual_time,
                 combined_active_positive: get_energy(EnergyType::ForwardActive, 0),
                 combined_active_negative: get_energy(EnergyType::ReverseActive, 0),
@@ -859,13 +917,38 @@ impl VirtualMeter {
                 rate4_active_positive: get_energy(EnergyType::ForwardActive, 4),
             };
 
-            // 异步提交
-            let tx = persist_tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tx.send(PersistRequest::WriteEnergyRegister(row)).await {
-                    eprintln!("[VirtualMeter] 电能寄存器持久化请求发送失败: {}", e);
-                }
-            });
+            // 非阻塞提交电能寄存器（见 persist_load_profile_samples 上方注释：这里不能
+            // .await，也不能 tokio::spawn，用 try_send 代替）
+            if let Err(e) = persist_tx.try_send(PersistRequest::WriteEnergyRegister(row)) {
+                warn!(
+                    "[VirtualMeter {}] 电能寄存器持久化队列已满或已关闭: {}",
+                    address_str, e
+                );
+            }
+
+            // 同时保存虚拟时间和配置（防止异常退出时丢失）
+            let simulation_config = crate::simulation::SimulationConfig {
+                load_model: self.config.physics_config.load_model.clone(),
+                rated_voltage: self.state.rated_voltage as f64 / 1000.0, // 毫伏转伏
+                rated_current: self.state.rated_current as f64 / 1000.0, // 毫安转安
+                rated_frequency: self.state.rated_frequency as f64,
+                power_factor: self.state.power_factor,
+                meter_constant: self.state.meter_constant,
+                demand_period_minutes: self.state.demand_period_minutes,
+                time_scale: self.state.simulation_time_scale,
+            };
+            
+            if let Err(e) = persist_tx.try_send(PersistRequest::SaveVirtualTime {
+                address: address_str.clone(),
+                virtual_time: self.state.virtual_time,
+                time_scale: self.state.simulation_time_scale,
+                simulation_config,
+            }) {
+                warn!(
+                    "[VirtualMeter {}] 虚拟时间持久化队列已满或已关闭: {}",
+                    address_str, e
+                );
+            }
 
             // 更新 flush 状态
             self.last_energy_flush = std::time::Instant::now();
@@ -873,7 +956,8 @@ impl VirtualMeter {
             #[cfg(debug_assertions)]
             {
                 println!(
-                    "[VirtualMeter] 电能寄存器已 flush: time={}, energy={:.3} kWh",
+                    "[VirtualMeter {}] 电能寄存器和虚拟时间已 flush: time={}, energy={:.3} kWh",
+                    address_str,
                     self.state.virtual_time.format("%Y-%m-%d %H:%M:%S"),
                     get_energy(EnergyType::ForwardActive, 0)
                 );
@@ -896,7 +980,7 @@ impl VirtualMeter {
         use crate::persistence::PersistenceWorker;
 
         let address_str = address_to_string(&self.state.address);
-        PersistenceWorker::save_meter_state(
+        PersistenceWorker::save_virtual_time(
             pool,
             &address_str,
             self.state.virtual_time,

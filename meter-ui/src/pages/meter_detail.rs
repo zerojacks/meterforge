@@ -380,14 +380,19 @@ impl Render for MeterDetailView {
                                 "离线"
                             })),
                     )
-                    .child(
-                        Label::new(format!(
-                            "虚拟时间 {}",
-                            Local::now().format("%Y-%m-%d %H:%M:%S")
-                        ))
-                        .text_xs()
-                        .text_color(theme.muted_foreground),
-                    ),
+                    .child({
+                        let virtual_time =
+                            chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
+                                .map(|dt| {
+                                    dt.with_timezone(&Local)
+                                        .format("%Y-%m-%d %H:%M:%S")
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|| "--".to_string());
+                        Label::new(format!("虚拟时间 {}", virtual_time))
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                    }),
             )
             .child(
                 TabBar::new("detail-tabs")

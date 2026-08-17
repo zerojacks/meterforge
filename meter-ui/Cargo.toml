@@ -38,3 +38,5 @@ smol = "2.0"
 
 # 其他 UI 依赖
 anyhow = "1.0"
+
+sqlx.workspace = true
