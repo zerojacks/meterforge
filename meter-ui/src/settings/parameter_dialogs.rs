@@ -3,7 +3,7 @@
 
 use chrono::{Datelike, Local, TimeZone, Timelike};
 use gpui::*;
-use gpui_component::button::Button;
+use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::form::{field, v_form};
 use gpui_component::input::{Input, InputState};
 use gpui_component::label::Label;
@@ -15,6 +15,7 @@ use gpui_component::*;
 
 #[allow(dead_code)]
 pub struct TimeSettingDialog {
+    focus_handle: FocusHandle,
     year_input: Entity<InputState>,
     month_input: Entity<InputState>,
     day_input: Entity<InputState>,
@@ -31,6 +32,7 @@ impl TimeSettingDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let focus_handle = cx.focus_handle();
         let year_input = cx.new(|cx| InputState::new(window, cx).placeholder("年"));
         let month_input = cx.new(|cx| InputState::new(window, cx).placeholder("月"));
         let day_input = cx.new(|cx| InputState::new(window, cx).placeholder("日"));
@@ -59,6 +61,7 @@ impl TimeSettingDialog {
         });
 
         Self {
+            focus_handle,
             year_input,
             month_input,
             day_input,
@@ -163,7 +166,14 @@ impl TimeSettingDialog {
                 callback(datetime, window, cx);
                 self.on_confirm = Some(callback);
             }
+            window.close_dialog(cx);
         }
+    }
+}
+
+impl Focusable for TimeSettingDialog {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -171,9 +181,8 @@ impl Render for TimeSettingDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        div()
-            .flex()
-            .flex_col()
+         v_flex()
+            .id("subscription-panel")
             .gap_4()
             .child(
                 v_form()
@@ -336,6 +345,7 @@ impl PasswordDialog {
             callback(level, old_password, new_password, window, cx);
             self.on_confirm = Some(callback);
         }
+        window.close_dialog(cx);
     }
 }
 
@@ -474,6 +484,7 @@ impl BaudrateDialog {
             callback(baudrate, password, window, cx);
             self.on_confirm = Some(callback);
         }
+        window.close_dialog(cx);
     }
 }
 
@@ -616,6 +627,7 @@ impl ClearOperationDialog {
             callback(password, operator_code, window, cx);
             self.on_confirm = Some(callback);
         }
+        window.close_dialog(cx);
     }
 }
 
@@ -854,6 +866,7 @@ impl TouConfigDialog {
             callback(slots, window, cx);
             self.on_confirm = Some(callback);
         }
+        window.close_dialog(cx);
     }
 }
 
@@ -866,21 +879,17 @@ impl Render for TouConfigDialog {
             .flex()
             .flex_col()
             .gap_4()
+            .size_full()
+            .min_h_0()
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(Label::new("费率时段表配置").text_lg().font_semibold())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.colors.muted_foreground)
-                            .child("配置日时段表（最多14个时段，时间必须升序）"),
-                    ),
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.colors.muted_foreground)
+                    .child("配置日时段表（最多14个时段，时间必须升序）"),
             )
             .child(
-                v_form().gap_4().child(
+                v_form().flex_shrink_0().gap_4().child(
                     field()
                         .label("费率数")
                         .child(Input::new(&self.num_rates_input).w(px(100.0))),
@@ -890,9 +899,12 @@ impl Render for TouConfigDialog {
                 div()
                     .flex()
                     .flex_col()
+                    .flex_1()
+                    .min_h_0()
                     .gap_2()
                     .child(
                         div()
+                            .flex_shrink_0()
                             .flex()
                             .flex_row()
                             .justify_between()
@@ -907,10 +919,12 @@ impl Render for TouConfigDialog {
                     )
                     .child(
                         div()
+                            .id("tou-time-slots-list")
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_h_0()
                             .gap_2()
-                            .max_h(px(300.0))
                             .overflow_y_scrollbar()
                             .children(self.time_slots.iter().enumerate().map(|(idx, slot)| {
                                 div()
@@ -931,8 +945,9 @@ impl Render for TouConfigDialog {
                                     .child(Input::new(&slot.rate_input).w(px(60.0)))
                                     .child(
                                         Button::new(format!("remove-{}", idx))
-                                            .label("🗑️")
+                                            .icon(IconName::Delete)
                                             .small()
+                                            .ghost()
                                             .on_click({
                                                 let idx = idx;
                                                 cx.listener(move |this, _, window, cx| {
@@ -945,6 +960,7 @@ impl Render for TouConfigDialog {
             )
             .children(error_msg.map(|msg| {
                 div()
+                    .flex_shrink_0()
                     .p_3()
                     .rounded_lg()
                     .bg(theme.colors.danger.opacity(0.1))
@@ -953,11 +969,18 @@ impl Render for TouConfigDialog {
                     .child(div().text_sm().text_color(theme.colors.danger).child(msg))
             }))
             .child(
-                div().flex().flex_row().gap_2().justify_end().mt_4().child(
-                    Button::new("confirm-tou")
-                        .label("确定")
-                        .on_click(cx.listener(Self::handle_confirm)),
-                ),
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .justify_end()
+                    .mt_4()
+                    .child(
+                        Button::new("confirm-tou")
+                            .label("确定")
+                            .on_click(cx.listener(Self::handle_confirm)),
+                    ),
             )
     }
 }

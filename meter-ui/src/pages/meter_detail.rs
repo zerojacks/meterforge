@@ -6,11 +6,14 @@ use crate::{
     state::GlobalMeterRegistry,
     types::MeterSnapshot,
 };
-use chrono::{Datelike, Local, Timelike};
+use chrono::{Datelike, Local, TimeZone, Timelike};
 use gpui::*;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     badge::Badge,
+    button::Button,
+    form::{field, v_form},
+    input::{Input, InputState},
     label::Label,
     resizable::{resizable_panel, v_resizable},
     tab::{Tab, TabBar},
@@ -175,24 +178,34 @@ impl MeterDetailView {
             .unwrap_or_else(|| Local::now().into())
             .with_timezone(&Local);
         let address = self.address.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let address = address.clone();
-            dialog.title("设置电表时间").child(cx.new(move |cx| {
-                TimeSettingDialog::new(initial, window, cx).on_confirm(move |value, _, cx| {
-                    cx.global::<AppBackend>().dispatch(
-                        address.clone(),
-                        MeterAction::SetVirtualTime {
-                            year: value.year() as u16,
-                            month: value.month() as u8,
-                            day: value.day() as u8,
-                            hour: value.hour() as u8,
-                            minute: value.minute() as u8,
-                            second: value.second() as u8,
-                        },
-                        cx,
-                    );
+
+        // 只在“打开对话框”这一刻创建一次 Entity，避免 open_dialog 的 build
+        // 闭包在每次 Root 重渲染时都重新 new 出一个全新的对话框状态。
+        let dialog_entity = cx.new(|cx| {
+            TimeSettingDialog::new(initial, window, cx).on_confirm(move |value, _, cx| {
+                cx.global::<AppBackend>().dispatch(
+                    address.clone(),
+                    MeterAction::SetVirtualTime {
+                        year: value.year() as u16,
+                        month: value.month() as u8,
+                        day: value.day() as u8,
+                        hour: value.hour() as u8,
+                        minute: value.minute() as u8,
+                        second: value.second() as u8,
+                    },
+                    cx,
+                );
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("设置电表时间")
+                .w(px(500.))
+                .content({
+                    let dialog_entity = dialog_entity.clone();
+                    move |content, _, _| content.child(dialog_entity.clone())
                 })
-            }))
         })
     }
 
@@ -203,20 +216,28 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let address = self.address.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let address = address.clone();
-            dialog.title("修改密码").child(cx.new(move |cx| {
-                PasswordDialog::new(window, cx).on_confirm(move |level, _, password, _, cx| {
-                    cx.global::<AppBackend>().dispatch(
-                        address.clone(),
-                        MeterAction::ChangePassword {
-                            level,
-                            new_password: password,
-                        },
-                        cx,
-                    );
+
+        let dialog_entity = cx.new(|cx| {
+            PasswordDialog::new(window, cx).on_confirm(move |level, _, password, _, cx| {
+                cx.global::<AppBackend>().dispatch(
+                    address.clone(),
+                    MeterAction::ChangePassword {
+                        level,
+                        new_password: password,
+                    },
+                    cx,
+                );
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("修改密码")
+                .w(px(500.))
+                .content({
+                    let dialog_entity = dialog_entity.clone();
+                    move |content, _, _| content.child(dialog_entity.clone())
                 })
-            }))
         })
     }
 
@@ -227,17 +248,25 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let address = self.address.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let address = address.clone();
-            dialog.title("修改通信速率").child(cx.new(move |cx| {
-                BaudrateDialog::new(0x20, window, cx).on_confirm(move |baudrate, _, _, cx| {
-                    cx.global::<AppBackend>().dispatch(
-                        address.clone(),
-                        MeterAction::SetBaudrate { baudrate },
-                        cx,
-                    );
+
+        let dialog_entity = cx.new(|cx| {
+            BaudrateDialog::new(0x20, window, cx).on_confirm(move |baudrate, _, _, cx| {
+                cx.global::<AppBackend>().dispatch(
+                    address.clone(),
+                    MeterAction::SetBaudrate { baudrate },
+                    cx,
+                );
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("修改通信速率")
+                .w(px(500.))
+                .content({
+                    let dialog_entity = dialog_entity.clone();
+                    move |content, _, _| content.child(dialog_entity.clone())
                 })
-            }))
         })
     }
 
@@ -248,17 +277,26 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let address = self.address.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let address = address.clone();
-            dialog.title("费率时段表配置").child(cx.new(move |cx| {
-                TouConfigDialog::new(window, cx).on_confirm(move |slots, _, cx| {
-                    cx.global::<AppBackend>().dispatch(
-                        address.clone(),
-                        MeterAction::SetTouConfig { time_slots: slots },
-                        cx,
-                    );
+
+        let dialog_entity = cx.new(|cx| {
+            TouConfigDialog::new(window, cx).on_confirm(move |slots, _, cx| {
+                cx.global::<AppBackend>().dispatch(
+                    address.clone(),
+                    MeterAction::SetTouConfig { time_slots: slots },
+                    cx,
+                );
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title("费率时段表配置")
+                .w(px(600.))
+                .h(px(500.))
+                .content({
+                    let dialog_entity = dialog_entity.clone();
+                    move |content, _, _| content.child(dialog_entity.clone())
                 })
-            }))
         })
     }
 
@@ -300,15 +338,22 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let address = self.address.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let address = address.clone();
-            let action = action.clone();
-            dialog.title(title).child(cx.new(move |cx| {
-                ClearOperationDialog::new(clear_type, window, cx).on_confirm(move |_, _, _, cx| {
-                    cx.global::<AppBackend>()
-                        .dispatch(address.clone(), action.clone(), cx);
+
+        let dialog_entity = cx.new(|cx| {
+            ClearOperationDialog::new(clear_type, window, cx).on_confirm(move |_, _, _, cx| {
+                cx.global::<AppBackend>()
+                    .dispatch(address.clone(), action.clone(), cx);
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(title)
+                .w(px(500.))
+                .content({
+                    let dialog_entity = dialog_entity.clone();
+                    move |content, _, _| content.child(dialog_entity.clone())
                 })
-            }))
         })
     }
 

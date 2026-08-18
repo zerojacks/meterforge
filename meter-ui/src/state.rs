@@ -50,6 +50,18 @@ impl MeterState {
         }
     }
 
+    /// 用已知快照创建 MeterState（用于启动时已经从数据库恢复出配置的场景，
+    /// 避免 UI 先渲染一份默认快照、等第一次 tick 推送才刷新成真实数据——
+    /// 像"模拟配置"这种只在构造时读取一次快照的表单组件，如果构造时拿到
+    /// 的是默认值，之后不会自动刷新，只有切换电表重新构造才会更新）
+    pub fn with_snapshot(snapshot: MeterSnapshot) -> Self {
+        Self {
+            address: snapshot.address.clone(),
+            snapshot,
+            history: VecDeque::new(),
+        }
+    }
+
     /// 启动后台监听任务，被动接收来自 meter-core 的状态更新
     ///
     /// 使用 cx.spawn() + entity.update() 模式，这是 GPUI 推荐的异步更新方式

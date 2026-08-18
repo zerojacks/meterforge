@@ -81,11 +81,6 @@ fn spawn_demo_meters(
         };
 
         let (snapshot_tx, snapshot_rx) = mpsc::unbounded_channel::<MeterSnapshot>();
-        let entity = cx.new(|_| MeterState::new(address.clone()));
-        entity.update(cx, |_, cx| {
-            MeterState::start_update_loop(entity.clone(), snapshot_rx, cx)
-        });
-        registry.write().register(address.clone(), entity);
 
         // 有 persist_tx 就用 with_persistence 挂上去（高频、可容忍短暂丢失的
         // tick 驱动数据 -> PersistenceWorker 队列）；db_pool 是同一个连接池的
@@ -122,6 +117,25 @@ fn spawn_demo_meters(
                 }
             }
         }
+
+        // 用 restore 之后的 virtual_meter 直接算出一份快照给 entity 做初始值，
+        // 不要再用 MeterState::new() 的默认快照——MeterActor 要等到第一次
+        // tick（最长 1 秒后）才会通过 snapshot_tx 推送真实数据，UI 里那些
+        // 每次渲染都重新读 registry 的页面（实时数据/参数设置等）能在数据
+        // 到达后自动刷新，但"模拟配置"这类只在构造时读一次快照来初始化
+        // 表单的组件不会自动刷新，会一直停留在这份默认快照上，直到用户切换
+        // 到别的电表再切回来、组件被重新构造才会更新——这就是启动时默认选中
+        // 的第一块表"模拟配置"数据不对、切换一次就正常了的根因。
+        let initial_snapshot = crate::types::MeterSnapshot::from_state(
+            virtual_meter.state(),
+            virtual_meter.load_model_config(),
+            true,
+        );
+        let entity = cx.new(|_| MeterState::with_snapshot(initial_snapshot));
+        entity.update(cx, |_, cx| {
+            MeterState::start_update_loop(entity.clone(), snapshot_rx, cx)
+        });
+        registry.write().register(address.clone(), entity);
 
         let (command_tx, command_rx) = mpsc::channel(100);
         let actor = MeterActor::new(
