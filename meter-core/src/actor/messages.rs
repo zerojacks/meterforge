@@ -145,6 +145,12 @@ pub enum AdminCommand {
 
     /// 保存状态到数据库（触发最终flush）
     SaveState,
+
+    /// 加载冻结历史（合并内存环形缓冲 + 数据库历史，去重后按时间倒序）
+    ///
+    /// 返回值为 JSON 字符串，反序列化为 `Vec<crate::snapshot::FreezeSnapshotSummary>`。
+    /// 用于 UI 切换到"冻结数据"标签页时按需加载，避免启动时全量读库。
+    LoadFreezeHistory,
 }
 
 /// Tick 消息（全局时钟广播）

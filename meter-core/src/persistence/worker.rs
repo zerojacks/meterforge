@@ -227,33 +227,88 @@ impl PersistenceWorker {
     }
 
     /// 写入冻结快照
+    ///
+    /// 按协议 A.6 节语义：DI0=01 恒为"最近一次"，02 为"上一次"……每来一次新
+    /// 冻结，已有记录整体挪号 +1，超出该触发类型容量（`FreezeTrigger::max_history_count()`，
+    /// 与内存环形缓冲一致：定时12/瞬时3/切换类3/整点62/日62）的最旧记录被丢弃，
+    /// 新快照落在 01。
+    ///
+    /// 挪号分两步（先挪到负数区间再翻正）：SQLite 对同一条 UPDATE 语句里
+    /// 批量改写主键列不保证行内写入顺序，若直接 `occurrence_idx = occurrence_idx + 1`
+    /// 升序写入，会在语句执行期间与尚未挪走的旧值发生 `(address, trigger_type,
+    /// category, occurrence_idx)` 唯一约束瞬时冲突；先移到不可能重叠的负数区间
+    /// 暂存，再统一翻正，可以安全避开这个问题。
     async fn write_freeze_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         snapshot: FreezeSnapshotRow,
     ) -> Result<(), sqlx::Error> {
+        use crate::simulation::FreezeTrigger;
+
         let now_ms = Utc::now().timestamp_millis();
         let snapshot_time_ms = snapshot.snapshot_time.timestamp_millis();
         let payload_json = serde_json::to_string(&snapshot.payload)
             .map_err(|e| sqlx::Error::Protocol(format!("JSON serialization error: {}", e)))?;
 
+        let capacity = FreezeTrigger::from_di2(snapshot.trigger_type)
+            .map(|t| t.max_history_count())
+            .unwrap_or(12) as i64;
+
+        // 1. 丢弃将被挤出协议 DI0 范围的最旧记录（挪号前 occurrence_idx == capacity，
+        //    挪号后会变成 capacity+1，超出范围）
         sqlx::query(
             r#"
-            INSERT INTO freeze_snapshots (
-                address, trigger_type, category, occurrence_idx,
-                snapshot_time_ms, payload_json, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(address, trigger_type, category, occurrence_idx)
-            DO UPDATE SET
-                snapshot_time_ms = excluded.snapshot_time_ms,
-                payload_json = excluded.payload_json,
-                created_at_ms = excluded.created_at_ms
+            DELETE FROM freeze_snapshots
+            WHERE address = ? AND trigger_type = ? AND category = ?
+              AND occurrence_idx >= ?
             "#,
         )
         .bind(&snapshot.meter_address)
         .bind(snapshot.trigger_type)
         .bind(snapshot.category)
-        .bind(snapshot.occurrence_idx)
+        .bind(capacity)
+        .execute(&mut **tx)
+        .await?;
+
+        // 2. 现存记录整体 occurrence_idx += 1（先负数暂存，避开唯一约束瞬时冲突）
+        sqlx::query(
+            r#"
+            UPDATE freeze_snapshots
+            SET occurrence_idx = -(occurrence_idx + 1)
+            WHERE address = ? AND trigger_type = ? AND category = ?
+            "#,
+        )
+        .bind(&snapshot.meter_address)
+        .bind(snapshot.trigger_type)
+        .bind(snapshot.category)
+        .execute(&mut **tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE freeze_snapshots
+            SET occurrence_idx = -occurrence_idx
+            WHERE address = ? AND trigger_type = ? AND category = ? AND occurrence_idx < 0
+            "#,
+        )
+        .bind(&snapshot.meter_address)
+        .bind(snapshot.trigger_type)
+        .bind(snapshot.category)
+        .execute(&mut **tx)
+        .await?;
+
+        // 3. 新快照落在 01（协议语义：本次即"最近一次"）
+        sqlx::query(
+            r#"
+            INSERT INTO freeze_snapshots (
+                address, trigger_type, category, occurrence_idx,
+                snapshot_time_ms, payload_json, created_at_ms
+            ) VALUES (?, ?, ?, 1, ?, ?, ?)
+            "#,
+        )
+        .bind(&snapshot.meter_address)
+        .bind(snapshot.trigger_type)
+        .bind(snapshot.category)
         .bind(snapshot_time_ms)
         .bind(payload_json)
         .bind(now_ms)
@@ -685,6 +740,55 @@ impl PersistenceWorker {
         } else {
             Ok(None)
         }
+    }
+
+    /// 查询某地址全部冻结历史快照（供 UI 切到"冻结数据"标签页时加载使用）
+    ///
+    /// 只查 `category = 0xFF`（完整快照摘要行，写入路径见 `write_freeze_snapshot`），
+    /// 按时间倒序返回，跨全部触发类型。`limit` 控制最多返回多少行，避免长期
+    /// 运行后单次查询过大（正常情况下各触发类型容量之和有上限，不会太大）。
+    pub async fn query_freeze_history(
+        pool: &SqlitePool,
+        address: &str,
+        limit: i64,
+    ) -> Result<Vec<FreezeSnapshotRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT trigger_type, category, occurrence_idx, snapshot_time_ms, payload_json
+            FROM freeze_snapshots
+            WHERE address = ? AND category = 255
+            ORDER BY snapshot_time_ms DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(address)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let snapshot_time_ms: i64 = row.get("snapshot_time_ms");
+            let payload_json: String = row.get("payload_json");
+
+            let snapshot_time = chrono::DateTime::from_timestamp_millis(snapshot_time_ms)
+                .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
+                .with_timezone(&chrono::Local);
+
+            let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                .map_err(|e| sqlx::Error::Protocol(format!("JSON parse error: {}", e)))?;
+
+            result.push(FreezeSnapshotRow {
+                meter_address: address.to_string(),
+                trigger_type: row.get("trigger_type"),
+                category: row.get("category"),
+                occurrence_idx: row.get("occurrence_idx"),
+                snapshot_time,
+                payload,
+            });
+        }
+
+        Ok(result)
     }
 
     /// 查询负荷记录采样数据（供 DIHandler 读取使用）

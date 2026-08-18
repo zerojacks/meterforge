@@ -1439,12 +1439,108 @@ impl MeterActor {
                 // 3. 等待PersistenceWorker完成
                 Err("SaveState not yet fully implemented".to_string())
             }
+
+            AdminCommand::LoadFreezeHistory => self.load_freeze_history().await,
         };
 
         // 命令执行后立即推送快照（反映最新状态）
         self.push_snapshot();
 
         let _ = reply_tx.send(result);
+    }
+
+    /// 加载冻结历史：合并内存环形缓冲 + 数据库历史，去重后按时间倒序，
+    /// 序列化为 JSON 字符串返回（供 `AdminCommand::LoadFreezeHistory` 使用）。
+    ///
+    /// - 内存部分：遍历全部触发类型的环形缓冲，按缓冲区内位置计算真实序号
+    ///   （01=最近一次，与协议 DI0 语义一致）。
+    /// - 数据库部分：仅在启用了持久化（`db_pool` 存在）时查询，查询失败只是
+    ///   缺少更早的数据，不影响内存部分的展示，因此不会让整个命令失败。
+    /// - 去重 key 用 `(trigger, snapshot_time_ms)` 而不是 occurrence_idx——
+    ///   两边的序号编码方式不完全一致（内存按位置、数据库按挪号），时间戳才是
+    ///   稳定标识同一次冻结事件的字段。
+    async fn load_freeze_history(&mut self) -> Result<String, String> {
+        use crate::simulation::state::FreezeTrigger;
+        use crate::snapshot::FreezeSnapshotSummary;
+
+        const ALL_TRIGGERS: [FreezeTrigger; 7] = [
+            FreezeTrigger::Timed,
+            FreezeTrigger::Instant,
+            FreezeTrigger::TimeZoneSwitch,
+            FreezeTrigger::DayTableSwitch,
+            FreezeTrigger::Hourly,
+            FreezeTrigger::Daily,
+            FreezeTrigger::LadderSwitch,
+        ];
+
+        let address = format_address(&self.config.address);
+        let state = self.meter.state();
+
+        // 1. 内存环形缓冲
+        let mut merged: Vec<FreezeSnapshotSummary> = ALL_TRIGGERS
+            .iter()
+            .flat_map(|trigger| {
+                let trigger_label = format!("{:?}", trigger);
+                state
+                    .get_all_freeze_snapshots(*trigger)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(position, snap)| {
+                        FreezeSnapshotSummary::from_freeze_data(
+                            trigger_label.clone(),
+                            (position + 1) as u8,
+                            snap.snapshot_time.timestamp_millis(),
+                            &snap.data,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // 2. 数据库历史（失败不阻断加载，只是没有更早的数据）
+        if let Some(pool) = &self.config.db_pool {
+            match crate::persistence::PersistenceWorker::query_freeze_history(pool, &address, 500)
+                .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        match serde_json::from_value::<crate::simulation::FreezeData>(
+                            row.payload.clone(),
+                        ) {
+                            Ok(data) => {
+                                let trigger_label = FreezeTrigger::from_di2(row.trigger_type)
+                                    .map(|t| format!("{:?}", t))
+                                    .unwrap_or_else(|| {
+                                        format!("Unknown({:02X})", row.trigger_type)
+                                    });
+                                merged.push(FreezeSnapshotSummary::from_freeze_data(
+                                    trigger_label,
+                                    row.occurrence_idx,
+                                    row.snapshot_time.timestamp_millis(),
+                                    &data,
+                                ));
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[MeterActor {}] 冻结快照 payload 解析失败: {}",
+                                    address, e
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[MeterActor {}] 冻结历史查询失败: {}", address, e);
+                }
+            }
+        }
+
+        // 3. 去重 + 按时间倒序
+        let mut seen = std::collections::HashSet::new();
+        merged.retain(|s| seen.insert((s.trigger.clone(), s.snapshot_time_ms)));
+        merged.sort_by_key(|s| std::cmp::Reverse(s.snapshot_time_ms));
+
+        serde_json::to_string(&merged).map_err(|e| e.to_string())
     }
 
     /// 执行优雅关闭

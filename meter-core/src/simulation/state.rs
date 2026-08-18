@@ -340,15 +340,23 @@ impl FreezeRingBuffer {
 
     /// 添加新快照（自动循环覆盖）
     ///
-    /// 新快照插入到队首，旧快照后移，超过容量的自动丢弃
-    pub fn push(&mut self, snapshot: FreezeSnapshot) {
+    /// 新快照插入到队首并重排 occurrence_index（队首=1，DI0 语义），
+    /// 超过容量的自动丢弃。返回最新快照的序号。
+    pub fn push(&mut self, mut snapshot: FreezeSnapshot) -> u8 {
         // 插入到队首
+        snapshot.occurrence_index = 1;
         self.snapshots.push_front(snapshot);
 
         // 如果超过容量，移除最旧的
         if self.snapshots.len() > self.capacity {
             self.snapshots.pop_back();
         }
+
+        // 重排序号：队首 = 1（上1次），往后递增（上2次…）
+        for (index, snapshot) in self.snapshots.iter_mut().enumerate() {
+            snapshot.occurrence_index = (index + 1) as u8;
+        }
+        1
     }
 
     /// 获取指定索引的快照（DI0: 01-0C）
@@ -1686,7 +1694,10 @@ impl MeterState {
     /// 生成冻结快照并返回数据库行（用于持久化）
     ///
     /// 此方法生成快照并立即返回用于数据库写入的行数据
-    /// 调用方需要自行将其提交到 PersistenceWorker
+    /// 调用方需要自行将其提交到 PersistenceWorker。
+    ///
+    /// occurrence_idx 使用环形缓冲分配的真实序号（队首=1），
+    /// payload 为 FreezeData 的 serde 序列化（读取侧兼容旧平铺格式）。
     pub fn create_freeze_snapshot_with_persist(
         &mut self,
         trigger: FreezeTrigger,
@@ -1695,47 +1706,36 @@ impl MeterState {
 
         // 生成快照数据
         let snapshot_data = FreezeData::from_meter_state(self);
-        let occurrence_index = 1u8;
 
         // 创建快照
         let snapshot = FreezeSnapshot {
             snapshot_time: self.virtual_time,
             trigger_type: trigger,
-            occurrence_index,
+            occurrence_index: 1,
             data: snapshot_data.clone(),
         };
 
-        // 存储到环形缓冲区
-        if let Some(buffer) = self.freeze_snapshots.get_mut(&trigger) {
-            buffer.push(snapshot);
-        }
+        // 存储到环形缓冲区并取回真实序号
+        let occurrence_index = self
+            .freeze_snapshots
+            .get_mut(&trigger)
+            .map(|buffer| buffer.push(snapshot))
+            .unwrap_or(1);
 
-        // 生成数据库行（所有数据类别）
-        // 注意：冻结快照需要按数据类别（DI1）分别存储
+        // 生成数据库行：payload 为 FreezeData 全量 serde JSON（category=0xFF 完整快照）
+        let payload = serde_json::to_value(&snapshot_data).unwrap_or_else(|_| {
+            serde_json::json!({
+                "forward_active_total": snapshot_data.forward_active_total,
+                "reverse_active_total": snapshot_data.reverse_active_total,
+            })
+        });
         let row = FreezeSnapshotRow {
             meter_address: String::new(), // 由VirtualMeter填充
             trigger_type: trigger as u8,
             category: 0xFF, // 0xFF表示完整快照（包含所有类别）
             occurrence_idx: occurrence_index,
             snapshot_time: self.virtual_time,
-            payload: serde_json::json!({
-                "forward_active_total": snapshot_data.forward_active_total,
-                "forward_active_rate1": snapshot_data.forward_active_rates[0],
-                "forward_active_rate2": snapshot_data.forward_active_rates[1],
-                "forward_active_rate3": snapshot_data.forward_active_rates[2],
-                "forward_active_rate4": snapshot_data.forward_active_rates[3],
-                "reverse_active_total": snapshot_data.reverse_active_total,
-                "forward_reactive_total": snapshot_data.forward_reactive_total,
-                "reverse_reactive_total": snapshot_data.reverse_reactive_total,
-                "voltage_a": snapshot_data.voltages.map(|v| v[0]),
-                "voltage_b": snapshot_data.voltages.map(|v| v[1]),
-                "voltage_c": snapshot_data.voltages.map(|v| v[2]),
-                "current_a": snapshot_data.currents.map(|c| c[0]),
-                "current_b": snapshot_data.currents.map(|c| c[1]),
-                "current_c": snapshot_data.currents.map(|c| c[2]),
-                "power_factor": snapshot_data.power_factor,
-                "frequency": snapshot_data.frequency,
-            }),
+            payload,
         };
 
         (occurrence_index, row)

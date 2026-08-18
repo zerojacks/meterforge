@@ -26,6 +26,7 @@ use crate::settings::parameter_dialogs::{
     TouConfigDialog,
 };
 use crate::settings::SimulationConfigPanel;
+use meter_core::snapshot::FreezeSnapshotSummary;
 
 #[derive(Clone, Copy, Default)]
 enum DetailTab {
@@ -63,6 +64,10 @@ pub struct MeterDetailView {
     active_tab: DetailTab,
     log_panel: Entity<CommunicationLogPanel>,
     simulation_panel: Entity<SimulationConfigPanel>,
+    /// 合并了数据库历史并去重后的冻结数据；切到"冻结数据"tab 时按需异步加载，
+    /// 加载完成前 UI 用 snapshot 里的实时快照兜底（见 meter_history::freezes）。
+    freeze_history: Option<Vec<FreezeSnapshotSummary>>,
+    freeze_history_loading: bool,
 }
 
 impl MeterDetailView {
@@ -156,6 +161,8 @@ impl MeterDetailView {
             active_tab: DetailTab::default(),
             log_panel,
             simulation_panel,
+            freeze_history: None,
+            freeze_history_loading: false,
         }
     }
 
@@ -165,6 +172,33 @@ impl MeterDetailView {
 
     fn select_tab(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {
         self.active_tab = DetailTab::from_index(index);
+
+        // 只在切进"冻结数据"tab、且还没加载过（也没有正在加载）时才发起查询，
+        // 这样启动阶段和切到其它 tab 都不会碰数据库；切走再切回来也不会重复查。
+        if matches!(self.active_tab, DetailTab::Freezes)
+            && self.freeze_history.is_none()
+            && !self.freeze_history_loading
+        {
+            self.freeze_history_loading = true;
+            let address = self.address.clone();
+            let backend = cx.global::<AppBackend>().clone();
+            let task = backend.load_freeze_history(address, cx);
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.freeze_history_loading = false;
+                    match result {
+                        Ok(data) => this.freeze_history = Some(data),
+                        Err(error) => {
+                            tracing::warn!(%error, "加载冻结历史失败");
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
         cx.notify();
     }
 
@@ -394,9 +428,13 @@ impl Render for MeterDetailView {
             }
             DetailTab::Simulation => self.simulation_panel.clone().into_any_element(),
             DetailTab::Events => super::meter_history::events(&snapshot, &theme).into_any_element(),
-            DetailTab::Freezes => {
-                super::meter_history::freezes(&snapshot, &theme).into_any_element()
-            }
+            DetailTab::Freezes => super::meter_history::freezes(
+                &snapshot,
+                self.freeze_history.as_deref(),
+                self.freeze_history_loading,
+                &theme,
+            )
+            .into_any_element(),
         };
         div()
             .size_full()

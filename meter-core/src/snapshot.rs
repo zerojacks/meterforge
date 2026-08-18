@@ -122,6 +122,30 @@ pub struct MeterSnapshot {
     pub simulation: SimulationSnapshot,
 }
 
+impl FreezeSnapshotSummary {
+    /// 从冻结快照数据构建展示摘要。
+    ///
+    /// `occurrence_index` 语义遵循协议 A.6：01=最近一次，02=上一次……由调用方
+    /// 按实际来源计算（内存环形缓冲用位置，数据库行用挪号后的 occurrence_idx）。
+    pub fn from_freeze_data(
+        trigger_label: String,
+        occurrence_index: u8,
+        snapshot_time_ms: i64,
+        data: &crate::simulation::FreezeData,
+    ) -> Self {
+        Self {
+            trigger: trigger_label,
+            occurrence_index,
+            snapshot_time_ms,
+            forward_active_kwh: data.forward_active_total,
+            max_demand_kw: data.max_demand_active,
+            voltage_a: data.voltages.map(|values| values[0]),
+            voltage_b: data.voltages.map(|values| values[1]),
+            voltage_c: data.voltages.map(|values| values[2]),
+        }
+    }
+}
+
 impl MeterSnapshot {
     /// 构建默认快照（全零，仅带地址，用于 UI Entity 初始化）
     pub fn default_with_address(address: String) -> Self {
@@ -196,19 +220,28 @@ impl MeterSnapshot {
             })
             .collect();
         events.sort_by_key(|record| std::cmp::Reverse(record.start_time_ms));
+        // 注意：FreezeSnapshot.occurrence_index 字段本身在创建时恒为 1（见
+        // state.rs 的 create_freeze_snapshot 系列方法），真正的"第几次"由
+        // 环形缓冲区内的位置决定（get_all() 按新到旧排列），这里按位置重新
+        // 计算，使其与协议 DI0（01=最近一次）语义一致，也便于跟数据库历史合并。
         let mut freezes: Vec<_> = state
             .freeze_snapshots
-            .values()
-            .flat_map(|records| records.get_all())
-            .map(|freeze| FreezeSnapshotSummary {
-                trigger: format!("{:?}", freeze.trigger_type),
-                occurrence_index: freeze.occurrence_index,
-                snapshot_time_ms: freeze.snapshot_time.timestamp_millis(),
-                forward_active_kwh: freeze.data.forward_active_total,
-                max_demand_kw: freeze.data.max_demand_active,
-                voltage_a: freeze.data.voltages.map(|values| values[0]),
-                voltage_b: freeze.data.voltages.map(|values| values[1]),
-                voltage_c: freeze.data.voltages.map(|values| values[2]),
+            .iter()
+            .flat_map(|(trigger, records)| {
+                let trigger_label = format!("{:?}", trigger);
+                records
+                    .get_all()
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(position, freeze)| {
+                        FreezeSnapshotSummary::from_freeze_data(
+                            trigger_label.clone(),
+                            (position + 1) as u8,
+                            freeze.snapshot_time.timestamp_millis(),
+                            &freeze.data,
+                        )
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         freezes.sort_by_key(|record| std::cmp::Reverse(record.snapshot_time_ms));

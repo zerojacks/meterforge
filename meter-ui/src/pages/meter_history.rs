@@ -3,6 +3,7 @@ use crate::types::MeterSnapshot;
 use chrono::Local;
 use gpui::*;
 use gpui_component::{h_flex, label::Label, *};
+use meter_core::snapshot::FreezeSnapshotSummary;
 
 pub fn events(snapshot: &MeterSnapshot, theme: &Theme) -> impl IntoElement {
     div()
@@ -66,7 +67,18 @@ pub fn events(snapshot: &MeterSnapshot, theme: &Theme) -> impl IntoElement {
         }))
 }
 
-pub fn freezes(snapshot: &MeterSnapshot, theme: &Theme) -> impl IntoElement {
+/// 渲染冻结数据标签页。
+///
+/// `history` 是通过 `AppBackend::load_freeze_history` 异步加载、合并了数据库
+/// 历史并去重后的完整列表；在它加载完成之前（或加载失败）先用 `snapshot.freezes`
+/// （仅内存环形缓冲、重启后可能不完整）兜底展示，避免切到这个 tab 时先空一下。
+pub fn freezes(
+    snapshot: &MeterSnapshot,
+    history: Option<&[FreezeSnapshotSummary]>,
+    loading: bool,
+    theme: &Theme,
+) -> impl IntoElement {
+    let items: &[FreezeSnapshotSummary] = history.unwrap_or(&snapshot.freezes);
     div()
         .flex()
         .flex_col()
@@ -74,14 +86,15 @@ pub fn freezes(snapshot: &MeterSnapshot, theme: &Theme) -> impl IntoElement {
         .gap_4()
         .child(Label::new("冻结数据").text_2xl().font_semibold())
         .child(
-            Label::new(format!(
-                "共 {} 条冻结快照，按冻结时间倒序显示",
-                snapshot.freezes.len()
-            ))
+            Label::new(if loading && history.is_none() {
+                "正在从数据库加载历史冻结数据…".to_string()
+            } else {
+                format!("共 {} 条冻结快照，按冻结时间倒序显示", items.len())
+            })
             .text_sm()
             .text_color(theme.muted_foreground),
         )
-        .children(snapshot.freezes.iter().map(|freeze| {
+        .children(items.iter().map(|freeze| {
             let time = chrono::DateTime::from_timestamp_millis(freeze.snapshot_time_ms)
                 .map(|v| {
                     v.with_timezone(&Local)

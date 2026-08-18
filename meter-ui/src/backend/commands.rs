@@ -1,6 +1,7 @@
 use gpui::*;
 use meter_core::actor::{AdminCommand, MeterActorHandle};
 use meter_core::simulation::SimulationConfig;
+use meter_core::snapshot::FreezeSnapshotSummary;
 use meter_core::ConnectionManager;
 use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc};
@@ -176,6 +177,28 @@ impl AppBackend {
                 }
             })
             .detach();
+    }
+
+    /// 异步加载某块表的冻结历史（内存环形缓冲 + 数据库，已合并去重）。
+    ///
+    /// 与 `dispatch` 不同，这是一个查询：不直接操作数据库，只是通过 admin
+    /// 通道把请求转发给对应的 `MeterActor`，由它在自己的异步上下文里完成
+    /// 内存/数据库合并后把 JSON 结果传回来。调用方（UI 视图）应在切换到
+    /// "冻结数据"标签页时调用一次，用 `cx.spawn` await 这个 Task。
+    pub fn load_freeze_history(
+        &self,
+        address: String,
+        cx: &App,
+    ) -> Task<Result<Vec<FreezeSnapshotSummary>, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            let json = handle
+                .send_admin_command(AdminCommand::LoadFreezeHistory)
+                .await?;
+            serde_json::from_str(&json).map_err(|e| e.to_string())
+        })
     }
 
     /// Gracefully shutdown all meters (save virtual time and energy registers)

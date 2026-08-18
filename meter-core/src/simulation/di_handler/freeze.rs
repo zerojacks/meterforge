@@ -98,8 +98,14 @@ impl DIHandler {
         }
 
         // DI0 > max_memory_index: 从数据库查询
+        //
+        // 注意：数据库里每次冻结只落一行完整摘要（category=0xFF，见
+        // write_freeze_snapshot），具体某个 DI1 类别的数据是从这行完整快照里
+        // 现场解码出来的（encode_freeze_data_from_db_row），所以查询时 category
+        // 固定传 0xFF，不能直接传 di1 —— 之前这里传 di1 会导致除 di1=0xFF 外的
+        // 查询永远查不到数据（库里根本没有那个 category 的行）。
         let snapshot_row =
-            PersistenceWorker::query_freeze_snapshot(db_pool, address, di2, di1, di0)
+            PersistenceWorker::query_freeze_snapshot(db_pool, address, di2, 0xFF, di0)
                 .await
                 .map_err(|e| format!("数据库查询失败: {}", e))?
                 .ok_or_else(|| {
@@ -109,7 +115,7 @@ impl DIHandler {
                     )
                 })?;
 
-        // 从数据库行解析数据
+        // 从数据库行解析数据，按 di1 抽取具体类别
         self.encode_freeze_data_from_db_row(di1, &snapshot_row)
     }
 
