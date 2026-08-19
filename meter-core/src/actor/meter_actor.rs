@@ -1553,12 +1553,12 @@ impl MeterActor {
     /// 而非报错，与"未启用持久化=没有历史数据可看"的语义一致。
     async fn load_load_profile_history(&mut self, max_records: u32) -> Result<String, String> {
         use crate::simulation::state::LoadRecordData;
-        use crate::snapshot::{KeyValuePair, LoadRecordSummary};
+        use crate::snapshot::LoadRecordSnapshot;
 
         let address = format_address(&self.config.address);
 
         let Some(pool) = &self.config.db_pool else {
-            return serde_json::to_string(&Vec::<LoadRecordSummary>::new())
+            return serde_json::to_string(&Vec::<LoadRecordSnapshot>::new())
                 .map_err(|e| e.to_string());
         };
 
@@ -1574,87 +1574,22 @@ impl MeterActor {
         .await
         .map_err(|e| format!("负荷记录查询失败: {e}"))?;
 
-        let summaries: Vec<LoadRecordSummary> = rows
+        let snapshots: Vec<LoadRecordSnapshot> = rows
             .into_iter()
             .filter_map(|row| {
                 // 反序列化JSON payload
                 let data: LoadRecordData = serde_json::from_value(row.payload).ok()?;
 
-                // 生成类别标签
-                let class_label = format!("第{}类负荷", row.class_id);
-
-                // 生成数据块摘要
-                let mut blocks = Vec::new();
-                if data.vif.is_some() {
-                    blocks.push("电压电流频率");
-                }
-                if data.pq.is_some() {
-                    blocks.push("有无功功率");
-                }
-                if data.pf.is_some() {
-                    blocks.push("功率因数");
-                }
-                if data.energy.is_some() {
-                    blocks.push("电能");
-                }
-                if data.quadrant.is_some() {
-                    blocks.push("四象限");
-                }
-                if data.demand.is_some() {
-                    blocks.push("需量");
-                }
-                let blocks_summary = if blocks.is_empty() {
-                    "无数据".to_string()
-                } else {
-                    blocks.join(" · ")
-                };
-
-                // 提取关键数值
-                let mut key_values = Vec::new();
-
-                // 电压（取A相）
-                if let Some(vif) = &data.vif {
-                    key_values.push(KeyValuePair {
-                        label: "A相电压".to_string(),
-                        value: format!("{:.1}", vif.voltage_a),
-                        unit: "V".to_string(),
-                    });
-                    key_values.push(KeyValuePair {
-                        label: "频率".to_string(),
-                        value: format!("{:.2}", vif.frequency),
-                        unit: "Hz".to_string(),
-                    });
-                }
-
-                // 有功功率（取总）
-                if let Some(pq) = &data.pq {
-                    key_values.push(KeyValuePair {
-                        label: "总有功功率".to_string(),
-                        value: format!("{:.4}", pq.active_total),
-                        unit: "kW".to_string(),
-                    });
-                }
-
-                // 电能（取正向有功）
-                if let Some(energy) = &data.energy {
-                    key_values.push(KeyValuePair {
-                        label: "正向有功电能".to_string(),
-                        value: format!("{:.2}", energy.forward_active),
-                        unit: "kWh".to_string(),
-                    });
-                }
-
-                Some(LoadRecordSummary {
-                    class_label,
-                    class_id: row.class_id,
-                    sample_time_ms: row.sample_time.timestamp_millis(),
-                    blocks_summary,
-                    key_values,
-                })
+                // 使用 LoadRecordSnapshot::from_load_record_data 统一转换
+                Some(LoadRecordSnapshot::from_load_record_data(
+                    row.class_id,
+                    row.sample_time.timestamp_millis(),
+                    &data,
+                ))
             })
             .collect();
 
-        serde_json::to_string(&summaries).map_err(|e| e.to_string())
+        serde_json::to_string(&snapshots).map_err(|e| e.to_string())
     }
 
     /// 执行优雅关闭

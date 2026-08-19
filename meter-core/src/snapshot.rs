@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::format::format_address;
-use crate::simulation::state::MeterState;
+use crate::simulation::state::{MeterState, LoadRecordData};
 use crate::simulation::{EnergyType, LoadModelConfig, LoadProfile};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,29 +86,80 @@ pub struct EventSnapshot {
     pub data_hex: String,
 }
 
-/// 为展示层准备的负荷记录摘要（对应 `load_profile_records` 表新方案）
+/// 负荷记录快照（统一的负荷记录类型）
 ///
-/// 每条记录是某类负荷某时刻的完整快照，展示其选通的数据块摘要。
+/// 既用于实时快照推送（MeterSnapshot.load_records），也用于数据库历史查询。
+/// 包含完整的原始数据字段，UI层按需格式化展示。
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoadRecordSummary {
-    /// 类别标签（第1~6类负荷记录）
-    pub class_label: String,
-    /// 类别ID（1-6）
+pub struct LoadRecordSnapshot {
     pub class_id: u8,
-    /// 采样时刻
     pub sample_time_ms: i64,
-    /// 选通的数据块摘要（用于快速展示）
-    pub blocks_summary: String,
-    /// 关键数值摘要（可选，用于详细展示）
-    pub key_values: Vec<KeyValuePair>,
+    pub voltage_a: Option<f32>,
+    pub voltage_b: Option<f32>,
+    pub voltage_c: Option<f32>,
+    pub current_a: Option<f32>,
+    pub current_b: Option<f32>,
+    pub current_c: Option<f32>,
+    pub active_power_kw: Option<f32>,
+    pub reactive_power_kvar: Option<f32>,
+    pub power_factor: Option<f32>,
+    pub energy_forward_active_kwh: Option<f64>,
+    pub energy_reverse_active_kwh: Option<f64>,
 }
 
-/// 键值对，用于展示负荷记录的关键数据
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KeyValuePair {
-    pub label: String,
-    pub value: String,
-    pub unit: String,
+impl LoadRecordSnapshot {
+    /// 从 LoadRecordData 构建快照
+    pub fn from_load_record_data(
+        class_id: u8,
+        sample_time_ms: i64,
+        data: &LoadRecordData,
+    ) -> Self {
+        Self {
+            class_id,
+            sample_time_ms,
+            voltage_a: data.vif.as_ref().map(|v| v.voltage_a as f32),
+            voltage_b: data.vif.as_ref().map(|v| v.voltage_b as f32),
+            voltage_c: data.vif.as_ref().map(|v| v.voltage_c as f32),
+            current_a: data.vif.as_ref().map(|v| v.current_a as f32),
+            current_b: data.vif.as_ref().map(|v| v.current_b as f32),
+            current_c: data.vif.as_ref().map(|v| v.current_c as f32),
+            active_power_kw: data.pq.as_ref().map(|v| v.active_total as f32),
+            reactive_power_kvar: data.pq.as_ref().map(|v| v.reactive_total as f32),
+            power_factor: data.pf.as_ref().map(|v| v.total as f32),
+            energy_forward_active_kwh: data.energy.as_ref().map(|v| v.forward_active),
+            energy_reverse_active_kwh: data.energy.as_ref().map(|v| v.reverse_active),
+        }
+    }
+    
+    /// 生成类别标签（UI辅助方法）
+    pub fn class_label(&self) -> String {
+        format!("第{}类负荷记录", self.class_id)
+    }
+    
+    /// 生成数据块摘要（UI辅助方法）
+    pub fn blocks_summary(&self) -> String {
+        let mut blocks = Vec::new();
+        if self.voltage_a.is_some() || self.voltage_b.is_some() || self.voltage_c.is_some() {
+            blocks.push("电压");
+        }
+        if self.current_a.is_some() || self.current_b.is_some() || self.current_c.is_some() {
+            blocks.push("电流");
+        }
+        if self.active_power_kw.is_some() || self.reactive_power_kvar.is_some() {
+            blocks.push("功率");
+        }
+        if self.power_factor.is_some() {
+            blocks.push("功率因数");
+        }
+        if self.energy_forward_active_kwh.is_some() || self.energy_reverse_active_kwh.is_some() {
+            blocks.push("电能");
+        }
+        if blocks.is_empty() {
+            "无数据".to_string()
+        } else {
+            blocks.join("·")
+        }
+    }
 }
 
 /// 为展示层准备的冻结快照摘要。
@@ -144,6 +195,7 @@ pub struct MeterSnapshot {
     pub recent_event_count: u16,
     pub events: Vec<EventSnapshot>,
     pub freezes: Vec<FreezeSnapshotSummary>,
+    pub load_records: Vec<LoadRecordSnapshot>,
     pub simulation: SimulationSnapshot,
 }
 
@@ -192,6 +244,7 @@ impl MeterSnapshot {
             recent_event_count: 0,
             events: Vec::new(),
             freezes: Vec::new(),
+            load_records: Vec::new(),
             simulation: SimulationSnapshot {
                 load_profile: "Residential".into(),
                 fixed_load_factor: None,
@@ -271,6 +324,20 @@ impl MeterSnapshot {
             .collect();
         freezes.sort_by_key(|record| std::cmp::Reverse(record.snapshot_time_ms));
 
+        // 收集最近的负荷记录（跨所有类别，最新的在前）
+        let mut load_records: Vec<_> = state
+            .recent_load_records
+            .iter()
+            .flat_map(|(class_id, records)| {
+                records.iter().map(|sample| LoadRecordSnapshot::from_load_record_data(
+                    *class_id,
+                    sample.sample_time.timestamp_millis(),
+                    &sample.data,
+                ))
+            })
+            .collect();
+        load_records.sort_by_key(|record| std::cmp::Reverse(record.sample_time_ms));
+
         Self {
             address: format_address(&state.address),
             virtual_time_ms: state.virtual_time.timestamp_millis(),
@@ -290,6 +357,7 @@ impl MeterSnapshot {
             recent_event_count,
             events,
             freezes,
+            load_records,
             simulation: SimulationSnapshot {
                 load_profile: match load_model.profile {
                     LoadProfile::Residential => "Residential".into(),

@@ -6,7 +6,7 @@
 // - WAL 模式：减少写锁竞争
 // - 非阻塞：Actor 的 tick 循环不被磁盘 I/O 阻塞
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::path::Path;
@@ -827,6 +827,41 @@ impl PersistenceWorker {
         .await?;
 
         Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 查询每个类别的最后一次采样时间（用于重启后恢复采样状态）
+    ///
+    /// 返回：[Option<DateTime<Utc>>; 6]，索引对应类别1-6（索引0对应类别1）
+    pub async fn restore_last_sample_times(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<[Option<DateTime<Utc>>; 6], sqlx::Error> {
+        let mut last_sample_times = [None; 6];
+
+        for class_id in 1..=6 {
+            let row: Option<(i64,)> = sqlx::query_as(
+                r#"
+                SELECT sample_time_ms
+                FROM load_profile_records
+                WHERE address = ? AND class_id = ?
+                ORDER BY sample_time_ms DESC
+                LIMIT 1
+                "#,
+            )
+            .bind(address)
+            .bind(class_id as i64)
+            .fetch_optional(pool)
+            .await?;
+
+            if let Some((timestamp_ms,)) = row {
+                use chrono::TimeZone;
+                if let Some(dt) = chrono::Utc.timestamp_millis_opt(timestamp_ms).single() {
+                    last_sample_times[class_id - 1] = Some(dt);
+                }
+            }
+        }
+
+        Ok(last_sample_times)
     }
 
     /// 查询最近的负荷记录（跨类别，或按 `class_id` 过滤单一类别），不依赖任何

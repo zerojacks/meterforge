@@ -725,11 +725,21 @@ impl PhysicsEngine {
             {
                 // 整行采集：一次抓全部选通块，时间戳取同一虚拟时钟
                 let data = LoadRecordData::from_meter_state(state, mode_word);
-                samples.push(super::state::LoadRecordSample {
+                let sample = super::state::LoadRecordSample {
                     class_id: (class_idx + 1) as u8,
                     sample_time: now,
-                    data,
-                });
+                    data: data.clone(),
+                };
+                
+                samples.push(sample.clone());
+
+                // 更新内存中的最近记录（保留最近5次）
+                let class_id = (class_idx + 1) as u8;
+                let recent_records = state.recent_load_records.entry(class_id).or_insert_with(VecDeque::new);
+                recent_records.push_front(sample); // 最新的在前
+                while recent_records.len() > 5 {
+                    recent_records.pop_back(); // 移除最旧的
+                }
 
                 state
                     .load_profile_state

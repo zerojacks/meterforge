@@ -996,6 +996,13 @@ pub struct LoadProfileSamplingState {
 }
 
 impl LoadProfileSamplingState {
+    /// 从数据库恢复的最后采样时间初始化状态
+    pub fn from_last_sample_times(times: [Option<DateTime<Utc>>; 6]) -> Self {
+        Self {
+            last_sample_times: times,
+        }
+    }
+
     /// 检查某类是否到达采样节拍
     pub fn should_sample(
         &self,
@@ -1009,11 +1016,24 @@ impl LoadProfileSamplingState {
         if class_idx >= 6 {
             return false;
         }
+        
+        // 计算当前时间对应的对齐点（向下取整到最近的间隔倍数）
+        // 例如：15分钟间隔，12:17 的对齐点是 12:15
+        let total_minutes = current_time.hour() as i64 * 60 + current_time.minute() as i64;
+        let aligned_minutes = (total_minutes / interval_minutes as i64) * interval_minutes as i64;
+        
         match self.last_sample_times[class_idx] {
-            None => true, // 从未采样过
+            None => {
+                // 从未采样过，直接采样
+                true
+            }
             Some(last_time) => {
-                let elapsed = (*current_time - last_time).num_minutes();
-                elapsed >= interval_minutes as i64
+                // 计算上次采样时的对齐点
+                let last_total_minutes = last_time.hour() as i64 * 60 + last_time.minute() as i64;
+                let last_aligned_minutes = (last_total_minutes / interval_minutes as i64) * interval_minutes as i64;
+                
+                // 如果当前对齐点不同于上次对齐点，说明已经跨过了至少一个采样点
+                aligned_minutes > last_aligned_minutes
             }
         }
     }
@@ -1305,6 +1325,10 @@ pub struct MeterState {
     /// 负荷记录采样状态（跟踪上次采样时间）
     pub load_profile_state: LoadProfileSamplingState,
 
+    /// 最近的负荷记录快照（每个类别保存最近5次）
+    /// Key = class_id (1-6)，Value = 环形缓冲区（最多5条，最新的在前）
+    pub recent_load_records: HashMap<u8, VecDeque<LoadRecordSample>>,
+
     /// 当前冻结数据（DI0=00，不在环形缓冲中，实时查询）
     ///
     /// 注意：根据协议，DI0=00 表示"当前"数据，不是历史快照
@@ -1471,6 +1495,7 @@ impl Default for MeterState {
 
             // 负荷记录采样状态
             load_profile_state: LoadProfileSamplingState::default(),
+            recent_load_records: HashMap::new(),
 
             // 冻结触发标志
             pending_freeze_trigger: None,
@@ -2147,3 +2172,135 @@ mod tests {
         assert_eq!(buffer.len(), 0);
     }
 }
+
+    #[test]
+    fn test_load_profile_sampling_alignment() {
+        use chrono::TimeZone;
+
+        let mut sampling_state = LoadProfileSamplingState::default();
+        
+        // 测试15分钟间隔，应该在 0, 15, 30, 45 分采样
+        let interval = 15;
+        
+        // 12:00:00 - 应该采样
+        let time_12_00 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_00, interval));
+        sampling_state.update_sample_time(0, time_12_00);
+        
+        // 12:07:00 - 不应该采样（还在同一对齐点 12:00-12:14）
+        let time_12_07 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 7, 0).unwrap();
+        assert!(!sampling_state.should_sample(0, &time_12_07, interval));
+        
+        // 12:15:00 - 应该采样（新的对齐点）
+        let time_12_15 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 15, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_15, interval));
+        sampling_state.update_sample_time(0, time_12_15);
+        
+        // 12:30:00 - 应该采样
+        let time_12_30 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_30, interval));
+        sampling_state.update_sample_time(0, time_12_30);
+        
+        // 12:45:00 - 应该采样
+        let time_12_45 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 45, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_45, interval));
+        sampling_state.update_sample_time(0, time_12_45);
+        
+        // 13:00:00 - 应该采样（下一个小时的整点）
+        let time_13_00 = Utc.with_ymd_and_hms(2025, 1, 1, 13, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_13_00, interval));
+    }
+
+    #[test]
+    fn test_load_profile_sampling_skip_alignment_point() {
+        use chrono::TimeZone;
+
+        let mut sampling_state = LoadProfileSamplingState::default();
+        let interval = 15;
+        
+        // 12:00:00 - 第一次采样
+        let time_12_00 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_00, interval));
+        sampling_state.update_sample_time(0, time_12_00);
+        
+        // 关键测试：从 12:00 跳到 12:15:03（秒数不为0，跨过了采样点）
+        // 应该仍然能够采样，因为已经跨过了一个对齐点
+        let time_12_15_03 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 15, 3).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_15_03, interval), 
+                "应该能够在 12:15:03 采样，即使秒数不为0");
+        sampling_state.update_sample_time(0, time_12_15_03);
+        
+        // 12:15:05 - 同一个对齐点内（12:15-12:29），不应该重复采样
+        let time_12_15_05 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 15, 5).unwrap();
+        assert!(!sampling_state.should_sample(0, &time_12_15_05, interval),
+                "同一对齐点内不应该重复采样");
+        
+        // 从 12:15 直接跳到 12:47（跨过了 12:30 和 12:45 两个采样点）
+        // 应该在到达 12:47 时立即采样（代表 12:45 的对齐点）
+        let time_12_47 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 47, 0).unwrap();
+        assert!(sampling_state.should_sample(0, &time_12_47, interval),
+                "跨过采样点后应该立即采样");
+        sampling_state.update_sample_time(0, time_12_47);
+        
+        // 12:50 - 同一对齐点（12:45），不应该再采样
+        let time_12_50 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 50, 0).unwrap();
+        assert!(!sampling_state.should_sample(0, &time_12_50, interval));
+    }
+
+    #[test]
+    fn test_load_profile_sampling_various_intervals() {
+        use chrono::TimeZone;
+
+        let mut sampling_state = LoadProfileSamplingState::default();
+        
+        // 测试30分钟间隔，应该在 0, 30 分采样
+        let interval_30 = 30;
+        
+        let time_12_00 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(1, &time_12_00, interval_30));
+        sampling_state.update_sample_time(1, time_12_00);
+        
+        let time_12_15 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 15, 0).unwrap();
+        assert!(!sampling_state.should_sample(1, &time_12_15, interval_30));
+        
+        let time_12_30 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
+        assert!(sampling_state.should_sample(1, &time_12_30, interval_30));
+        sampling_state.update_sample_time(1, time_12_30);
+        
+        let time_13_00 = Utc.with_ymd_and_hms(2025, 1, 1, 13, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(1, &time_13_00, interval_30));
+        
+        // 测试60分钟间隔，应该只在整点采样
+        let interval_60 = 60;
+        
+        let time_14_00 = Utc.with_ymd_and_hms(2025, 1, 1, 14, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(2, &time_14_00, interval_60));
+        sampling_state.update_sample_time(2, time_14_00);
+        
+        let time_14_30 = Utc.with_ymd_and_hms(2025, 1, 1, 14, 30, 0).unwrap();
+        assert!(!sampling_state.should_sample(2, &time_14_30, interval_60));
+        
+        let time_15_00 = Utc.with_ymd_and_hms(2025, 1, 1, 15, 0, 0).unwrap();
+        assert!(sampling_state.should_sample(2, &time_15_00, interval_60));
+    }
+
+    #[test]
+    fn test_load_profile_no_duplicate_sampling() {
+        use chrono::TimeZone;
+
+        let mut sampling_state = LoadProfileSamplingState::default();
+        
+        let interval = 15;
+        let time_12_00 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+        
+        // 第一次采样
+        assert!(sampling_state.should_sample(0, &time_12_00, interval));
+        sampling_state.update_sample_time(0, time_12_00);
+        
+        // 同一对齐点内的任何时间都不应该重复采样
+        let time_12_05 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 5, 0).unwrap();
+        assert!(!sampling_state.should_sample(0, &time_12_05, interval));
+        
+        let time_12_14 = Utc.with_ymd_and_hms(2025, 1, 1, 12, 14, 59).unwrap();
+        assert!(!sampling_state.should_sample(0, &time_12_14, interval));
+    }

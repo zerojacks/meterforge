@@ -145,6 +145,28 @@ impl VirtualMeter {
             }
         }
 
+        // 4. 恢复负荷记录采样状态（每个类别的最后一次采样时间）
+        //
+        // 防止重启后重复采样：如果重启前刚采样过 12:15，重启后在 12:16
+        // 不应该再次采样，应该等到 12:30。
+        match PersistenceWorker::restore_last_sample_times(pool, &address_str).await {
+            Ok(last_sample_times) => {
+                let non_empty_count = last_sample_times.iter().filter(|t| t.is_some()).count();
+                if non_empty_count > 0 {
+                    self.state.load_profile_state = 
+                        super::state::LoadProfileSamplingState::from_last_sample_times(last_sample_times);
+                    println!(
+                        "[VirtualMeter] Restored last sample times for {} class(es)",
+                        non_empty_count
+                    );
+                }
+            }
+            Err(e) => {
+                // 非致命错误，只记录警告，不阻止启动
+                eprintln!("Warning: Failed to restore last sample times: {}", e);
+            }
+        }
+
         Ok(true)
     }
 

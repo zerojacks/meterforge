@@ -210,7 +210,7 @@ impl AppBackend {
         address: String,
         max_records: u32,
         cx: &App,
-    ) -> Task<Result<Vec<meter_core::snapshot::LoadRecordSummary>, String>> {
+    ) -> Task<Result<Vec<meter_core::snapshot::LoadRecordSnapshot>, String>> {
         let Some(handle) = self.meters.read().get(&address).cloned() else {
             return Task::ready(Err(format!("meter {address} not found")));
         };

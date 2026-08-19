@@ -26,7 +26,7 @@ use crate::settings::parameter_dialogs::{
     TouConfigDialog,
 };
 use crate::settings::SimulationConfigPanel;
-use meter_core::snapshot::{FreezeSnapshotSummary, LoadRecordSummary};
+use meter_core::snapshot::FreezeSnapshotSummary;
 
 /// "负荷记录"标签页每次最多拉取的采样条数（跨全部数据类型/通道）。
 const LOAD_PROFILE_HISTORY_LIMIT: u32 = 200;
@@ -75,9 +75,7 @@ pub struct MeterDetailView {
     freeze_history: Option<Vec<FreezeSnapshotSummary>>,
     freeze_history_loading: bool,
     /// 数据库里最近的负荷记录采样；切到"负荷记录"tab 时按需异步加载。
-    /// 负荷记录落库后不维护内存历史，加载完成前只能展示"正在加载"，没有
-    /// 实时快照可兜底（见 meter_history::load_profile）。
-    load_profile_history: Option<Vec<LoadRecordSummary>>,
+    load_profile_history: Option<Vec<meter_core::snapshot::LoadRecordSnapshot>>,
     load_profile_history_loading: bool,
 }
 
@@ -479,6 +477,7 @@ impl Render for MeterDetailView {
             )
             .into_any_element(),
             DetailTab::LoadProfile => super::meter_history::load_profile(
+                &snapshot,
                 self.load_profile_history.as_deref(),
                 self.load_profile_history_loading,
                 &theme,
