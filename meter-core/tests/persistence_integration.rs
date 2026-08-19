@@ -160,7 +160,7 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
             trigger_type: trigger as u8,
             category: 0x01, // DI1=01 正向有功总电能（与测试查询匹配）
             occurrence_idx: i,
-            snapshot_time: chrono::Local::now(),
+            snapshot_time: chrono::Utc::now(),
             payload: serde_json::json!({
                 "forward_active_total": 1000.0 + i as f64 * 100.0,
                 "reverse_active_total": 500.0,
@@ -249,7 +249,7 @@ async fn test_ring_buffer_overflow_with_database() {
             trigger_type: trigger as u8,
             category: 0xFF,
             occurrence_idx,
-            snapshot_time: chrono::Local::now(),
+            snapshot_time: chrono::Utc::now(),
             payload: serde_json::json!({
                 "forward_active_total": 100.0 + i as f64 * 10.0,
                 "reverse_active_total": 50.0,
@@ -321,7 +321,7 @@ async fn test_persistence_worker_batch_write() {
             trigger_type: FreezeTrigger::Timed as u8,
             category: 0xFF,
             occurrence_idx: (i % 12 + 1) as u8, // 模拟环形覆盖
-            snapshot_time: chrono::Local::now(),
+            snapshot_time: chrono::Utc::now(),
             payload: serde_json::json!({
                 "forward_active_total": 1000.0 + i as f64,
                 "reverse_active_total": 500.0,

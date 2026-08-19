@@ -53,7 +53,7 @@ pub(super) fn encode_bcd(value: f64, bytes: usize, decimals: usize) -> Vec<u8> {
 }
 
 /// 编码日期时间 (ss mm hh DD MM YY, 6字节 BCD)
-pub(super) fn encode_datetime(dt: &chrono::DateTime<chrono::Local>) -> Vec<u8> {
+pub(super) fn encode_datetime(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
     vec![
         to_bcd(dt.second() as u8),
         to_bcd(dt.minute() as u8),

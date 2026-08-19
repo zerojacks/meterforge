@@ -1,6 +1,6 @@
 // 电表状态 - 包含所有需要读写的数据
 
-use chrono::{DateTime, Local, Timelike};
+use chrono::{DateTime, Utc, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -25,7 +25,7 @@ pub enum EnergyType {
 #[derive(Debug, Clone, Copy)]
 pub struct DemandValue {
     pub value: f64,
-    pub time: DateTime<Local>,
+    pub time: DateTime<Utc>,
 }
 
 /// 事件类型（对应DI2）
@@ -59,10 +59,10 @@ pub struct EventRecord {
     pub sub_type: u8,
 
     /// 事件开始时间
-    pub start_time: DateTime<Local>,
+    pub start_time: DateTime<Utc>,
 
     /// 事件结束时间（None表示事件仍在进行中）
-    pub end_time: Option<DateTime<Local>>,
+    pub end_time: Option<DateTime<Utc>>,
 
     /// 事件数据（根据事件类型不同，存储不同的数据）
     pub data: Vec<u8>,
@@ -70,7 +70,7 @@ pub struct EventRecord {
 
 impl EventRecord {
     /// 创建新的事件记录
-    pub fn new(event_type: u8, sub_type: u8, start_time: DateTime<Local>, data: Vec<u8>) -> Self {
+    pub fn new(event_type: u8, sub_type: u8, start_time: DateTime<Utc>, data: Vec<u8>) -> Self {
         Self {
             event_type,
             sub_type,
@@ -81,7 +81,7 @@ impl EventRecord {
     }
 
     /// 结束事件
-    pub fn end_event(&mut self, end_time: DateTime<Local>) {
+    pub fn end_event(&mut self, end_time: DateTime<Utc>) {
         self.end_time = Some(end_time);
     }
 
@@ -94,7 +94,7 @@ impl EventRecord {
             }
             None => {
                 // 事件仍在进行中，计算到当前时间
-                let duration = Local::now().signed_duration_since(self.start_time);
+                let duration = Utc::now().signed_duration_since(self.start_time);
                 (duration.num_minutes().max(0)) as u32
             }
         }
@@ -196,7 +196,7 @@ pub struct TimeSlotTable {
 
 impl TimeSlotTable {
     /// 根据当前时间查询所属费率
-    pub fn get_rate_at_time(&self, time: &DateTime<Local>) -> u8 {
+    pub fn get_rate_at_time(&self, time: &DateTime<Utc>) -> u8 {
         let hour = time.hour() as u8;
         let minute = time.minute() as u8;
         let current_minutes = hour as u16 * 60 + minute as u16;
@@ -290,8 +290,8 @@ pub struct TouConfig {
     pub time_zone_table_2: TimeZoneTable, // 第二套时区表（04-00-03-05）
     pub day_table_1: TimeSlotTable,       // 第一套日时段表（04-00-02-01）
     pub day_table_2: TimeSlotTable,       // 第二套日时段表（04-00-02-02）
-    pub time_zone_switch_datetime: Option<DateTime<Local>>, // 时区表切换时间（04-00-01-06）
-    pub day_table_switch_datetime: Option<DateTime<Local>>, // 日时段表切换时间（04-00-01-07）
+    pub time_zone_switch_datetime: Option<DateTime<Utc>>, // 时区表切换时间（04-00-01-06）
+    pub day_table_switch_datetime: Option<DateTime<Utc>>, // 日时段表切换时间（04-00-01-07）
 }
 
 impl Default for TouConfig {
@@ -488,7 +488,7 @@ impl FreezeDataCategory {
 #[derive(Debug, Clone)]
 pub struct FreezeSnapshot {
     /// 快照时间（虚拟时钟）
-    pub snapshot_time: DateTime<Local>,
+    pub snapshot_time: DateTime<Utc>,
 
     /// 触发类型（DI2）
     pub trigger_type: FreezeTrigger,
@@ -550,18 +550,18 @@ pub struct FreezeData {
     /// 正向有功最大需量 (kW)
     pub max_demand_active: f64,
     /// 正向有功最大需量发生时间
-    pub max_demand_active_time: DateTime<Local>,
+    pub max_demand_active_time: DateTime<Utc>,
 
     /// 正向有功最大需量分费率（值 + 发生时间）
-    pub max_demand_active_rates: Vec<(f64, DateTime<Local>)>,
+    pub max_demand_active_rates: Vec<(f64, DateTime<Utc>)>,
 
     /// 正向无功最大需量 (kvar)
     pub max_demand_reactive: f64,
     /// 正向无功最大需量发生时间
-    pub max_demand_reactive_time: DateTime<Local>,
+    pub max_demand_reactive_time: DateTime<Utc>,
 
     /// 正向无功最大需量分费率（值 + 发生时间）
-    pub max_demand_reactive_rates: Vec<(f64, DateTime<Local>)>,
+    pub max_demand_reactive_rates: Vec<(f64, DateTime<Utc>)>,
 
     // ─────────────────────────────────────────────────────────────
     // 瞬时量（可选，部分冻结类型不包含）
@@ -600,10 +600,10 @@ impl Default for FreezeData {
             quadrant4_reactive_total: 0.0,
             quadrant4_reactive_rates: Vec::new(),
             max_demand_active: 0.0,
-            max_demand_active_time: Local::now(),
+            max_demand_active_time: Utc::now(),
             max_demand_active_rates: Vec::new(),
             max_demand_reactive: 0.0,
-            max_demand_reactive_time: Local::now(),
+            max_demand_reactive_time: Utc::now(),
             max_demand_reactive_rates: Vec::new(),
             voltages: None,
             currents: None,
@@ -642,7 +642,7 @@ impl FreezeData {
         }
 
         // 分费率需量（值 + 发生时间）
-        let demand_rates = |energy_type: EnergyType| -> Vec<(f64, DateTime<Local>)> {
+        let demand_rates = |energy_type: EnergyType| -> Vec<(f64, DateTime<Utc>)> {
             (1..=state.num_rates)
                 .map(|rate| {
                     let demand = state.get_demand(0, 0, energy_type, Some(rate));
@@ -842,100 +842,174 @@ impl Default for LoadRecordConfig {
     }
 }
 
-/// 负荷记录数据类型（DI1）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadProfileDataType {
-    Voltage = 0x01,        // 电压
-    Current = 0x02,        // 电流
-    ActivePower = 0x03,    // 有功功率
-    ReactivePower = 0x04,  // 无功功率
-    PowerFactor = 0x05,    // 功率因数
-    Energy = 0x06,         // 电能量
-    ReactiveEnergy = 0x07, // 无功电能
-    Demand = 0x08,         // 需量
+/// 负荷记录数据内容（附录B，模式字 bit0~bit5 与六个块一一对应）
+///
+/// 与 FreezeData 平铺字段不同，负荷记录按附录B的六个数据块组织，且使用
+/// 块级 Option：模式字的选通单位是"块"（选了电压电流频率就是 17 字节整体，
+/// 不存在只记电压）；同时要区分"没记录这个块"（None，序列化后 JSON 键
+/// 直接缺省，历史行自描述）和"记录了但值为 0"——日后改模式字不影响旧行解码。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct LoadRecordData {
+    pub vif: Option<VifBlock>, // bit0 电压、电流、频率（B.2.1，17字节）
+    pub pq: Option<PqBlock>,   // bit1 有、无功功率（B.2.2，24字节）
+    pub pf: Option<PfBlock>,   // bit2 功率因数（B.2.3，8字节）
+    pub energy: Option<EnergyBlock>, // bit3 有、无功总电能（B.2.4，16字节）
+    pub quadrant: Option<QuadrantBlock>, // bit4 四象限无功（B.2.5，16字节）
+    pub demand: Option<DemandBlock>,    // bit5 当前需量（B.2.6，6字节）
 }
 
-impl LoadProfileDataType {
-    /// 从DI1解析数据类型
-    pub fn from_di1(di1: u8) -> Option<Self> {
-        match di1 {
-            0x01 => Some(Self::Voltage),
-            0x02 => Some(Self::Current),
-            0x03 => Some(Self::ActivePower),
-            0x04 => Some(Self::ReactivePower),
-            0x05 => Some(Self::PowerFactor),
-            0x06 => Some(Self::Energy),
-            0x07 => Some(Self::ReactiveEnergy),
-            0x08 => Some(Self::Demand),
-            _ => None,
-        }
-    }
-
-    /// 获取采样间隔索引（0-5对应第1-6类负荷记录）
-    pub fn interval_index(&self) -> usize {
-        match self {
-            Self::Voltage => 0,
-            Self::Current => 1,
-            Self::ActivePower => 2,
-            Self::ReactivePower => 3,
-            Self::PowerFactor => 4,
-            Self::Energy | Self::ReactiveEnergy | Self::Demand => 5,
-        }
-    }
+/// B.2.1 电压、电流、频率
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct VifBlock {
+    pub voltage_a: f64, // V
+    pub voltage_b: f64,
+    pub voltage_c: f64,
+    pub current_a: f64, // A
+    pub current_b: f64,
+    pub current_c: f64,
+    pub frequency: f64, // Hz
 }
 
-/// 负荷记录采样记录（用于数据库持久化）
-#[derive(Debug, Clone)]
-pub struct LoadProfileSample {
-    pub sample_time: chrono::DateTime<chrono::Local>, // 采样时间
-    pub data_type: LoadProfileDataType,               // 数据类型
-    pub channel: u8,                                  // 通道（0=总，1=A相，2=B相，3=C相）
-    pub value: f64,                                   // 采样值
+/// B.2.2 有、无功功率
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PqBlock {
+    pub active_total: f64, // kW
+    pub active_a: f64,
+    pub active_b: f64,
+    pub active_c: f64,
+    pub reactive_total: f64, // kvar
+    pub reactive_a: f64,
+    pub reactive_b: f64,
+    pub reactive_c: f64,
 }
 
-/// 负荷记录采样状态（跟踪上次采样时间）
-#[derive(Debug, Clone)]
-pub struct LoadProfileSamplingState {
-    pub last_sample_times: [[Option<chrono::DateTime<chrono::Local>>; 4]; 6], // [数据类型索引][通道]
+/// B.2.3 功率因数（分相简化使用总值，与瞬时变量读路径一致）
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PfBlock {
+    pub total: f64,
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
 }
 
-impl Default for LoadProfileSamplingState {
-    fn default() -> Self {
+/// B.2.4 有、无功总电能
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct EnergyBlock {
+    pub forward_active: f64,     // 正向有功总电能 (kWh)
+    pub reverse_active: f64,     // 反向有功总电能 (kWh)
+    pub combined_reactive1: f64, // 组合无功1总电能 (kvarh)
+    pub combined_reactive2: f64, // 组合无功2总电能 (kvarh)
+}
+
+/// B.2.5 四象限无功总电能
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct QuadrantBlock {
+    pub q1: f64, // kvarh
+    pub q2: f64,
+    pub q3: f64,
+    pub q4: f64,
+}
+
+/// B.2.6 当前需量
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DemandBlock {
+    pub active: f64,    // 当前有功需量 (kW)
+    pub reactive: f64,  // 当前无功需量 (kvar)
+}
+
+impl LoadRecordData {
+    /// 按负荷记录模式字（附录C：bit0~bit5 对应六个数据块）从当前状态采集
+    ///
+    /// 取值口径与 FreezeData::from_meter_state 一致：电能/需量读寄存器，
+    /// 瞬时量读物理引擎最新输出；数值存 SI 浮点（kW、kvarh…），协议定点/
+    /// BCD 编码由读取侧的 encode_* 完成。
+    pub fn from_meter_state(state: &MeterState, mode_word: u8) -> Self {
         Self {
-            last_sample_times: [[None; 4]; 6],
+            vif: (mode_word & 0x01 != 0).then(|| VifBlock {
+                voltage_a: state.voltage_a,
+                voltage_b: state.voltage_b,
+                voltage_c: state.voltage_c,
+                current_a: state.current_a,
+                current_b: state.current_b,
+                current_c: state.current_c,
+                frequency: state.frequency,
+            }),
+            pq: (mode_word & 0x02 != 0).then(|| PqBlock {
+                active_total: state.active_power_total,
+                active_a: state.active_power_a,
+                active_b: state.active_power_b,
+                active_c: state.active_power_c,
+                reactive_total: state.reactive_power_total,
+                reactive_a: state.reactive_power_a,
+                reactive_b: state.reactive_power_b,
+                reactive_c: state.reactive_power_c,
+            }),
+            pf: (mode_word & 0x04 != 0).then(|| PfBlock {
+                total: state.power_factor,
+                // 分相功率因数未单独建模，与瞬时变量读路径一致使用总值
+                a: state.power_factor,
+                b: state.power_factor,
+                c: state.power_factor,
+            }),
+            energy: (mode_word & 0x08 != 0).then(|| {
+                EnergyBlock {
+                    forward_active: state.get_energy(EnergyType::ForwardActive, None),
+                    reverse_active: state.get_energy(EnergyType::ReverseActive, None),
+                    combined_reactive1: state.get_energy(EnergyType::ForwardReactive, None),
+                    combined_reactive2: state.get_energy(EnergyType::ReverseReactive, None),
+                }
+            }),
+            quadrant: (mode_word & 0x10 != 0).then(|| QuadrantBlock {
+                q1: state.get_energy(EnergyType::Quadrant1Reactive, None),
+                q2: state.get_energy(EnergyType::Quadrant2Reactive, None),
+                q3: state.get_energy(EnergyType::Quadrant3Reactive, None),
+                q4: state.get_energy(EnergyType::Quadrant4Reactive, None),
+            }),
+            demand: (mode_word & 0x20 != 0).then(|| DemandBlock {
+                // 当前结算周期需量寄存值（正向有功回退到 max_demand）
+                active: state.get_demand(0, 0, EnergyType::ForwardActive, None).value,
+                reactive: state.get_demand(0, 0, EnergyType::ForwardReactive, None).value,
+            }),
         }
     }
+}
+
+/// 负荷记录采样行（某类负荷某节拍的完整快照，用于数据库持久化）
+#[derive(Debug, Clone)]
+pub struct LoadRecordSample {
+    /// 第几类负荷记录（1~6，对应 04-00-0A-01~06）
+    pub class_id: u8,
+    /// 采样时刻（虚拟时钟）
+    pub sample_time: DateTime<Utc>,
+    /// 该节拍全部选通块的快照
+    pub data: LoadRecordData,
+}
+
+/// 负荷记录采样状态（跟踪各类上次采样时间）
+///
+/// 采样节拍按"类"驱动：第1~6类各自有独立间隔（04-00-0A-01~06），每个节拍
+/// 一次性采集模式字选通的全部数据块、整行落库——时间对齐与块原子性由此保证。
+#[derive(Debug, Clone, Default)]
+pub struct LoadProfileSamplingState {
+    pub last_sample_times: [Option<DateTime<Utc>>; 6], // 索引 = 类号-1
 }
 
 impl LoadProfileSamplingState {
-    /// 检查是否应该进行采样
-    ///
-    /// 参数：
-    /// - data_type: 数据类型
-    /// - channel: 通道
-    /// - current_time: 当前时间
-    /// - interval_minutes: 采样间隔（分钟）
-    ///
-    /// 返回：是否应该采样
+    /// 检查某类是否到达采样节拍
     pub fn should_sample(
         &self,
-        data_type: LoadProfileDataType,
-        channel: u8,
-        current_time: &chrono::DateTime<chrono::Local>,
+        class_idx: usize,
+        current_time: &DateTime<Utc>,
         interval_minutes: u16,
     ) -> bool {
         if interval_minutes == 0 {
             return false; // 间隔为0表示不采样
         }
-
-        let type_idx = data_type.interval_index();
-        let ch_idx = channel as usize;
-
-        if ch_idx >= 4 {
+        if class_idx >= 6 {
             return false;
         }
-
-        match self.last_sample_times[type_idx][ch_idx] {
+        match self.last_sample_times[class_idx] {
             None => true, // 从未采样过
             Some(last_time) => {
                 let elapsed = (*current_time - last_time).num_minutes();
@@ -944,18 +1018,10 @@ impl LoadProfileSamplingState {
         }
     }
 
-    /// 更新采样时间
-    pub fn update_sample_time(
-        &mut self,
-        data_type: LoadProfileDataType,
-        channel: u8,
-        sample_time: chrono::DateTime<chrono::Local>,
-    ) {
-        let type_idx = data_type.interval_index();
-        let ch_idx = channel as usize;
-
-        if ch_idx < 4 {
-            self.last_sample_times[type_idx][ch_idx] = Some(sample_time);
+    /// 更新某类的采样时间
+    pub fn update_sample_time(&mut self, class_idx: usize, sample_time: DateTime<Utc>) {
+        if class_idx < 6 {
+            self.last_sample_times[class_idx] = Some(sample_time);
         }
     }
 }
@@ -1089,7 +1155,7 @@ pub struct MeterState {
     // ─────────────────────────────────────────────────────────────
     // 虚拟时钟
     // ─────────────────────────────────────────────────────────────
-    pub virtual_time: DateTime<Local>,
+    pub virtual_time: DateTime<Utc>,
 
     // ─────────────────────────────────────────────────────────────
     // 仿真量：电能寄存器
@@ -1167,7 +1233,7 @@ pub struct MeterState {
     // 最大需量
     // ─────────────────────────────────────────────────────────────
     pub max_demand: f64,
-    pub max_demand_time: DateTime<Local>,
+    pub max_demand_time: DateTime<Utc>,
 
     // ─────────────────────────────────────────────────────────────
     // A.5 参变量扩展
@@ -1196,7 +1262,7 @@ pub struct MeterState {
     /// 约定冻结是否已触发（一次性）
     pub appointment_freeze_fired: bool,
     /// 上次结算日转存的虚拟时间
-    pub last_settlement_rollover: Option<DateTime<Local>>,
+    pub last_settlement_rollover: Option<DateTime<Utc>>,
     // 04-00-11-01 电表运行特征字1
     pub operation_feature_word_1: u16,
     // 04-00-12-xx 整点/日冻结时间
@@ -1304,7 +1370,7 @@ impl Default for MeterState {
             derived_status: DerivedStatusWords::default(),
 
             // 虚拟时钟
-            virtual_time: Local::now(),
+            virtual_time: Utc::now(),
 
             // 电能寄存器
             energy_registers: HashMap::new(),
@@ -1351,7 +1417,7 @@ impl Default for MeterState {
 
             // 最大需量
             max_demand: 0.0,
-            max_demand_time: Local::now(),
+            max_demand_time: Utc::now(),
 
             // A.5 参变量扩展
             calibration_pulse_width_ms: 80,
@@ -1565,12 +1631,12 @@ impl MeterState {
                 return false;
             }
             // 逐月枚举 last 与 now 之间（含 now 当月）的结算日边界
-            let mut cursor = chrono::Local
+            let mut cursor = chrono::Utc
                 .with_ymd_and_hms(last.year(), last.month(), 1, 0, 0, 0)
                 .single()
                 .unwrap_or(last);
             loop {
-                if let Some(boundary) = chrono::Local
+                if let Some(boundary) = chrono::Utc
                     .with_ymd_and_hms(cursor.year(), cursor.month(), day, hour, 0, 0)
                     .single()
                 {
@@ -1579,12 +1645,12 @@ impl MeterState {
                     }
                 }
                 // 下一个月
-                let next = chrono::Local
+                let next = chrono::Utc
                     .with_ymd_and_hms(cursor.year(), cursor.month(), 28, 23, 59, 59)
                     .single()
                     .unwrap_or(cursor)
                     + chrono::Duration::days(4);
-                cursor = chrono::Local
+                cursor = chrono::Utc
                     .with_ymd_and_hms(next.year(), next.month(), 1, 0, 0, 0)
                     .single()
                     .unwrap_or(next);
@@ -1734,7 +1800,7 @@ impl MeterState {
             trigger_type: trigger as u8,
             category: 0xFF, // 0xFF表示完整快照（包含所有类别）
             occurrence_idx: occurrence_index,
-            snapshot_time: self.virtual_time,
+            snapshot_time: self.virtual_time.with_timezone(&chrono::Utc),
             payload,
         };
 
@@ -1790,7 +1856,7 @@ impl MeterState {
         &mut self,
         event_type: u8,
         sub_type: u8,
-        start_time: DateTime<Local>,
+        start_time: DateTime<Utc>,
         data: Vec<u8>,
     ) {
         let key = (event_type, sub_type);
@@ -1826,7 +1892,7 @@ impl MeterState {
         &mut self,
         event_type: u8,
         sub_type: u8,
-        end_time: DateTime<Local>,
+        end_time: DateTime<Utc>,
         energy_increments: [f64; 4],
     ) {
         let key = (event_type, sub_type);
@@ -1858,7 +1924,7 @@ impl MeterState {
         self.end_event_record(event_type, sub_type, end_time);
     }
 
-    pub fn end_event_record(&mut self, event_type: u8, sub_type: u8, end_time: DateTime<Local>) {
+    pub fn end_event_record(&mut self, event_type: u8, sub_type: u8, end_time: DateTime<Utc>) {
         let key = (event_type, sub_type);
 
         // 查找最新的未结束事件记录
@@ -1962,7 +2028,7 @@ impl MeterState {
     ///
     /// 参数：
     /// - virtual_time: 从数据库加载的虚拟时钟
-    pub fn restore_virtual_time(&mut self, virtual_time: DateTime<Local>) {
+    pub fn restore_virtual_time(&mut self, virtual_time: DateTime<Utc>) {
         self.virtual_time = virtual_time;
     }
 }
@@ -1992,7 +2058,7 @@ mod tests {
 
         // 测试环形缓冲区限制（最多10条）
         for i in 1..=15 {
-            state.add_event_record(0x01, 0x01, Local::now(), vec![i as u8]);
+            state.add_event_record(0x01, 0x01, Utc::now(), vec![i as u8]);
         }
 
         // 应该只保留最新的10条
@@ -2011,7 +2077,7 @@ mod tests {
     #[test]
     fn test_event_record_operations() {
         let mut state = MeterState::default();
-        let now = Local::now();
+        let now = Utc::now();
 
         // 测试1：添加编程记录事件
         state.add_event_record(
@@ -2062,7 +2128,7 @@ mod tests {
 
         // 添加3条记录
         for i in 1..=3 {
-            buffer.push(EventRecord::new(0x30, 0x0F, Local::now(), vec![i]));
+            buffer.push(EventRecord::new(0x30, 0x0F, Utc::now(), vec![i]));
         }
 
         assert_eq!(buffer.len(), 3);
@@ -2070,7 +2136,7 @@ mod tests {
         assert_eq!(buffer.get(3).unwrap().data[0], 1); // 最旧
 
         // 添加第4条，应该挤掉第1条
-        buffer.push(EventRecord::new(0x30, 0x0F, Local::now(), vec![4]));
+        buffer.push(EventRecord::new(0x30, 0x0F, Utc::now(), vec![4]));
 
         assert_eq!(buffer.len(), 3);
         assert_eq!(buffer.get(1).unwrap().data[0], 4); // 最新

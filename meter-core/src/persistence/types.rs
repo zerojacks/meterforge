@@ -1,6 +1,6 @@
 // 持久化请求类型定义
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::simulation::SimulationConfig;
@@ -34,25 +34,19 @@ pub enum PersistRequest {
     /// 写入事件记录
     WriteEventRecord(EventRecordRow),
 
-    /// 写入负荷记录
-    WriteLoadProfileRecord(LoadProfileRecordRow),
-
     /// 写入电能寄存器（单条记录）
     WriteEnergyRegister(EnergyRegisterRow),
 
     /// 更新最大需量
     UpdateMaxDemand(MaxDemandRow),
 
-    /// 写入负荷记录采样（load_profile_samples 表，按时间序列追加）
-    WriteLoadProfileSample {
-        address: String,
-        sample: crate::simulation::state::LoadProfileSample,
-    },
+    /// 写入负荷记录（load_profile_records 表，JSON payload）
+    WriteLoadRecord(LoadRecordRow),
 
     /// 保存虚拟时间和配置（用于定期持久化，防止异常退出丢失）
     SaveVirtualTime {
         address: String,
-        virtual_time: DateTime<Local>,
+        virtual_time: DateTime<Utc>,
         time_scale: f64,
         simulation_config: SimulationConfig,
     },
@@ -65,7 +59,7 @@ pub struct FreezeSnapshotRow {
     pub trigger_type: u8,   // DI2
     pub category: u8,       // DI1
     pub occurrence_idx: u8, // DI0
-    pub snapshot_time: DateTime<Local>,
+    pub snapshot_time: DateTime<Utc>,
     pub payload: serde_json::Value, // 快照数据（JSON）
 }
 
@@ -76,18 +70,8 @@ pub struct EventRecordRow {
     pub event_kind: u8,     // DI2
     pub sub_kind: u8,       // DI1
     pub occurrence_idx: u8, // DI0
-    pub start_time: DateTime<Local>,
-    pub end_time: Option<DateTime<Local>>,
-    pub payload: serde_json::Value,
-}
-
-/// 负荷记录数据行（对应 load_profile_records 表）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadProfileRecordRow {
-    pub meter_address: String,
-    pub channel: u8,
-    pub data_type: u8,
-    pub recorded_at: DateTime<Local>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: Option<DateTime<Utc>>,
     pub payload: serde_json::Value,
 }
 
@@ -100,7 +84,7 @@ pub struct LoadProfileRecordRow {
 #[derive(Debug, Clone)]
 pub struct EnergyRegisterRow {
     pub meter_address: String,
-    pub timestamp: DateTime<Local>,
+    pub timestamp: DateTime<Utc>,
 
     // 组合有功电能
     pub combined_active_positive: f64,
@@ -124,7 +108,7 @@ pub struct MaxDemandRow {
     pub demand_kind: u8,
     pub rate_index: u8,
     pub value_fp: i64,
-    pub occurred_at: DateTime<Local>,
+    pub occurred_at: DateTime<Utc>,
 }
 
 /// 负荷记录采样数据行（查询结果）
@@ -133,8 +117,116 @@ pub struct MaxDemandRow {
 #[derive(Debug, Clone)]
 pub struct LoadProfileSampleRow {
     pub meter_address: String,
-    pub sample_time: DateTime<Local>,
+    pub sample_time: DateTime<Utc>,
     pub data_type: u8, // 数据类型（01=电压，02=电流等）
     pub channel: u8,   // 通道（00=总，01=A相，02=B相，03=C相）
     pub value: f64,    // 采样值
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 负荷记录数据结构（附录B，JSON存储，对齐冻结数据模式）
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// 负荷记录数据内容（附录B，模式字 bit0~bit5 一一对应）
+/// 
+/// 块级 Option 设计原因：
+/// 1. 模式字的选通单位是"块"（选了电压电流频率就是17字节整体）
+/// 2. 区分"没记录这个块"和"记录了但值为0"
+/// 3. None 块序列化后 JSON 键直接缺省，日后改模式字不影响旧行解码
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LoadRecordData {
+    /// bit0: 电压电流频率（B.2.1，17字节）
+    pub vif: Option<VifBlock>,
+    /// bit1: 有无功功率（B.2.2，24字节）
+    pub pq: Option<PqBlock>,
+    /// bit2: 功率因数（B.2.3，8字节）
+    pub pf: Option<PfBlock>,
+    /// bit3: 有无功总电能（B.2.4，16字节）
+    pub energy: Option<EnergyBlock>,
+    /// bit4: 四象限无功（B.2.5，16字节）
+    pub quadrant: Option<QuadrantBlock>,
+    /// bit5: 当前需量（B.2.6，6字节）
+    pub demand: Option<DemandBlock>,
+}
+
+/// B.2.1 电压、电流、频率块（17字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VifBlock {
+    /// A/B/C 相电压 (V)
+    pub voltage_a: f64,
+    pub voltage_b: f64,
+    pub voltage_c: f64,
+    /// A/B/C 相电流 (A)
+    pub current_a: f64,
+    pub current_b: f64,
+    pub current_c: f64,
+    /// 频率 (Hz)
+    pub frequency: f64,
+}
+
+/// B.2.2 有、无功功率块（24字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PqBlock {
+    /// 总及A/B/C相有功功率 (kW)
+    pub active_total: f64,
+    pub active_a: f64,
+    pub active_b: f64,
+    pub active_c: f64,
+    /// 总及A/B/C相无功功率 (kvar)
+    pub reactive_total: f64,
+    pub reactive_a: f64,
+    pub reactive_b: f64,
+    pub reactive_c: f64,
+}
+
+/// B.2.3 功率因数块（8字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PfBlock {
+    /// 总及A/B/C相功率因数
+    pub total: f64,
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+}
+
+/// B.2.4 有、无功总电能块（16字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnergyBlock {
+    /// 正向有功总电能 (kWh)
+    pub forward_active: f64,
+    /// 反向有功总电能 (kWh)
+    pub reverse_active: f64,
+    /// 组合无功1总电能 (kvarh)
+    pub combined_reactive1: f64,
+    /// 组合无功2总电能 (kvarh)
+    pub combined_reactive2: f64,
+}
+
+/// B.2.5 四象限无功总电能块（16字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuadrantBlock {
+    /// 第一~四象限无功总电能 (kvarh)
+    pub q1: f64,
+    pub q2: f64,
+    pub q3: f64,
+    pub q4: f64,
+}
+
+/// B.2.6 当前需量块（6字节）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemandBlock {
+    /// 当前有功需量 (kW)
+    pub active: f64,
+    /// 当前无功需量 (kvar)
+    pub reactive: f64,
+}
+
+/// 负荷记录数据行（load_profile_records 表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadRecordRow {
+    pub meter_address: String,
+    pub class_id: u8,            // 第1~6类负荷记录（1-6）
+    pub sample_time: DateTime<Utc>,
+    pub payload: serde_json::Value, // LoadRecordData 序列化
 }

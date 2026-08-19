@@ -6,8 +6,8 @@
 // - tick() 方法接收 &mut MeterState，读取参数并更新状态
 // - **不创建 tick**：tick 由全局 broadcast channel 统一产出（设计方案 4.4 节）
 
-use super::state::{DemandValue, EnergyType, FreezeType, LoadProfileDataType, MeterState};
-use chrono::{DateTime, Local, Timelike};
+use super::state::{DemandValue, EnergyType, FreezeType, MeterState};
+use chrono::{DateTime, Utc, Timelike};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ pub struct PhysicsEngine {
     demand_window: VecDeque<PowerSample>,
 
     /// 上次需量计算时刻（滑差步进用）
-    last_demand_calc: Option<DateTime<Local>>,
+    last_demand_calc: Option<DateTime<Utc>>,
 
     /// 当前活跃的故障集合，key = (事件类型 DI2, 相别 DI1)
     /// 用于跟踪故障的开始/结束跃迁，避免重复生成事件。
@@ -46,7 +46,7 @@ pub struct PhysicsEngine {
 }
 
 struct PowerSample {
-    timestamp: DateTime<Local>,
+    timestamp: DateTime<Utc>,
     power: f64,
     /// 分相有功（A/B/C）与总无功，用于各类/分相需量寄存
     power_a: f64,
@@ -333,7 +333,7 @@ impl PhysicsEngine {
             .day_table_1
             .get_rate_at_time(&state.virtual_time);
 
-        let mut update = |key: (u8, u8, EnergyType, u8), value: f64, time: DateTime<Local>| {
+        let mut update = |key: (u8, u8, EnergyType, u8), value: f64, time: DateTime<Utc>| {
             if let Some(existing) = state.demand_registers.get(&key) {
                 if value > existing.value {
                     state
@@ -508,7 +508,7 @@ impl PhysicsEngine {
     fn transition_fault(
         &mut self,
         state: &mut MeterState,
-        now: DateTime<Local>,
+        now: DateTime<Utc>,
         event_type: u8,
         sub_type: u8,
         active: bool,
@@ -680,21 +680,21 @@ impl PhysicsEngine {
 
     /// 步骤7: 负荷记录采样检测
     ///
-    /// 检查是否需要进行负荷记录采样，并返回待持久化的采样记录
+    /// 检查是否需要进行负荷记录采样，并返回待持久化的采样行
     ///
-    /// 采样规则：
+    /// 采样规则（附录B + 04-00-09-01/0A-xx）：
     /// - 起始时间（04-00-0A-01，MMDDhhmm BCD）未到不采样；全 0 视为立即启用
-    /// - 根据 load_record_config.intervals 配置的间隔时间采样
-    /// - intervals[0-5] 对应 6 类数据（电压/电流/有功功率/无功功率/功率因数/其他）
-    /// - 每类数据包含 4 个通道（总/A/B/C相）
-    /// - 采样记录直接写入数据库，不维护内存历史
+    /// - 采样节拍按"类"驱动：第1~6类各自有独立间隔（04-00-0A-02~07）
+    /// - 模式字（04-00-09-01）选通的是附录B六个数据块（bit0~bit5），
+    ///   不是采样类别；模式字为 0 时无任何数据块可记，直接不采样
+    /// - 每个节拍一次性采集全部选通块、整行落库（时间对齐与块原子性由此保证）
     ///
-    /// 返回：需要持久化的采样记录列表
-    pub fn check_load_profile_sampling(
+    /// 返回：需要持久化的采样行列表（每类每节拍最多一行）
+    pub fn check_load_record_sampling(
         &self,
         state: &mut MeterState,
-    ) -> Vec<super::state::LoadProfileSample> {
-        use super::state::{LoadProfileDataType, LoadProfileSample};
+    ) -> Vec<super::state::LoadRecordSample> {
+        use super::state::LoadRecordData;
 
         let mut samples = Vec::new();
         let now = state.virtual_time;
@@ -706,139 +706,38 @@ impl PhysicsEngine {
             }
         }
 
-        // 遍历所有数据类型
-        let data_types = [
-            LoadProfileDataType::Voltage,
-            LoadProfileDataType::Current,
-            LoadProfileDataType::ActivePower,
-            LoadProfileDataType::ReactivePower,
-            LoadProfileDataType::PowerFactor,
-            // Energy, ReactiveEnergy, Demand 共享同一个间隔（intervals[5]）
-        ];
+        // 模式字未选通任何数据块：无负荷记录可写
+        let mode_word = state.load_record_config.mode_word;
+        if mode_word == 0 {
+            return samples;
+        }
 
-        for &data_type in &data_types {
-            let interval_idx = data_type.interval_index();
-            let interval_minutes = state.load_record_config.intervals[interval_idx];
-
+        // 逐类检查采样节拍（class_idx = 类号-1）
+        for class_idx in 0..6 {
+            let interval_minutes = state.load_record_config.intervals[class_idx];
             if interval_minutes == 0 {
-                continue; // 间隔为0表示不采样
+                continue; // 间隔为0表示该类不采样
             }
 
-            // 检查是否启用了此类数据的采样（mode_word位图）
-            let mode_bit = 1 << interval_idx;
-            if state.load_record_config.mode_word & mode_bit == 0 {
-                continue; // mode_word未启用此类数据
-            }
+            if state
+                .load_profile_state
+                .should_sample(class_idx, &now, interval_minutes)
+            {
+                // 整行采集：一次抓全部选通块，时间戳取同一虚拟时钟
+                let data = LoadRecordData::from_meter_state(state, mode_word);
+                samples.push(super::state::LoadRecordSample {
+                    class_id: (class_idx + 1) as u8,
+                    sample_time: now,
+                    data,
+                });
 
-            // 检查每个通道（0=总，1=A相，2=B相，3=C相）
-            for channel in 0..4 {
-                if state.load_profile_state.should_sample(
-                    data_type,
-                    channel,
-                    &now,
-                    interval_minutes,
-                ) {
-                    // 读取当前值
-                    let value = self.read_load_profile_value(state, data_type, channel);
-
-                    // 创建采样记录
-                    samples.push(LoadProfileSample {
-                        sample_time: now,
-                        data_type,
-                        channel,
-                        value,
-                    });
-
-                    // 更新采样时间
-                    state
-                        .load_profile_state
-                        .update_sample_time(data_type, channel, now);
-                }
+                state
+                    .load_profile_state
+                    .update_sample_time(class_idx, now);
             }
         }
 
         samples
-    }
-
-    /// 读取负荷记录采样值
-    ///
-    /// 根据数据类型和通道，从MeterState中读取当前值
-    fn read_load_profile_value(
-        &self,
-        state: &MeterState,
-        data_type: LoadProfileDataType,
-        channel: u8,
-    ) -> f64 {
-        use super::state::LoadProfileDataType;
-
-        match data_type {
-            LoadProfileDataType::Voltage => {
-                match channel {
-                    0 => (state.voltage_a + state.voltage_b + state.voltage_c) / 3.0, // 平均值作为"总"
-                    1 => state.voltage_a,
-                    2 => state.voltage_b,
-                    3 => state.voltage_c,
-                    _ => 0.0,
-                }
-            }
-            LoadProfileDataType::Current => {
-                match channel {
-                    0 => state.current_a + state.current_b + state.current_c, // 总电流
-                    1 => state.current_a,
-                    2 => state.current_b,
-                    3 => state.current_c,
-                    _ => 0.0,
-                }
-            }
-            LoadProfileDataType::ActivePower => match channel {
-                0 => state.active_power_total,
-                1 => state.active_power_a,
-                2 => state.active_power_b,
-                3 => state.active_power_c,
-                _ => 0.0,
-            },
-            LoadProfileDataType::ReactivePower => match channel {
-                0 => state.reactive_power_total,
-                1 => state.reactive_power_a,
-                2 => state.reactive_power_b,
-                3 => state.reactive_power_c,
-                _ => 0.0,
-            },
-            LoadProfileDataType::PowerFactor => {
-                // 功率因数通常只有总值，各相相同
-                state.power_factor
-            }
-            LoadProfileDataType::Energy => {
-                // 正向有功总电能
-                use super::state::EnergyType;
-                match channel {
-                    0 => state.get_energy(EnergyType::ForwardActive, None),
-                    1 => state.get_energy(EnergyType::ForwardActive, Some(1)),
-                    2 => state.get_energy(EnergyType::ForwardActive, Some(2)),
-                    3 => state.get_energy(EnergyType::ForwardActive, Some(3)),
-                    _ => 0.0,
-                }
-            }
-            LoadProfileDataType::ReactiveEnergy => {
-                // 正向无功总电能
-                use super::state::EnergyType;
-                match channel {
-                    0 => state.get_energy(EnergyType::ForwardReactive, None),
-                    1 => state.get_energy(EnergyType::ForwardReactive, Some(1)),
-                    2 => state.get_energy(EnergyType::ForwardReactive, Some(2)),
-                    3 => state.get_energy(EnergyType::ForwardReactive, Some(3)),
-                    _ => 0.0,
-                }
-            }
-            LoadProfileDataType::Demand => {
-                // 当前有功需量
-                if channel == 0 {
-                    state.max_demand
-                } else {
-                    0.0 // 各相需量未单独跟踪
-                }
-            }
-        }
     }
 
     /// 生成小噪声 (-1.0 ~ 1.0)
@@ -881,7 +780,7 @@ impl Default for LoadModelConfig {
 
 impl LoadModelConfig {
     /// 根据当前时间获取负荷系数 (0.0 ~ 1.0)
-    pub fn get_load_factor(&self, time: &DateTime<Local>) -> f64 {
+    pub fn get_load_factor(&self, time: &DateTime<Utc>) -> f64 {
         self.profile.get_load_factor(time.hour())
     }
 }
@@ -1063,7 +962,7 @@ fn bcd_to_dec(bcd: u8) -> u32 {
 
 /// 解码负荷记录起始时间（MMDDhhmm BCD，4字节）。
 /// 年份取参考时间所在年份；全 0 返回 None（表示立即启用）。
-fn decode_bcd_start_time(bcd: &[u8; 4], reference: DateTime<Local>) -> Option<DateTime<Local>> {
+fn decode_bcd_start_time(bcd: &[u8; 4], reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     use chrono::{Datelike, TimeZone};
     let (mm, dd, hh, mi) = (
         bcd_to_dec(bcd[0]),
@@ -1074,20 +973,20 @@ fn decode_bcd_start_time(bcd: &[u8; 4], reference: DateTime<Local>) -> Option<Da
     if mm == 0 && dd == 0 && hh == 0 && mi == 0 {
         return None;
     }
-    chrono::Local
+    chrono::Utc
         .with_ymd_and_hms(reference.year(), mm, dd, hh, mi, 0)
         .single()
 }
 
 /// 解码 BCD 时间（YYMMDDhhmm, 5 字节）为本地时间
-fn decode_bcd_datetime(bcd: &[u8; 5]) -> Option<DateTime<Local>> {
+fn decode_bcd_datetime(bcd: &[u8; 5]) -> Option<DateTime<Utc>> {
     use chrono::TimeZone;
     let yy = bcd_to_dec(bcd[0]);
     let mm = bcd_to_dec(bcd[1]);
     let dd = bcd_to_dec(bcd[2]);
     let hh = bcd_to_dec(bcd[3]);
     let mi = bcd_to_dec(bcd[4]);
-    chrono::Local
+    chrono::Utc
         .with_ymd_and_hms(2000 + yy as i32, mm, dd, hh, mi, 0)
         .single()
 }
@@ -1209,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_daily_freeze_triggered_by_config() {
-        use chrono::{Local, TimeZone};
+        use chrono::{Utc, TimeZone};
 
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
@@ -1218,7 +1117,7 @@ mod tests {
         state.daily_freeze_time = [0x00, 0x30];
 
         // 虚拟时钟推到 00:30:00
-        state.virtual_time = Local
+        state.virtual_time = Utc
             .with_ymd_and_hms(2025, 6, 2, 0, 30, 0)
             .single()
             .unwrap();
@@ -1227,7 +1126,7 @@ mod tests {
 
         // 非冻结时刻不触发
         state.pending_freeze_trigger = None;
-        state.virtual_time = Local
+        state.virtual_time = Utc
             .with_ymd_and_hms(2025, 6, 2, 0, 31, 0)
             .single()
             .unwrap();
@@ -1237,14 +1136,14 @@ mod tests {
 
     #[test]
     fn test_settlement_rollover_resets_demand() {
-        use chrono::{Local, TimeZone};
+        use chrono::{Utc, TimeZone};
 
         let mut engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
         state.settlement_days = [1, 0, 0];
 
         // 从上月末推进跨过本月1日0点
-        state.virtual_time = Local
+        state.virtual_time = Utc
             .with_ymd_and_hms(2025, 5, 31, 23, 59, 50)
             .single()
             .unwrap();
@@ -1321,15 +1220,15 @@ mod tests {
         state.freeze_config.timed_freeze_mode = 3;
 
         // 设置虚拟时间为整点前1秒
-        use chrono::{Local, TimeZone};
-        state.virtual_time = Local.with_ymd_and_hms(2024, 6, 15, 10, 59, 59).unwrap();
+        use chrono::{Utc, TimeZone};
+        state.virtual_time = Utc.with_ymd_and_hms(2024, 6, 15, 10, 59, 59).unwrap();
 
         // 第1次tick：59秒，不应触发
         engine.check_freeze_schedule(&mut state);
         assert!(state.pending_freeze_trigger.is_none(), "59秒不应触发冻结");
 
         // 推进到整点
-        state.virtual_time = Local.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap();
+        state.virtual_time = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap();
 
         // 第2次tick：整点，应触发
         engine.check_freeze_schedule(&mut state);
@@ -1441,51 +1340,44 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_load_profile_sampling_logic() {
-        use crate::simulation::state::LoadProfileDataType;
-
+    fn test_load_record_sampling_logic() {
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
-        // 配置负荷记录：启用电压采样，间隔5分钟
-        state.load_record_config.mode_word = 0b00000001; // 位0=电压
-        state.load_record_config.intervals[0] = 5; // 5分钟
+        // 配置负荷记录：模式字选通电压电流频率块，第1类间隔5分钟
+        state.load_record_config.mode_word = 0b00000001; // bit0=电压电流频率块
+        state.load_record_config.intervals[0] = 5; // 第1类5分钟
 
-        // 第一次采样应该立即触发
-        let samples = engine.check_load_profile_sampling(&mut state);
-        assert!(!samples.is_empty(), "首次应该立即采样");
+        // 第一次采样应该立即触发（第1类一行）
+        let samples = engine.check_load_record_sampling(&mut state);
+        assert_eq!(samples.len(), 1, "首次应该立即采样，且只产生一行");
+        assert_eq!(samples[0].class_id, 1);
+        assert_eq!(samples[0].sample_time, state.virtual_time);
+        assert!(samples[0].data.vif.is_some(), "模式字 bit0 选通 vif 块");
+        assert!(samples[0].data.pq.is_none(), "未选通的块应为 None");
 
-        // 检查采样了4个通道（总+A+B+C）
-        assert_eq!(samples.len(), 4, "应该采样4个通道");
+        let vif = samples[0].data.vif.as_ref().unwrap();
+        assert!((vif.voltage_a - 220.0).abs() < 1.0, "A相电压应接近220V");
+        assert!((vif.frequency - 50.0).abs() < 1.0, "频率应接近50Hz");
 
-        for sample in &samples {
-            assert_eq!(sample.data_type, LoadProfileDataType::Voltage);
-            assert!(sample.channel <= 3);
-            assert!(sample.value > 0.0);
-        }
-
-        println!("✓ 首次负荷记录采样正常");
-        println!("  采样通道数: {}", samples.len());
-        println!("  A相电压: {:.1}V", samples[1].value);
+        println!("✓ 首次负荷记录采样正常（按类整行）");
 
         // 推进2分钟，不应再次采样
         use chrono::Duration;
         state.virtual_time = state.virtual_time + Duration::minutes(2);
-        let samples = engine.check_load_profile_sampling(&mut state);
+        let samples = engine.check_load_record_sampling(&mut state);
         assert!(samples.is_empty(), "2分钟后不应采样（间隔5分钟）");
 
         // 推进到5分钟，应该再次采样
         state.virtual_time = state.virtual_time + Duration::minutes(3);
-        let samples = engine.check_load_profile_sampling(&mut state);
-        assert!(!samples.is_empty(), "5分钟后应该再次采样");
+        let samples = engine.check_load_record_sampling(&mut state);
+        assert_eq!(samples.len(), 1, "5分钟后应该再次采样");
 
         println!("✓ 负荷记录采样间隔控制正常");
     }
 
     #[test]
-    fn test_load_profile_data_types() {
-        use crate::simulation::state::LoadProfileDataType;
-
+    fn test_load_record_mode_word_selects_blocks() {
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
@@ -1495,52 +1387,58 @@ mod tests {
         state.active_power_a = 2.2;
         state.power_factor = 0.95;
 
-        // 测试读取各种数据类型
-        let voltage = engine.read_load_profile_value(&state, LoadProfileDataType::Voltage, 1);
-        assert!((voltage - 220.0).abs() < 0.1, "A相电压应为220V");
+        // 模式字选通 bit0（vif）+ bit1（pq）+ bit2（pf）
+        state.load_record_config.mode_word = 0b00000111;
+        state.load_record_config.intervals[1] = 5; // 第2类5分钟
 
-        let current = engine.read_load_profile_value(&state, LoadProfileDataType::Current, 1);
-        assert!((current - 10.0).abs() < 0.1, "A相电流应为10A");
+        let samples = engine.check_load_record_sampling(&mut state);
+        assert_eq!(samples.len(), 1, "只有第2类配置了间隔");
+        assert_eq!(samples[0].class_id, 2);
 
-        let power = engine.read_load_profile_value(&state, LoadProfileDataType::ActivePower, 1);
-        assert!((power - 2.2).abs() < 0.1, "A相功率应为2.2kW");
+        let data = &samples[0].data;
+        let vif = data.vif.as_ref().unwrap();
+        assert!((vif.voltage_a - 220.0).abs() < 0.1, "A相电压应为220V");
+        assert!((vif.current_a - 10.0).abs() < 0.1, "A相电流应为10A");
 
-        let pf = engine.read_load_profile_value(&state, LoadProfileDataType::PowerFactor, 0);
-        assert!((pf - 0.95).abs() < 0.01, "功率因数应为0.95");
+        let pq = data.pq.as_ref().unwrap();
+        assert!((pq.active_a - 2.2).abs() < 0.1, "A相有功功率应为2.2kW");
 
-        println!("✓ 负荷记录各数据类型读取正常");
+        let pf = data.pf.as_ref().unwrap();
+        assert!((pf.total - 0.95).abs() < 0.01, "功率因数应为0.95");
+
+        // 未选通的块不存在
+        assert!(data.energy.is_none());
+        assert!(data.quadrant.is_none());
+        assert!(data.demand.is_none());
+
+        println!("✓ 负荷记录模式字块选通正常");
     }
 
     #[test]
-    fn test_load_profile_mode_word_control() {
+    fn test_load_record_mode_word_zero_disables_sampling() {
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
-        // 只启用电流采样（位1）
-        state.load_record_config.mode_word = 0b00000010;
-        state.load_record_config.intervals[1] = 5; // 电流间隔5分钟
+        // 模式字为0（无任何数据块），即使配了间隔也不采样
+        state.load_record_config.mode_word = 0;
+        state.load_record_config.intervals[0] = 5;
 
-        let samples = engine.check_load_profile_sampling(&mut state);
+        let samples = engine.check_load_record_sampling(&mut state);
+        assert!(samples.is_empty(), "模式字为0时不应采样");
 
-        // 应该只有电流采样（4个通道）
-        assert_eq!(samples.len(), 4);
-        for sample in &samples {
-            assert_eq!(sample.data_type, LoadProfileDataType::Current);
-        }
-
-        println!("✓ 负荷记录mode_word控制正常");
+        println!("✓ 负荷记录模式字0禁用采样正常");
     }
 
     #[test]
-    fn test_load_profile_interval_zero_disables_sampling() {
+    fn test_load_record_interval_zero_disables_sampling() {
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
-        // 启用电压，但间隔设为0
+        // 选通电压块，但间隔设为0
         state.load_record_config.mode_word = 0b00000001;
         state.load_record_config.intervals[0] = 0; // 间隔0=禁用
 
-        let samples = engine.check_load_profile_sampling(&mut state);
+        let samples = engine.check_load_record_sampling(&mut state);
 
         // 不应该有任何采样
         assert!(samples.is_empty(), "间隔为0时不应采样");
@@ -1555,32 +1453,30 @@ mod tests {
     #[test]
     fn test_freeze_and_load_integration() {
         use crate::simulation::state::FreezeTrigger;
-        use chrono::{Local, TimeZone};
+        use chrono::{Utc, TimeZone};
 
         let mut engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
-        // 配置冻结和负荷记录
+        // 配置冻结和负荷记录：模式字选通 vif+pq+pf 三块，第1类15分钟
         state.freeze_config.timed_freeze_mode = 3; // 小时周期
-        state.load_record_config.mode_word = 0b00000111; // 电压+电流+功率
-        state.load_record_config.intervals[0] = 15; // 电压15分钟
-        state.load_record_config.intervals[1] = 15; // 电流15分钟
-        state.load_record_config.intervals[2] = 15; // 功率15分钟
+        state.load_record_config.mode_word = 0b00000111;
+        state.load_record_config.intervals[0] = 15;
 
         // 设置初始时间：10:45:00
-        state.virtual_time = Local.with_ymd_and_hms(2024, 6, 15, 10, 45, 0).unwrap();
+        state.virtual_time = Utc.with_ymd_and_hms(2024, 6, 15, 10, 45, 0).unwrap();
 
         // 模拟运行30分钟（1800秒）
         for _ in 0..1800 {
             engine.tick(&mut state, Duration::from_secs(1), 1.0);
 
             // 检查负荷记录采样
-            let samples = engine.check_load_profile_sampling(&mut state);
+            let samples = engine.check_load_record_sampling(&mut state);
             if !samples.is_empty() {
                 println!(
-                    "采样时间: {}, 采样数: {}",
+                    "采样时间: {}, 采样类: {:?}",
                     state.virtual_time.format("%H:%M:%S"),
-                    samples.len()
+                    samples.iter().map(|s| s.class_id).collect::<Vec<_>>()
                 );
             }
 

@@ -1,7 +1,7 @@
 // 参数设置对话框集合
 // 包含时间设置、密码修改、通信速率、费率时段表等所有配置对话框
 
-use chrono::{Datelike, Local, TimeZone, Timelike};
+use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::form::{field, v_form};
@@ -23,12 +23,12 @@ pub struct TimeSettingDialog {
     minute_input: Entity<InputState>,
     second_input: Entity<InputState>,
     on_confirm:
-        Option<Box<dyn Fn(chrono::DateTime<Local>, &mut Window, &mut Context<Self>) + 'static>>,
+        Option<Box<dyn Fn(chrono::DateTime<Utc>, &mut Window, &mut Context<Self>) + 'static>>,
 }
 
 impl TimeSettingDialog {
     pub fn new(
-        current_time: chrono::DateTime<Local>,
+        current_time: chrono::DateTime<Utc>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -74,7 +74,7 @@ impl TimeSettingDialog {
 
     pub fn on_confirm<F>(mut self, callback: F) -> Self
     where
-        F: Fn(chrono::DateTime<Local>, &mut Window, &mut Context<Self>) + 'static,
+        F: Fn(chrono::DateTime<Utc>, &mut Window, &mut Context<Self>) + 'static,
     {
         self.on_confirm = Some(Box::new(callback));
         self
@@ -158,7 +158,7 @@ impl TimeSettingDialog {
             .clamp(0, 59);
 
         // 构造时间
-        if let Some(datetime) = Local
+        if let Some(datetime) = Utc
             .with_ymd_and_hms(year, month, day, hour, minute, second)
             .single()
         {

@@ -201,6 +201,27 @@ impl AppBackend {
         })
     }
 
+    /// 异步加载某块表最近的负荷记录采样（跨全部数据类型/通道，按时间倒序）。
+    ///
+    /// 负荷记录采样落库后不维护内存历史，因此每次调用都会打库；调用方
+    /// （UI 视图）应仅在切换到"负荷记录"标签页且尚未加载过时调用一次。
+    pub fn load_load_profile_history(
+        &self,
+        address: String,
+        max_records: u32,
+        cx: &App,
+    ) -> Task<Result<Vec<meter_core::snapshot::LoadRecordSummary>, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            let json = handle
+                .send_admin_command(AdminCommand::LoadLoadProfileHistory { max_records })
+                .await?;
+            serde_json::from_str(&json).map_err(|e| e.to_string())
+        })
+    }
+
     /// Gracefully shutdown all meters (save virtual time and energy registers)
     ///
     /// This should be called before the application exits to ensure all

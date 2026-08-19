@@ -6,14 +6,12 @@
 // - 持有 VirtualMeter 和 PersistenceWorker 发送器
 
 use super::messages::{AdminCommand, EngineMsg, RegistryMsg, TickMsg};
-use crate::persistence::PersistRequest;
 use crate::protocol::format::format_address;
 use crate::simulation::VirtualMeter;
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// 单帧最大数据片段字节数（续传时 DATA = DI(4) + SEQ(1) + 数据片段 ≤ L=200）
 const MAX_FRAGMENT: usize = 195;
@@ -709,7 +707,7 @@ impl MeterActor {
         let year = 2000 + yy;
 
         // 构造DateTime
-        match chrono::Local
+        match chrono::Utc
             .with_ymd_and_hms(year as i32, month, dd, hh, mm, ss)
             .single()
         {
@@ -1118,8 +1116,8 @@ impl MeterActor {
                 minute,
                 second,
             } => {
-                use chrono::{Local, TimeZone};
-                match Local
+                use chrono::{Utc, TimeZone};
+                match Utc
                     .with_ymd_and_hms(
                         year as i32,
                         month as u32,
@@ -1224,7 +1222,7 @@ impl MeterActor {
 
             AdminCommand::ClearMaxDemand => {
                 self.meter.state_mut().max_demand = 0.0;
-                self.meter.state_mut().max_demand_time = chrono::Local::now();
+                self.meter.state_mut().max_demand_time = chrono::Utc::now();
                 Ok("Max demand cleared".to_string())
             }
 
@@ -1232,7 +1230,7 @@ impl MeterActor {
                 let state = self.meter.state_mut();
                 state.energy_registers.clear();
                 state.max_demand = 0.0;
-                state.max_demand_time = chrono::Local::now();
+                state.max_demand_time = chrono::Utc::now();
                 Ok("Meter cleared".to_string())
             }
 
@@ -1441,6 +1439,10 @@ impl MeterActor {
             }
 
             AdminCommand::LoadFreezeHistory => self.load_freeze_history().await,
+
+            AdminCommand::LoadLoadProfileHistory { max_records } => {
+                self.load_load_profile_history(max_records).await
+            }
         };
 
         // 命令执行后立即推送快照（反映最新状态）
@@ -1541,6 +1543,118 @@ impl MeterActor {
         merged.sort_by_key(|s| std::cmp::Reverse(s.snapshot_time_ms));
 
         serde_json::to_string(&merged).map_err(|e| e.to_string())
+    }
+
+    /// 加载最近的负荷记录（供 `AdminCommand::LoadLoadProfileHistory` 使用）
+    ///
+    /// 负荷记录落库后不维护内存历史（每类各自独立采样间隔，靠数据库查询
+    /// 而非环形缓冲，见 `0003_load_records_json.sql` 的设计说明），所以
+    /// 这里只查数据库；没有开启持久化（`db_pool` 为 `None`）时返回空列表
+    /// 而非报错，与"未启用持久化=没有历史数据可看"的语义一致。
+    async fn load_load_profile_history(&mut self, max_records: u32) -> Result<String, String> {
+        use crate::simulation::state::LoadRecordData;
+        use crate::snapshot::{KeyValuePair, LoadRecordSummary};
+
+        let address = format_address(&self.config.address);
+
+        let Some(pool) = &self.config.db_pool else {
+            return serde_json::to_string(&Vec::<LoadRecordSummary>::new())
+                .map_err(|e| e.to_string());
+        };
+
+        // 取最近 max_records 条负荷记录——不设时间窗口（见
+        // `PersistenceWorker::query_recent_load_records` 的说明：仿真通常
+        // 开倍速，虚拟时钟可能已经跑到比真实时间靠后，用真实 `Utc::now()`
+        // 划时间窗口会把这些记录全部过滤掉）。
+        let rows = crate::persistence::PersistenceWorker::query_recent_load_records(
+            pool,
+            &address,
+            max_records,
+        )
+        .await
+        .map_err(|e| format!("负荷记录查询失败: {e}"))?;
+
+        let summaries: Vec<LoadRecordSummary> = rows
+            .into_iter()
+            .filter_map(|row| {
+                // 反序列化JSON payload
+                let data: LoadRecordData = serde_json::from_value(row.payload).ok()?;
+
+                // 生成类别标签
+                let class_label = format!("第{}类负荷", row.class_id);
+
+                // 生成数据块摘要
+                let mut blocks = Vec::new();
+                if data.vif.is_some() {
+                    blocks.push("电压电流频率");
+                }
+                if data.pq.is_some() {
+                    blocks.push("有无功功率");
+                }
+                if data.pf.is_some() {
+                    blocks.push("功率因数");
+                }
+                if data.energy.is_some() {
+                    blocks.push("电能");
+                }
+                if data.quadrant.is_some() {
+                    blocks.push("四象限");
+                }
+                if data.demand.is_some() {
+                    blocks.push("需量");
+                }
+                let blocks_summary = if blocks.is_empty() {
+                    "无数据".to_string()
+                } else {
+                    blocks.join(" · ")
+                };
+
+                // 提取关键数值
+                let mut key_values = Vec::new();
+
+                // 电压（取A相）
+                if let Some(vif) = &data.vif {
+                    key_values.push(KeyValuePair {
+                        label: "A相电压".to_string(),
+                        value: format!("{:.1}", vif.voltage_a),
+                        unit: "V".to_string(),
+                    });
+                    key_values.push(KeyValuePair {
+                        label: "频率".to_string(),
+                        value: format!("{:.2}", vif.frequency),
+                        unit: "Hz".to_string(),
+                    });
+                }
+
+                // 有功功率（取总）
+                if let Some(pq) = &data.pq {
+                    key_values.push(KeyValuePair {
+                        label: "总有功功率".to_string(),
+                        value: format!("{:.4}", pq.active_total),
+                        unit: "kW".to_string(),
+                    });
+                }
+
+                // 电能（取正向有功）
+                if let Some(energy) = &data.energy {
+                    key_values.push(KeyValuePair {
+                        label: "正向有功电能".to_string(),
+                        value: format!("{:.2}", energy.forward_active),
+                        unit: "kWh".to_string(),
+                    });
+                }
+
+                Some(LoadRecordSummary {
+                    class_label,
+                    class_id: row.class_id,
+                    sample_time_ms: row.sample_time.timestamp_millis(),
+                    blocks_summary,
+                    key_values,
+                })
+            })
+            .collect();
+
+        serde_json::to_string(&summaries).map_err(|e| e.to_string())
     }
 
     /// 执行优雅关闭
@@ -1650,7 +1764,7 @@ impl MeterActorHandle {
 }
 
 /// 校时记录用时间编码（ss mm hh DD MM YY，6字节BCD）
-fn encode_645_datetime(dt: &chrono::DateTime<chrono::Local>) -> Vec<u8> {
+fn encode_645_datetime(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
     use chrono::{Datelike, Timelike};
     let to_bcd = |v: u8| ((v / 10) << 4) | (v % 10);
     vec![

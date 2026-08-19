@@ -154,7 +154,7 @@ impl DIHandler {
         &self,
         di1: u8,
         freeze_data: &crate::simulation::state::FreezeData,
-        snapshot_time: &chrono::DateTime<chrono::Local>,
+        snapshot_time: &chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<u8>, String> {
         // 电能项：总 + 各费率
         let energy_item = |total: f64, rates: &[f64]| -> Vec<u8> {
@@ -166,8 +166,8 @@ impl DIHandler {
         };
         // 需量项：总 + 各费率，每项 = 需量(3B XX.XXXX) + 发生时间(5B YYMMDDhhmm)
         let demand_item = |total: f64,
-                           total_time: &chrono::DateTime<chrono::Local>,
-                           rates: &[(f64, chrono::DateTime<chrono::Local>)]|
+                           total_time: &chrono::DateTime<chrono::Utc>,
+                           rates: &[(f64, chrono::DateTime<chrono::Utc>)]|
          -> Vec<u8> {
             let mut data = encode_bcd_power(total);
             data.extend(encode_freeze_datetime(total_time));
@@ -280,7 +280,7 @@ impl DIHandler {
 }
 
 /// 冻结需量发生时间编码（YYMMDDhhmm，5字节BCD）
-fn encode_freeze_datetime(dt: &chrono::DateTime<chrono::Local>) -> Vec<u8> {
+fn encode_freeze_datetime(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
     use chrono::{Datelike, Timelike};
     vec![
         to_bcd((dt.year() % 100) as u8),

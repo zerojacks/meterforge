@@ -1,7 +1,7 @@
 //! 参数设置卡片：展示与触发动作分离，具体命令仍由详情视图统一处理。
 use super::meter_detail::MeterDetailView;
 use crate::types::MeterSnapshot;
-use chrono::{Datelike, FixedOffset, Local, Timelike};
+use chrono::{Datelike, FixedOffset, Local, Timelike, Utc};
 use gpui::*;
 use gpui_component::{
     badge::Badge,
@@ -53,8 +53,8 @@ pub fn render(
 ) -> impl IntoElement {
     let theme = cx.theme();
     let time = chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
-        .unwrap_or_else(|| Local::now().into())
-        .with_timezone(&FixedOffset::east_opt(8 * 3600).unwrap());
+        .unwrap_or_else(|| Utc::now().into())
+        .with_timezone(&chrono::Utc);
     div()
         .flex()
         .flex_col()

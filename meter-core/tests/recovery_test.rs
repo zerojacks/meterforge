@@ -6,7 +6,7 @@
 // 3. 创建新的VirtualMeter并从数据库恢复
 // 4. 验证恢复的状态是否正确
 
-use chrono::Local;
+use chrono::Utc;
 use meter_core::persistence::{
     EnergyRegisterRow, PersistRequest, PersistenceConfig, PersistenceWorker,
 };
@@ -86,7 +86,7 @@ async fn test_energy_register_recovery() {
     // 手动flush电能寄存器
     let row = EnergyRegisterRow {
         meter_address: address_str.clone(),
-        timestamp: Local::now(),
+        timestamp: Utc::now(),
         combined_active_positive: meter.state().get_energy(EnergyType::ForwardActive, None),
         combined_active_negative: meter.state().get_energy(EnergyType::ReverseActive, None),
         combined_reactive_positive: 0.0,
@@ -222,7 +222,7 @@ async fn test_full_lifecycle_with_recovery() {
     // 保存状态
     let row = EnergyRegisterRow {
         meter_address: address_str.clone(),
-        timestamp: Local::now(),
+        timestamp: Utc::now(),
         combined_active_positive: meter1.state().get_energy(EnergyType::ForwardActive, None),
         combined_active_negative: 0.0,
         combined_reactive_positive: 0.0,

@@ -86,6 +86,31 @@ pub struct EventSnapshot {
     pub data_hex: String,
 }
 
+/// 为展示层准备的负荷记录摘要（对应 `load_profile_records` 表新方案）
+///
+/// 每条记录是某类负荷某时刻的完整快照，展示其选通的数据块摘要。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoadRecordSummary {
+    /// 类别标签（第1~6类负荷记录）
+    pub class_label: String,
+    /// 类别ID（1-6）
+    pub class_id: u8,
+    /// 采样时刻
+    pub sample_time_ms: i64,
+    /// 选通的数据块摘要（用于快速展示）
+    pub blocks_summary: String,
+    /// 关键数值摘要（可选，用于详细展示）
+    pub key_values: Vec<KeyValuePair>,
+}
+
+/// 键值对，用于展示负荷记录的关键数据
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyValuePair {
+    pub label: String,
+    pub value: String,
+    pub unit: String,
+}
+
 /// 为展示层准备的冻结快照摘要。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FreezeSnapshotSummary {

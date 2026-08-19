@@ -24,7 +24,7 @@ mod instantaneous;
 mod load_profile;
 mod parameter;
 
-use super::state::{EnergyType, LoadProfileDataType, MeterState};
+use super::state::{EnergyType, MeterState};
 use chrono::{Datelike, Timelike};
 
 /// DI 数据处理器 - 无状态的纯映射层
@@ -97,11 +97,11 @@ impl DIHandler {
                         // data[3] = ww 星期，暂不使用
 
                         // 更新虚拟时钟的日期部分（保持时分秒不变）
-                        use chrono::{Datelike, Local, TimeZone, Timelike};
+                        use chrono::{Datelike, Utc, TimeZone, Timelike};
                         let current = state.virtual_time;
                         let year = 2000 + yy;
 
-                        match Local
+                        match Utc
                             .with_ymd_and_hms(
                                 year,
                                 mm,
@@ -136,10 +136,10 @@ impl DIHandler {
                             as u32;
 
                         // 更新虚拟时钟的时间部分（保持日期不变）
-                        use chrono::{Datelike, Local, TimeZone};
+                        use chrono::{Datelike, Utc, TimeZone};
                         let current = state.virtual_time;
 
-                        match Local
+                        match Utc
                             .with_ymd_and_hms(
                                 current.year(),
                                 current.month(),
@@ -400,14 +400,14 @@ mod tests {
         state.max_demand = 4.5;
 
         // 虚拟时钟设为某月2日：上次检查为上月15日，跨过了本月1日0点
-        use chrono::{Datelike, Local, TimeZone};
-        let now = Local
+        use chrono::{Datelike, Utc, TimeZone};
+        let now = Utc
             .with_ymd_and_hms(2025, 6, 2, 8, 0, 0)
             .single()
             .unwrap();
         state.virtual_time = now;
         state.last_settlement_rollover = Some(
-            Local
+            Utc
                 .with_ymd_and_hms(2025, 5, 15, 0, 0, 0)
                 .single()
                 .unwrap(),
@@ -776,11 +776,11 @@ mod tests {
 
 #[test]
 fn test_event_record_read() {
-    use chrono::{Duration, Local};
+    use chrono::{Duration, Utc};
 
     let handler = DIHandler::new();
     let mut state = MeterState::default();
-    let now = Local::now();
+    let now = Utc::now();
 
     // 添加编程记录事件
     state.add_event_record(

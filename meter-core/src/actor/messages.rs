@@ -151,6 +151,14 @@ pub enum AdminCommand {
     /// 返回值为 JSON 字符串，反序列化为 `Vec<crate::snapshot::FreezeSnapshotSummary>`。
     /// 用于 UI 切换到"冻结数据"标签页时按需加载，避免启动时全量读库。
     LoadFreezeHistory,
+
+    /// 加载最近的负荷记录（`load_profile_records` 表，跨全部类别，按时间倒序）
+    ///
+    /// 与冻结历史不同，负荷记录落库后不维护内存历史（每类各自独立采样间隔，
+    /// 靠数据库查询而非环形缓冲），因此这里只查数据库，不需要合并去重。
+    /// 返回值为 JSON 字符串，反序列化为 `Vec<crate::snapshot::LoadRecordSummary>`。
+    /// 用于 UI 切换到"负荷记录"标签页时按需加载。
+    LoadLoadProfileHistory { max_records: u32 },
 }
 
 /// Tick 消息（全局时钟广播）

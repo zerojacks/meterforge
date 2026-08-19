@@ -24,6 +24,13 @@ pub struct PersistenceConfig {
     pub batch_max_size: usize,
     pub batch_timeout_ms: u64,
     pub max_connections: u32,
+    /// `load_profile_records` 每个 (address, class_id) 序列最多保留的行数——
+    /// 不同于冻结快照按协议 DI0 语义逐条挪号，负荷记录每类各自独立采样间隔，
+    /// 快的可能每分钟一条 × 每表最多 6 类，必须有容量上限才不会无限增长。
+    /// 超出部分由 `load_profile_cleanup_interval_secs` 定期清理。
+    pub load_profile_max_records_per_class: u32,
+    /// 负荷记录清理任务的运行间隔（秒）
+    pub load_profile_cleanup_interval_secs: u64,
 }
 
 impl Default for PersistenceConfig {
@@ -33,6 +40,8 @@ impl Default for PersistenceConfig {
             batch_max_size: 200,
             batch_timeout_ms: 1000, // 1秒超时
             max_connections: 4,
+            load_profile_max_records_per_class: 2000,
+            load_profile_cleanup_interval_secs: 600, // 10 分钟
         }
     }
 }
@@ -116,6 +125,11 @@ impl PersistenceWorker {
         info!("PersistenceWorker started");
 
         let mut flush_interval = interval(Duration::from_millis(self.config.batch_timeout_ms));
+        let mut load_profile_cleanup_interval = interval(Duration::from_secs(
+            self.config.load_profile_cleanup_interval_secs,
+        ));
+        // 第一次 tick 立即触发，跳过它，避免启动瞬间就跑一次清理（此时数据量还很小）
+        load_profile_cleanup_interval.tick().await;
 
         loop {
             tokio::select! {
@@ -136,6 +150,13 @@ impl PersistenceWorker {
                     }
                 }
 
+                // 定期清理超出容量上限的负荷记录（见 load_profile_max_records_per_class）
+                _ = load_profile_cleanup_interval.tick() => {
+                    if let Err(e) = self.cleanup_load_profile_records().await {
+                        error!("负荷记录清理失败: {}", e);
+                    }
+                }
+
                 // 通道关闭，执行最终flush并退出
                 else => {
                     info!("PersistenceWorker channel closed, performing final flush");
@@ -148,6 +169,48 @@ impl PersistenceWorker {
         }
 
         info!("PersistenceWorker stopped");
+    }
+
+    /// 清理超出 `load_profile_max_records_per_class` 容量的负荷记录
+    ///
+    /// 与冻结快照按协议 DI0 语义逐条挪号不同，负荷记录没有对应的协议
+    /// 语义容量（协议只规定了采样间隔，没规定保留多少条），这里用
+    /// `ROW_NUMBER() OVER (PARTITION BY address, class_id ORDER BY
+    /// sample_time_ms DESC)` 给每个 (表, 类别) 序列内部按新到旧编号，删掉
+    /// 超出容量的部分——效果上相当于每个序列各自维护一个固定大小的"环形
+    /// 缓冲"，但用一条 DELETE 语句覆盖全部电表、全部类别，不用按地址/类别
+    /// 逐个查询。`load_profile_records` 是 `WITHOUT ROWID` 表、主键是
+    /// `(address, class_id, sample_time_ms)` 复合列，没有单独的 `id` 列，
+    /// 所以用行值（row value）比较 `(address, class_id, sample_time_ms) IN
+    /// (...)` 而不是按 `id` 过滤。
+    async fn cleanup_load_profile_records(&self) -> Result<(), sqlx::Error> {
+        let capacity = self.config.load_profile_max_records_per_class as i64;
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM load_profile_records
+            WHERE (address, class_id, sample_time_ms) IN (
+                SELECT address, class_id, sample_time_ms FROM (
+                    SELECT address, class_id, sample_time_ms, ROW_NUMBER() OVER (
+                        PARTITION BY address, class_id
+                        ORDER BY sample_time_ms DESC
+                    ) AS rn
+                    FROM load_profile_records
+                )
+                WHERE rn > ?
+            )
+            "#,
+        )
+        .bind(capacity)
+        .execute(&self.pool)
+        .await?;
+
+        let deleted = result.rows_affected();
+        if deleted > 0 {
+            info!("负荷记录清理：删除 {} 条超出容量的历史记录", deleted);
+        }
+
+        Ok(())
     }
 
     /// 批量刷新缓冲区
@@ -202,19 +265,14 @@ impl PersistenceWorker {
 
             PersistRequest::WriteEventRecord(record) => self.write_event_record(tx, record).await,
 
-            PersistRequest::WriteLoadProfileRecord(record) => {
-                self.write_load_profile_record(tx, record).await
-            }
-
             PersistRequest::WriteEnergyRegister(register) => {
                 self.write_energy_register(tx, register).await
             }
 
             PersistRequest::UpdateMaxDemand(entry) => self.update_max_demand(tx, entry).await,
 
-            PersistRequest::WriteLoadProfileSample { address, sample } => {
-                self.write_load_profile_sample_tx(tx, &address, &sample)
-                    .await
+            PersistRequest::WriteLoadRecord(row) => {
+                self.write_load_record_tx(tx, row).await
             }
 
             PersistRequest::SaveVirtualTime {
@@ -358,130 +416,32 @@ impl PersistenceWorker {
         Ok(())
     }
 
-    /// 写入负荷记录采样（支持LoadProfileSample）
+    /// 写入负荷记录（load_profile_records 表，JSON payload）
     ///
-    /// 按设计方案，负荷记录采样数据直接落库，不维护内存历史
-    pub async fn write_load_profile_sample(
-        pool: &SqlitePool,
-        address: &str,
-        sample: &crate::simulation::state::LoadProfileSample,
-    ) -> Result<(), sqlx::Error> {
-        let now_ms = Utc::now().timestamp_millis();
-        let sample_time_ms = sample.sample_time.timestamp_millis();
-
-        // 将浮点值转换为定点数（*10000）以避免浮点精度问题
-        let value_fp = (sample.value * 10000.0) as i64;
-
-        sqlx::query(
-            r#"
-            INSERT INTO load_profile_samples (
-                address, data_type, channel, sample_time_ms, value_fp, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(address)
-        .bind(sample.data_type as u8)
-        .bind(sample.channel)
-        .bind(sample_time_ms)
-        .bind(value_fp)
-        .bind(now_ms)
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// 批量写入负荷记录采样
-    pub async fn write_load_profile_samples_batch(
-        pool: &SqlitePool,
-        address: &str,
-        samples: &[crate::simulation::state::LoadProfileSample],
-    ) -> Result<(), sqlx::Error> {
-        if samples.is_empty() {
-            return Ok(());
-        }
-
-        let mut tx = pool.begin().await?;
-
-        for sample in samples {
-            let now_ms = Utc::now().timestamp_millis();
-            let sample_time_ms = sample.sample_time.timestamp_millis();
-            let value_fp = (sample.value * 10000.0) as i64;
-
-            sqlx::query(
-                r#"
-                INSERT INTO load_profile_samples (
-                    address, data_type, channel, sample_time_ms, value_fp, created_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(address)
-            .bind(sample.data_type as u8)
-            .bind(sample.channel)
-            .bind(sample_time_ms)
-            .bind(value_fp)
-            .bind(now_ms)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 在事务内写入单条负荷记录采样（load_profile_samples 表）
-    async fn write_load_profile_sample_tx(
+    /// 设计说明：
+    /// - 主键 (address, class_id, sample_time_ms) 天然防重复采样
+    /// - 主键冲突时使用 ON CONFLICT IGNORE，保留第一次采样值
+    async fn write_load_record_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        address: &str,
-        sample: &crate::simulation::state::LoadProfileSample,
+        row: LoadRecordRow,
     ) -> Result<(), sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
-        let sample_time_ms = sample.sample_time.timestamp_millis();
-        // 定点数存储：真实值 * 10000，避免浮点精度问题
-        let value_fp = (sample.value * 10000.0) as i64;
-
-        sqlx::query(
-            r#"
-            INSERT INTO load_profile_samples (
-                address, data_type, channel, sample_time_ms, value_fp, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind(address)
-        .bind(sample.data_type as u8)
-        .bind(sample.channel)
-        .bind(sample_time_ms)
-        .bind(value_fp)
-        .bind(now_ms)
-        .execute(&mut **tx)
-        .await?;
-
-        Ok(())
-    }
-
-    /// 写入负荷记录（旧版本，兼容LoadProfileRecordRow）
-    async fn write_load_profile_record(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        record: LoadProfileRecordRow,
-    ) -> Result<(), sqlx::Error> {
-        let now_ms = Utc::now().timestamp_millis();
-        let recorded_at_ms = record.recorded_at.timestamp_millis();
-        let payload_json = serde_json::to_string(&record.payload)
+        let sample_time_ms = row.sample_time.timestamp_millis();
+        let payload_json = serde_json::to_string(&row.payload)
             .map_err(|e| sqlx::Error::Protocol(format!("JSON serialization error: {}", e)))?;
 
         sqlx::query(
             r#"
             INSERT INTO load_profile_records (
-                address, channel, data_type, recorded_at_ms, payload_json, created_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                address, class_id, sample_time_ms, payload_json, created_at_ms
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (address, class_id, sample_time_ms) DO NOTHING
             "#,
         )
-        .bind(&record.meter_address)
-        .bind(record.channel)
-        .bind(record.data_type)
-        .bind(recorded_at_ms)
+        .bind(&row.meter_address)
+        .bind(row.class_id)
+        .bind(sample_time_ms)
         .bind(payload_json)
         .bind(now_ms)
         .execute(&mut **tx)
@@ -588,7 +548,7 @@ impl PersistenceWorker {
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         address: &str,
-        virtual_time: chrono::DateTime<chrono::Local>,
+        virtual_time: chrono::DateTime<chrono::Utc>,
         time_scale: f64,
         simulation_config: &crate::simulation::SimulationConfig,
     ) -> Result<(), sqlx::Error> {
@@ -724,7 +684,7 @@ impl PersistenceWorker {
 
             let snapshot_time = chrono::DateTime::from_timestamp_millis(snapshot_time_ms)
                 .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
-                .with_timezone(&chrono::Local);
+                .with_timezone(&chrono::Utc);
 
             let payload: serde_json::Value = serde_json::from_str(&payload_json)
                 .map_err(|e| sqlx::Error::Protocol(format!("JSON parse error: {}", e)))?;
@@ -773,7 +733,7 @@ impl PersistenceWorker {
 
             let snapshot_time = chrono::DateTime::from_timestamp_millis(snapshot_time_ms)
                 .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
-                .with_timezone(&chrono::Local);
+                .with_timezone(&chrono::Utc);
 
             let payload: serde_json::Value = serde_json::from_str(&payload_json)
                 .map_err(|e| sqlx::Error::Protocol(format!("JSON parse error: {}", e)))?;
@@ -791,73 +751,213 @@ impl PersistenceWorker {
         Ok(result)
     }
 
-    /// 查询负荷记录采样数据（供 DIHandler 读取使用）
-    ///
-    /// 参数：
-    /// - pool: 数据库连接池
-    /// - address: 电表地址
-    /// - data_type: 数据类型（01=电压，02=电流等）
-    /// - channel: 通道（00=总，01=A相，02=B相，03=C相）
-    /// - start_time: 起始时间
-    /// - end_time: 结束时间
-    /// - max_records: 最大返回记录数
-    ///
-    /// 返回：按时间升序排列的采样记录列表
-    pub async fn query_load_profile_samples(
+    // ═════════════════════════════════════════════════════════════════════════
+    // 负荷记录查询（load_profile_records 表，JSON payload）
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// 查询最早的负荷记录块（06-DI2-00-00）
+    pub async fn query_load_records_earliest(
         pool: &SqlitePool,
         address: &str,
-        data_type: u8,
-        channel: u8,
-        start_time: &chrono::DateTime<chrono::Local>,
-        end_time: &chrono::DateTime<chrono::Local>,
-        max_records: u32,
-    ) -> Result<Vec<LoadProfileSampleRow>, sqlx::Error> {
-        let start_ms = start_time.timestamp_millis();
-        let end_ms = end_time.timestamp_millis();
-
+        class_id: u8,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT sample_time_ms, data_type, channel, value_fp
-            FROM load_profile_samples
-            WHERE address = ? 
-              AND data_type = ? 
-              AND channel = ?
-              AND sample_time_ms >= ?
-              AND sample_time_ms <= ?
+            SELECT class_id, sample_time_ms, payload_json
+            FROM load_profile_records
+            WHERE address = ? AND class_id = ?
             ORDER BY sample_time_ms ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(address)
+        .bind(class_id)
+        .fetch_all(pool)
+        .await?;
+
+        Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 查询给定时间的负荷记录块（06-DI2-00-01）
+    pub async fn query_load_records_at_time(
+        pool: &SqlitePool,
+        address: &str,
+        class_id: u8,
+        target_time: &chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
+        let target_ms = target_time.timestamp_millis();
+
+        // 查询最接近目标时间的记录（取绝对差值最小的）
+        let rows = sqlx::query(
+            r#"
+            SELECT class_id, sample_time_ms, payload_json
+            FROM load_profile_records
+            WHERE address = ? AND class_id = ?
+            ORDER BY ABS(sample_time_ms - ?) ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(address)
+        .bind(class_id)
+        .bind(target_ms)
+        .fetch_all(pool)
+        .await?;
+
+        Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 查询最近的负荷记录块（06-DI2-00-02）
+    pub async fn query_load_records_latest(
+        pool: &SqlitePool,
+        address: &str,
+        class_id: u8,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT class_id, sample_time_ms, payload_json
+            FROM load_profile_records
+            WHERE address = ? AND class_id = ?
+            ORDER BY sample_time_ms DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(address)
+        .bind(class_id)
+        .fetch_all(pool)
+        .await?;
+
+        Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 查询最近的负荷记录（跨类别，或按 `class_id` 过滤单一类别），不依赖任何
+    /// "当前时间"参照——单纯按 `sample_time_ms DESC LIMIT max_records`。
+    ///
+    /// 专供 UI"负荷记录"标签页总览列表使用：`sample_time_ms` 是电表的
+    /// 虚拟时钟，仿真通常开倍速运行，虚拟时钟可能已经跑到比真实墙上时钟
+    /// 靠后很多（甚至几天），如果像 `query_load_records_range` 那样用
+    /// `chrono::Utc::now()` 划定时间窗口上界，虚拟时间"处在真实时间的
+    /// 未来"的记录会被整体过滤掉——数据库明明有数据，UI 却一条都看不到。
+    /// 这里不设时间窗口，直接取最新的 N 条，彻底避开真实/虚拟时钟不一致
+    /// 的问题。
+    pub async fn query_recent_load_records(
+        pool: &SqlitePool,
+        address: &str,
+        max_records: u32,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT class_id, sample_time_ms, payload_json
+            FROM load_profile_records
+            WHERE address = ?
+            ORDER BY sample_time_ms DESC
             LIMIT ?
             "#,
         )
         .bind(address)
-        .bind(data_type)
-        .bind(channel)
-        .bind(start_ms)
-        .bind(end_ms)
         .bind(max_records as i64)
         .fetch_all(pool)
         .await?;
 
-        let mut samples = Vec::new();
+        Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 查询时间范围内的负荷记录（跨类别，或按 `class_id` 过滤单一类别）
+    ///
+    /// `class_id = None` 时不筛类别，跨全部 1~6 类混合返回，按时间升序——
+    /// 调用方需要自行提供一个跟 `sample_time_ms`（虚拟时钟）同源的时间
+    /// 范围，不要传真实墙上时钟（`chrono::Utc::now()`）：仿真通常开倍速
+    /// 运行，虚拟时钟可能已经跑到比真实时间靠后很多，用真实时间当上界会
+    /// 把这些"处在真实时间未来"的记录整体过滤掉。UI"负荷记录"标签页的
+    /// 总览列表不需要时间窗口这个概念，改用 `query_recent_load_records`。
+    ///
+    /// `class_id = Some(n)` 时只返回该类别，适合 06-10-DI1-DI0（曲线查询）
+    /// 这种场景：这类查询在协议里没有类别维度，如果不筛类别，会把可能拥有
+    /// 不同采样间隔的多个类别的记录交织成一条时间序列，产出的"曲线"没有
+    /// 稳定的采样间隔、也可能同一时刻出现多个点，没有实际意义。
+    pub async fn query_load_records_range(
+        pool: &SqlitePool,
+        address: &str,
+        class_id: Option<u8>,
+        start_time: &chrono::DateTime<chrono::Utc>,
+        end_time: &chrono::DateTime<chrono::Utc>,
+        max_records: u32,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
+        let start_ms = start_time.timestamp_millis();
+        let end_ms = end_time.timestamp_millis();
+
+        let rows = if let Some(class_id) = class_id {
+            sqlx::query(
+                r#"
+                SELECT class_id, sample_time_ms, payload_json
+                FROM load_profile_records
+                WHERE address = ?
+                  AND class_id = ?
+                  AND sample_time_ms >= ?
+                  AND sample_time_ms <= ?
+                ORDER BY sample_time_ms ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(address)
+            .bind(class_id)
+            .bind(start_ms)
+            .bind(end_ms)
+            .bind(max_records as i64)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT class_id, sample_time_ms, payload_json
+                FROM load_profile_records
+                WHERE address = ?
+                  AND sample_time_ms >= ?
+                  AND sample_time_ms <= ?
+                ORDER BY sample_time_ms ASC
+                LIMIT ?
+                "#,
+            )
+            .bind(address)
+            .bind(start_ms)
+            .bind(end_ms)
+            .bind(max_records as i64)
+            .fetch_all(pool)
+            .await?
+        };
+
+        Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 解析load_profile_records表查询结果为LoadRecordRow
+    fn parse_load_record_rows(
+        address: &str,
+        rows: Vec<sqlx::sqlite::SqliteRow>,
+    ) -> Result<Vec<LoadRecordRow>, sqlx::Error> {
+        use sqlx::Row;
+
+        let mut records = Vec::new();
 
         for row in rows {
+            let class_id: u8 = row.get("class_id");
             let sample_time_ms: i64 = row.get("sample_time_ms");
+            let payload_json: String = row.get("payload_json");
+
             let sample_time = chrono::DateTime::from_timestamp_millis(sample_time_ms)
                 .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
-                .with_timezone(&chrono::Local);
+                .with_timezone(&chrono::Utc);
 
-            let value_fp: i64 = row.get("value_fp");
-            let value = value_fp as f64 / 10000.0; // 恢复浮点值（除以10000）
+            let payload: serde_json::Value = serde_json::from_str(&payload_json)
+                .map_err(|e| sqlx::Error::Protocol(format!("JSON parse error: {}", e)))?;
 
-            samples.push(LoadProfileSampleRow {
+            records.push(LoadRecordRow {
                 meter_address: address.to_string(),
+                class_id,
                 sample_time,
-                data_type: row.get("data_type"),
-                channel: row.get("channel"),
-                value,
+                payload,
             });
         }
 
-        Ok(samples)
+        Ok(records)
     }
 
     /// 从数据库恢复电能寄存器
@@ -902,7 +1002,7 @@ impl PersistenceWorker {
     pub async fn restore_virtual_time(
         pool: &SqlitePool,
         address: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Local>>, sqlx::Error> {
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
         let row = sqlx::query(
             r#"
             SELECT virtual_time_ms
@@ -919,7 +1019,7 @@ impl PersistenceWorker {
 
             let dt = chrono::DateTime::from_timestamp_millis(virtual_time_ms)
                 .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
-                .with_timezone(&chrono::Local);
+                .with_timezone(&chrono::Utc);
 
             Ok(Some(dt))
         } else {
@@ -934,7 +1034,7 @@ impl PersistenceWorker {
     pub async fn save_virtual_time(
         pool: &SqlitePool,
         address: &str,
-        virtual_time: chrono::DateTime<chrono::Local>,
+        virtual_time: chrono::DateTime<chrono::Utc>,
         time_scale: f64,
     ) -> Result<(), sqlx::Error> {
         let now_ms = chrono::Utc::now().timestamp_millis();

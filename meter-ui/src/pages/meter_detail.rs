@@ -6,7 +6,7 @@ use crate::{
     state::GlobalMeterRegistry,
     types::MeterSnapshot,
 };
-use chrono::{Datelike, Local, TimeZone, Timelike};
+use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
 use gpui::*;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
@@ -26,7 +26,10 @@ use crate::settings::parameter_dialogs::{
     TouConfigDialog,
 };
 use crate::settings::SimulationConfigPanel;
-use meter_core::snapshot::FreezeSnapshotSummary;
+use meter_core::snapshot::{FreezeSnapshotSummary, LoadRecordSummary};
+
+/// "负荷记录"标签页每次最多拉取的采样条数（跨全部数据类型/通道）。
+const LOAD_PROFILE_HISTORY_LIMIT: u32 = 200;
 
 #[derive(Clone, Copy, Default)]
 enum DetailTab {
@@ -36,6 +39,7 @@ enum DetailTab {
     Simulation,
     Events,
     Freezes,
+    LoadProfile,
 }
 
 impl DetailTab {
@@ -45,6 +49,7 @@ impl DetailTab {
             2 => Self::Simulation,
             3 => Self::Events,
             4 => Self::Freezes,
+            5 => Self::LoadProfile,
             _ => Self::RealTime,
         }
     }
@@ -55,6 +60,7 @@ impl DetailTab {
             Self::Simulation => 2,
             Self::Events => 3,
             Self::Freezes => 4,
+            Self::LoadProfile => 5,
         }
     }
 }
@@ -68,6 +74,11 @@ pub struct MeterDetailView {
     /// 加载完成前 UI 用 snapshot 里的实时快照兜底（见 meter_history::freezes）。
     freeze_history: Option<Vec<FreezeSnapshotSummary>>,
     freeze_history_loading: bool,
+    /// 数据库里最近的负荷记录采样；切到"负荷记录"tab 时按需异步加载。
+    /// 负荷记录落库后不维护内存历史，加载完成前只能展示"正在加载"，没有
+    /// 实时快照可兜底（见 meter_history::load_profile）。
+    load_profile_history: Option<Vec<LoadRecordSummary>>,
+    load_profile_history_loading: bool,
 }
 
 impl MeterDetailView {
@@ -163,6 +174,8 @@ impl MeterDetailView {
             simulation_panel,
             freeze_history: None,
             freeze_history_loading: false,
+            load_profile_history: None,
+            load_profile_history_loading: false,
         }
     }
 
@@ -188,9 +201,39 @@ impl MeterDetailView {
                 let _ = this.update(cx, |this, cx| {
                     this.freeze_history_loading = false;
                     match result {
-                        Ok(data) => this.freeze_history = Some(data),
+                        Ok(data) => {
+                            this.freeze_history = Some(data);
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "加载冻结历史失败");
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // 同理，"负荷记录"tab 也只在首次切入、且还没加载过/没有正在加载时打库。
+        if matches!(self.active_tab, DetailTab::LoadProfile)
+            && self.load_profile_history.is_none()
+            && !self.load_profile_history_loading
+        {
+            self.load_profile_history_loading = true;
+            let address = self.address.clone();
+            let backend = cx.global::<AppBackend>().clone();
+            let task =
+                backend.load_load_profile_history(address, LOAD_PROFILE_HISTORY_LIMIT, cx);
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    this.load_profile_history_loading = false;
+                    match result {
+                        Ok(data) => {
+                            this.load_profile_history = Some(data);
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "加载负荷记录失败");
                         }
                     }
                     cx.notify();
@@ -209,8 +252,8 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let initial = chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
-            .unwrap_or_else(|| Local::now().into())
-            .with_timezone(&Local);
+            .unwrap_or_else(|| Utc::now().into())
+            .with_timezone(&chrono::Utc);
         let address = self.address.clone();
 
         // 只在“打开对话框”这一刻创建一次 Entity，避免 open_dialog 的 build
@@ -435,6 +478,12 @@ impl Render for MeterDetailView {
                 &theme,
             )
             .into_any_element(),
+            DetailTab::LoadProfile => super::meter_history::load_profile(
+                self.load_profile_history.as_deref(),
+                self.load_profile_history_loading,
+                &theme,
+            )
+            .into_any_element(),
         };
         div()
             .size_full()
@@ -467,7 +516,7 @@ impl Render for MeterDetailView {
                         let virtual_time =
                             chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
                                 .map(|dt| {
-                                    dt.with_timezone(&Local)
+                                    dt.with_timezone(&Utc)
                                         .format("%Y-%m-%d %H:%M:%S")
                                         .to_string()
                                 })
@@ -488,7 +537,8 @@ impl Render for MeterDetailView {
                     .child(Tab::new().label("参数设置"))
                     .child(Tab::new().label("模拟配置"))
                     .child(Tab::new().label("事件记录"))
-                    .child(Tab::new().label("冻结数据")),
+                    .child(Tab::new().label("冻结数据"))
+                    .child(Tab::new().label("负荷记录")),
             )
             .child(
                 div().flex_1().min_h_0().child(

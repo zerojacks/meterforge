@@ -90,7 +90,7 @@ impl VirtualMeter {
                 self.state.restore_virtual_time(virtual_time);
                 println!(
                     "[VirtualMeter] Restored virtual_time: {}",
-                    virtual_time.format("%Y-%m-%d %H:%M:%S")
+                    virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC")
                 );
             }
             Ok(None) => {
@@ -195,7 +195,7 @@ impl VirtualMeter {
     /// 处理 DL/T645 读数据命令（异步，支持数据库历史查询）
     ///
     /// 按设计 4.5.2.3 / §12 路由：
-    /// - DI3=06 负荷记录：解析时间范围，查 `load_profile_samples` 表
+    /// - DI3=06 负荷记录：解析时间范围，查 `load_profile_records` 表
     /// - DI3=05 冻结数据且 DI0 超过内存环形缓冲容量：查 `freeze_snapshots` 表
     /// - 其余：内存同步读取
     pub async fn handle_read_async(
@@ -213,27 +213,64 @@ impl VirtualMeter {
 
         // 负荷记录（DI3=06）
         if di[3] == 0x06 {
-            if rest.len() != 10 {
-                return Err(format!(
-                    "负荷记录时间范围长度错误：期望10字节，实际{}字节",
-                    rest.len()
-                ));
-            }
             let pool = db_pool.ok_or_else(|| "负荷记录查询需要数据库支持".to_string())?;
-            let start_time = parse_load_profile_time(&rest[0..5])?;
-            let end_time = parse_load_profile_time(&rest[5..10])?;
-            return self
-                .handler
-                .handle_load_profile_read_async(
-                    di,
-                    &self.state,
-                    &address,
-                    pool,
-                    &start_time,
-                    &end_time,
-                    None,
-                )
-                .await;
+            
+            // 判断是第一类（06-DI2-00-DI0）还是第二类（06-10-DI1-DI0）
+            if di[2] == 0x10 {
+                // 第二类：曲线数据读取，需要时间范围（10字节）
+                if rest.len() != 10 {
+                    return Err(format!(
+                        "第二类负荷记录时间范围长度错误：期望10字节，实际{}字节",
+                        rest.len()
+                    ));
+                }
+                let start_time = parse_load_profile_time(&rest[0..5])?;
+                let end_time = parse_load_profile_time(&rest[5..10])?;
+                return self
+                    .handler
+                    .handle_load_profile_read_async(
+                        di,
+                        &self.state,
+                        &address,
+                        pool,
+                        None, // time_param
+                        &start_time,
+                        &end_time,
+                        None, // max_records
+                    )
+                    .await;
+            } else {
+                // 第一类：记录块读取
+                // DI0=00（最早）或02（最近）：不需要额外参数
+                // DI0=01（给定时间）：需要5字节BCD时间参数
+                let time_param = if di[0] == 0x01 {
+                    if rest.len() < 5 {
+                        return Err(format!(
+                            "给定时间记录块参数长度不足：期望至少5字节，实际{}字节",
+                            rest.len()
+                        ));
+                    }
+                    Some(&rest[0..5])
+                } else {
+                    None
+                };
+                
+                // 第一类不需要时间范围，使用虚拟时间作为占位
+                let now = self.state.virtual_time;
+                return self
+                    .handler
+                    .handle_load_profile_read_async(
+                        di,
+                        &self.state,
+                        &address,
+                        pool,
+                        time_param,
+                        &now,
+                        &now,
+                        None,
+                    )
+                    .await;
+            }
         }
 
         // 冻结数据（DI3=05）且 DI0 超过内存环形缓冲容量
@@ -497,7 +534,7 @@ impl VirtualMeter {
         self.state.add_event_record(
             0x30, // 编程记录
             0x12, // 密钥更新
-            chrono::Local::now(),
+            chrono::Utc::now(),
             vec![password_level], // 记录修改的密码等级
         );
 
@@ -538,13 +575,13 @@ impl VirtualMeter {
 
         // 清零最大需量寄存器
         self.state.max_demand = 0.0;
-        self.state.max_demand_time = chrono::Local::now();
+        self.state.max_demand_time = chrono::Utc::now();
 
         // 生成编程记录事件
         self.state.add_event_record(
             0x30, // 编程记录
             0x19, // 需量清零
-            chrono::Local::now(),
+            chrono::Utc::now(),
             operator_code.to_vec(),
         );
 
@@ -587,13 +624,13 @@ impl VirtualMeter {
 
         // 清零最大需量
         self.state.max_demand = 0.0;
-        self.state.max_demand_time = chrono::Local::now();
+        self.state.max_demand_time = chrono::Utc::now();
 
         // 生成编程记录事件（03 32 01 01）
         self.state.add_event_record(
             0x32, // 清零记录
             0x01, // 电表清零
-            chrono::Local::now(),
+            chrono::Utc::now(),
             operator_code.to_vec(),
         );
 
@@ -637,7 +674,7 @@ impl VirtualMeter {
         self.state.add_event_record(
             0x30, // 编程记录
             0x1B, // 事件清零
-            chrono::Local::now(),
+            chrono::Utc::now(),
             operator_code.to_vec(),
         );
 
@@ -737,9 +774,9 @@ impl VirtualMeter {
         self.physics.tick(&mut self.state, elapsed, time_scale);
 
         // 负荷记录采样（设计 4.5.1.7 / §12.2）：检测采样条件并提交持久化
-        let samples = self.physics.check_load_profile_sampling(&mut self.state);
+        let samples = self.physics.check_load_record_sampling(&mut self.state);
         if !samples.is_empty() {
-            self.persist_load_profile_samples(samples);
+            self.persist_load_records(samples);
         }
 
         // 检查并处理冻结触发
@@ -756,14 +793,32 @@ impl VirtualMeter {
     /// `tokio::spawn` 会直接 panic）。改用 `try_send`：非阻塞、不需要 Runtime，
     /// 队列满/已关闭时立刻 `warn!`，而不是把失败信息丢进一个可能永远不会
     /// 被 poll 的任务里。
-    fn persist_load_profile_samples(&self, samples: Vec<super::state::LoadProfileSample>) {
+    fn persist_load_records(&self, samples: Vec<super::state::LoadRecordSample>) {
+        use crate::persistence::LoadRecordRow;
+
         if let Some(persist_tx) = &self.persist_tx {
             let address_str = address_to_string(&self.state.address);
             for sample in samples {
-                let address = address_str.clone();
-                if let Err(e) = persist_tx
-                    .try_send(PersistRequest::WriteLoadProfileSample { address, sample })
-                {
+                // 将 LoadRecordSample 转换为 LoadRecordRow
+                let payload = match serde_json::to_value(&sample.data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            "[VirtualMeter {}] 负荷记录数据序列化失败: {}",
+                            address_str, e
+                        );
+                        continue;
+                    }
+                };
+
+                let row = LoadRecordRow {
+                    meter_address: address_str.clone(),
+                    class_id: sample.class_id,
+                    sample_time: sample.sample_time,
+                    payload,
+                };
+
+                if let Err(e) = persist_tx.try_send(PersistRequest::WriteLoadRecord(row)) {
                     warn!(
                         "[VirtualMeter {}] 负荷记录采样持久化队列已满或已关闭: {}",
                         address_str, e
@@ -809,7 +864,7 @@ impl VirtualMeter {
                 let address_str = address_to_string(&self.state.address);
 
                 // 提交到 PersistenceWorker（非阻塞、不需要 tokio Runtime，见
-                // persist_load_profile_samples 上方注释）
+                // persist_load_records 上方注释）
                 let mut row = snapshot_row;
                 row.meter_address = address_str.clone();
 
@@ -824,22 +879,24 @@ impl VirtualMeter {
                 #[cfg(debug_assertions)]
                 {
                     println!(
-                        "[VirtualMeter] 冻结快照已生成并提交持久化: trigger={:?}, time={}, occurrence={}",
+                        "[VirtualMeter {}] 冻结快照已生成并提交持久化: trigger={:?}, time={}, occurrence={}",
+                        address_str,
                         trigger,
-                        self.state.virtual_time.format("%Y-%m-%d %H:%M:%S"),
+                        self.state.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC"),
                         occurrence_index
                     );
                 }
             } else {
                 // 无持久化通道，只生成内存快照
                 let _occurrence_index = self.state.create_freeze_snapshot(trigger);
-
+                let address_str = address_to_string(&self.state.address);
                 #[cfg(debug_assertions)]
                 {
                     println!(
-                        "[VirtualMeter] 冻结快照已生成(仅内存): trigger={:?}, time={}, occurrence={}",
+                        "[VirtualMeter {}] 冻结快照已生成(仅内存): trigger={:?}, time={}, occurrence={}",
+                        address_str,
                         trigger,
-                        self.state.virtual_time.format("%Y-%m-%d %H:%M:%S"),
+                        self.state.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC"),
                         _occurrence_index
                     );
                 }
@@ -917,7 +974,7 @@ impl VirtualMeter {
                 rate4_active_positive: get_energy(EnergyType::ForwardActive, 4),
             };
 
-            // 非阻塞提交电能寄存器（见 persist_load_profile_samples 上方注释：这里不能
+            // 非阻塞提交电能寄存器（见 persist_load_records 上方注释：这里不能
             // .await，也不能 tokio::spawn，用 try_send 代替）
             if let Err(e) = persist_tx.try_send(PersistRequest::WriteEnergyRegister(row)) {
                 warn!(
@@ -940,7 +997,7 @@ impl VirtualMeter {
             
             if let Err(e) = persist_tx.try_send(PersistRequest::SaveVirtualTime {
                 address: address_str.clone(),
-                virtual_time: self.state.virtual_time,
+                virtual_time: self.state.virtual_time.with_timezone(&chrono::Utc),
                 time_scale: self.state.simulation_time_scale,
                 simulation_config,
             }) {
@@ -958,7 +1015,7 @@ impl VirtualMeter {
                 println!(
                     "[VirtualMeter {}] 电能寄存器和虚拟时间已 flush: time={}, energy={:.3} kWh",
                     address_str,
-                    self.state.virtual_time.format("%Y-%m-%d %H:%M:%S"),
+                    self.state.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC"),
                     get_energy(EnergyType::ForwardActive, 0)
                 );
             }
@@ -1046,7 +1103,7 @@ pub use crate::protocol::format::{
 };
 
 /// 解析负荷记录读取命令的时间范围字段（5 字节 BCD：mm hh DD MM YY，低字段先传）
-fn parse_load_profile_time(data: &[u8]) -> Result<chrono::DateTime<chrono::Local>, String> {
+fn parse_load_profile_time(data: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
     use crate::protocol::format::bcd_to_u64;
 
     if data.len() != 5 {
@@ -1061,7 +1118,7 @@ fn parse_load_profile_time(data: &[u8]) -> Result<chrono::DateTime<chrono::Local
     let year = 2000 + yy;
 
     use chrono::TimeZone;
-    chrono::Local
+    chrono::Utc
         .with_ymd_and_hms(year, month, dd, hh, mm, 0)
         .single()
         .ok_or_else(|| {
