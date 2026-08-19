@@ -217,99 +217,19 @@ impl VirtualMeter {
     /// 处理 DL/T645 读数据命令（异步，支持数据库历史查询）
     ///
     /// 按设计 4.5.2.3 / §12 路由：
-    /// - DI3=06 负荷记录：解析时间范围，查 `load_profile_records` 表
-    /// - DI3=05 冻结数据且 DI0 超过内存环形缓冲容量：查 `freeze_snapshots` 表
-    /// - 其余：内存同步读取
+    /// - 所有DI解析和路由逻辑已移到 DIHandler
+    /// - VirtualMeter 只负责提供上下文（state, address, db_pool）
     pub async fn handle_read_async(
         &mut self,
         data: &[u8],
         db_pool: Option<&sqlx::SqlitePool>,
     ) -> Result<Vec<u8>, String> {
-        if data.len() < 4 {
-            return Err("读命令数据长度不足".to_string());
-        }
-
-        let di = [data[0], data[1], data[2], data[3]];
-        let rest = &data[4..];
         let address = address_to_string(&self.state.address);
-
-        // 负荷记录（DI3=06）
-        if di[3] == 0x06 {
-            let pool = db_pool.ok_or_else(|| "负荷记录查询需要数据库支持".to_string())?;
-            
-            // 判断是第一类（06-DI2-00-DI0）还是第二类（06-10-DI1-DI0）
-            if di[2] == 0x10 {
-                // 第二类：曲线数据读取，需要时间范围（10字节）
-                if rest.len() != 10 {
-                    return Err(format!(
-                        "第二类负荷记录时间范围长度错误：期望10字节，实际{}字节",
-                        rest.len()
-                    ));
-                }
-                let start_time = parse_load_profile_time(&rest[0..5])?;
-                let end_time = parse_load_profile_time(&rest[5..10])?;
-                return self
-                    .handler
-                    .handle_load_profile_read_async(
-                        di,
-                        &self.state,
-                        &address,
-                        pool,
-                        None, // time_param
-                        &start_time,
-                        &end_time,
-                        None, // max_records
-                    )
-                    .await;
-            } else {
-                // 第一类：记录块读取
-                // DI0=00（最早）或02（最近）：不需要额外参数
-                // DI0=01（给定时间）：需要5字节BCD时间参数
-                let time_param = if di[0] == 0x01 {
-                    if rest.len() < 5 {
-                        return Err(format!(
-                            "给定时间记录块参数长度不足：期望至少5字节，实际{}字节",
-                            rest.len()
-                        ));
-                    }
-                    Some(&rest[0..5])
-                } else {
-                    None
-                };
-                
-                // 第一类不需要时间范围，使用虚拟时间作为占位
-                let now = self.state.virtual_time;
-                return self
-                    .handler
-                    .handle_load_profile_read_async(
-                        di,
-                        &self.state,
-                        &address,
-                        pool,
-                        time_param,
-                        &now,
-                        &now,
-                        None,
-                    )
-                    .await;
-            }
-        }
-
-        // 冻结数据（DI3=05）且 DI0 超过内存环形缓冲容量
-        if di[3] == 0x05 {
-            if let Some(trigger) = super::state::FreezeTrigger::from_di2(di[2]) {
-                if di[0] > trigger.max_history_count() {
-                    let pool = db_pool.ok_or_else(|| "历史冻结查询需要数据库支持".to_string())?;
-                    return self
-                        .handler
-                        .handle_freeze_data_read_async(di, &self.state, &address, pool)
-                        .await;
-                }
-            }
-        }
-
-        // 其余：内存同步读取
-        self.handler.handle_read(di, &self.state)
+        
+        // 委托给DIHandler处理（包括DI解析、数据库查询等所有逻辑）
+        self.handler
+            .handle_read_async(data, &self.state, &address, db_pool)
+            .await
     }
 
     /// 处理 DL/T645 写数据命令

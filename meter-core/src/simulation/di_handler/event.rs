@@ -90,11 +90,11 @@ impl DIHandler {
         let mut data = Vec::new();
 
         // 发生时间（6字节BCD）
-        data.extend(encode_datetime(&record.start_time));
+        data.extend(encode_datetime_sec(&record.start_time));
 
         // 结束时间（6字节BCD，故障类事件有效；编程记录为00 00 00 00 00 00）
         if let Some(end_time) = record.end_time {
-            data.extend(encode_datetime(&end_time));
+            data.extend(encode_datetime_sec(&end_time));
         } else {
             // 无结束时间，填充00
             data.extend(vec![0x00; 6]);

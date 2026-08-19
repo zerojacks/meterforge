@@ -53,9 +53,20 @@ pub(super) fn encode_bcd(value: f64, bytes: usize, decimals: usize) -> Vec<u8> {
 }
 
 /// 编码日期时间 (ss mm hh DD MM YY, 6字节 BCD)
-pub(super) fn encode_datetime(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+pub(super) fn encode_datetime_sec(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
     vec![
         to_bcd(dt.second() as u8),
+        to_bcd(dt.minute() as u8),
+        to_bcd(dt.hour() as u8),
+        to_bcd(dt.day() as u8),
+        to_bcd(dt.month() as u8),
+        to_bcd((dt.year() % 100) as u8),
+    ]
+}
+
+/// 编码日期时间 (mm hh DD MM YY, 6字节 BCD)
+pub(super) fn encode_datetime(dt: &chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    vec![
         to_bcd(dt.minute() as u8),
         to_bcd(dt.hour() as u8),
         to_bcd(dt.day() as u8),

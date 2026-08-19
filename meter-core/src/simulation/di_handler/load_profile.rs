@@ -1,4 +1,23 @@
 // 表A.7 负荷记录读取（DI3=06）
+//
+// # 数据块读取示例
+//
+// 当DI0=FF时，表示读取数据块，一次返回该类型的所有通道：
+//
+// ## 示例1：读取电压曲线数据块（06-10-01-FF）
+// 返回A/B/C三相电压（3个通道，每通道2字节）
+// 响应格式：记录数(1B) + 起始时间(6B) + DI数(1B=03) + [DI0=01,DI1=01,DI2=10,DI3=06] + 
+//          [DI0=02,DI1=01,DI2=10,DI3=06] + [DI0=03,DI1=01,DI2=10,DI3=06] + 
+//          Σ[时间(6B) + Va(2B) + Vb(2B) + Vc(2B)]
+//
+// ## 示例2：读取有功功率曲线数据块（06-10-03-FF）
+// 返回总/A/B/C四个通道（每通道3字节）
+// 响应格式：记录数(1B) + 起始时间(6B) + DI数(1B=04) + [4个DI标识] + 
+//          Σ[时间(6B) + P总(3B) + Pa(3B) + Pb(3B) + Pc(3B)]
+//
+// ## 示例3：读取单个通道电压（06-10-01-01）
+// 仅返回A相电压
+// 响应格式：记录数(1B) + 起始时间(6B) + DI(4B) + Σ[时间(6B) + Va(2B)]
 
 use super::encoding::*;
 use super::MeterState;
@@ -7,8 +26,116 @@ use crate::simulation::state::{
 };
 use crate::simulation::di_handler::DIHandler;
 use chrono::{Datelike, Timelike};
+use tracing::info;
 
 impl DIHandler {
+    /// 处理负荷记录读取（带参数解析）
+    ///
+    /// 按DL/T645-2007 §7.1协议规范：
+    /// - 帧格式1（m=0）：DI(4B) - 读最近1块
+    /// - 帧格式2（m=1）：DI(4B) + N(1B) - 读最近N块
+    /// - 帧格式3（m=6）：DI(4B) + N(1B) + 时间(5B mmhhDDMMYY) - 从给定时间起N块
+    ///
+    /// **重要**：读取是**逆序**的（从新到旧），从起始时间点开始，按采样间隔向前查找
+    pub async fn handle_load_profile_with_params(
+        &self,
+        di: [u8; 4],
+        state: &MeterState,
+        address: &str,
+        db_pool: &sqlx::SqlitePool,
+        rest: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        // 判断是第一类（06-DI2-00-DI0）还是第二类（06-10-DI1-DI0）
+        if di[2] == 0x10 {
+            // === 第二类：曲线数据读取 ===
+            // 协议规范（§7.1）：
+            // - m=0: 读最近1个采样点
+            // - m=1: N(1B) - 读最近N个采样点
+            // - m=6: N(1B) + 时间(5B) - 从给定时间开始向前读N个采样点
+            
+            let (start_time, count) = match rest.len() {
+                0 => {
+                    // 格式1：读最近1个采样点
+                    (state.virtual_time, 1)
+                }
+                1 => {
+                    // 格式2：读最近N个采样点
+                    let n = rest[0] as u32;
+                    if n == 0 {
+                        return Err("负荷记录块数不能为0".to_string());
+                    }
+                    (state.virtual_time, n)
+                }
+                6 => {
+                    // 格式3：从给定时间开始向前读N个采样点
+                    let n = rest[0] as u32;
+                    if n == 0 {
+                        return Err("负荷记录块数不能为0".to_string());
+                    }
+                    let start_time = parse_load_profile_time(&rest[1..6])?;
+                    (start_time, n)
+                }
+                _ => {
+                    return Err(format!(
+                        "第二类负荷记录参数长度错误：期望0/1/6字节，实际{}字节",
+                        rest.len()
+                    ));
+                }
+            };
+
+            // 获取采样间隔（固定使用第1类）
+            let class_id = 1;
+            let interval_minutes = state.load_record_config.intervals[class_id as usize - 1] as i64;
+
+            // 构造精确的时间点列表（从新到旧，逆序）
+            let mut time_points = Vec::new();
+            for i in 0..count {
+                let time_point = start_time + chrono::Duration::minutes(i as i64 * interval_minutes);
+                time_points.push(time_point);
+            }
+            info!("Meter {} di {:?} time_points {:?}", address, di, time_points);
+
+            return self
+                .handle_load_profile_curve_read_by_timepoints(
+                    di,
+                    state,
+                    address,
+                    db_pool,
+                    &time_points,
+                )
+                .await;
+        } else {
+            // === 第一类：记录块读取 ===
+            // 协议规范：
+            // - DI0=00：最早记录块
+            // - DI0=01：给定时间记录块（需要5字节时间参数）
+            // - DI0=02：最近一个记录块
+            let time_param = if di[0] == 0x01 {
+                if rest.len() < 5 {
+                    return Err(format!(
+                        "给定时间记录块参数长度不足：期望5字节，实际{}字节",
+                        rest.len()
+                    ));
+                }
+                Some(&rest[0..5])
+            } else {
+                None
+            };
+
+            // 第一类不需要时间范围，使用虚拟时间作为占位
+            let now = state.virtual_time;
+            return self
+                .handle_load_profile_read_async(
+                    di,
+                    state,
+                    address,
+                    db_pool,
+                    time_param,
+                )
+                .await;
+        }
+    }
+
     /// 处理负荷记录读取（DI3=06）
     ///
     /// 两类负荷记录：
@@ -39,37 +166,20 @@ impl DIHandler {
         address: &str,
         db_pool: &sqlx::SqlitePool,
         time_param: Option<&[u8]>,
-        start_time: &chrono::DateTime<chrono::Utc>,
-        end_time: &chrono::DateTime<chrono::Utc>,
-        max_records: Option<u32>,
     ) -> Result<Vec<u8>, String> {
         let di0 = di[0];
         let di1 = di[1];
         let di2 = di[2];
 
-        if di2 == 0x10 {
-            // 第二类：曲线数据读取（06-10-DI1-DI0）
-            self.handle_load_profile_curve_read(
-                di1,
-                di0,
-                address,
-                db_pool,
-                start_time,
-                end_time,
-                max_records.unwrap_or(100),
-            )
-            .await
-        } else {
-            // 第一类：记录块读取（06-DI2-00-DI0）
-            if di1 != 0x00 {
-                return Err(format!(
-                    "第一类负荷记录DI1必须为00，实际为：{:02X}",
-                    di1
-                ));
-            }
-            self.handle_load_profile_block_read(di2, di0, address, db_pool, time_param)
-                .await
+        // 第一类：记录块读取（06-DI2-00-DI0）
+        if di1 != 0x00 {
+            return Err(format!(
+                "第一类负荷记录DI1必须为00，实际为：{:02X}",
+                di1
+            ));
         }
+        self.handle_load_profile_block_read(di2, di0, address, db_pool, time_param)
+            .await
     }
 
     /// 第一类负荷记录：记录块读取（06-DI2-00-DI0）
@@ -146,69 +256,148 @@ impl DIHandler {
         self.encode_load_record_block(&row.sample_time, &data)
     }
 
-    /// 第二类负荷记录：曲线数据读取（06-10-DI1-DI0）
+    /// 第二类负荷记录：按时间点列表读取曲线数据
     ///
-    /// 返回格式：记录数(1B) + 起始时间(6B) + DI(4B) + Σ[时间(6B)+数据]
-    async fn handle_load_profile_curve_read(
+    /// 精确匹配时间点，确保数据对齐到采样间隔
+    /// 
+    /// **响应格式**（正确）：
+    /// 记录数(1B) + 起始时间(6B) + DI(4B) + Σ[数据值]
+    /// 
+    /// 注意：**只有一个起始时间**，后面直接是所有时间点的数据值，没有每条记录的时间
+    async fn handle_load_profile_curve_read_by_timepoints(
         &self,
-        di1: u8,
-        di0: u8,
+        di: [u8; 4],
+        _state: &MeterState,
         address: &str,
         db_pool: &sqlx::SqlitePool,
-        start_time: &chrono::DateTime<chrono::Utc>,
-        end_time: &chrono::DateTime<chrono::Utc>,
-        max_records: u32,
+        time_points: &[chrono::DateTime<chrono::Utc>],
     ) -> Result<Vec<u8>, String> {
         use crate::persistence::worker::PersistenceWorker;
 
-        if di0 == 0xFF {
-            return Err("暂不支持数据块读取（DI0=FF）".to_string());
+        if time_points.is_empty() {
+            return Err("时间点列表不能为空".to_string());
         }
 
-        // 查询time范围内的所有记录
-        //
-        // 曲线查询（06-10-DI1-DI0）在协议里没有类别维度，这里约定固定读
-        // 第1类负荷记录的序列——避免把多个类别（可能各自采样间隔不同）的
-        // 记录交织成一条时间不规则的"曲线"。如果第1类没有配置对应的数据块
-        // （模式字未选通），会在下面反序列化后因为字段是 None 而报错，
-        // 提示调用方"数据未记录"，而不是静默返回混乱的数据。
-        let rows = PersistenceWorker::query_load_records_range(
-            db_pool,
-            address,
-            Some(1),
-            start_time,
-            end_time,
-            max_records,
-        )
-        .await
-        .map_err(|e| format!("数据库查询失败: {}", e))?;
+        let di0 = di[0];
+        let di1 = di[1];
 
-        if rows.is_empty() {
+        // 处理数据块读取（DI0=FF）
+        if di0 == 0xFF {
+            return self
+                .handle_load_profile_curve_block_read_by_timepoints(
+                    di1,
+                    address,
+                    db_pool,
+                    time_points,
+                )
+                .await;
+        }
+
+        // 单通道读取：逐个查询时间点
+        let mut found_records = Vec::new();
+
+        for &time_point in time_points {
+            // 查询精确时间点（允许±30秒的误差）
+            let tolerance = chrono::Duration::seconds(30);
+            let rows = PersistenceWorker::query_load_records_range(
+                db_pool,
+                address,
+                Some(1), // 固定第1类
+                &(time_point - tolerance),
+                &(time_point + tolerance),
+                1, // 只取1条最接近的
+            )
+            .await
+            .map_err(|e| format!("数据库查询失败: {}", e))?;
+
+            if let Some(row) = rows.first() {
+                found_records.push(row.clone());
+            }
+        }
+
+        if found_records.is_empty() {
             return Err("未找到负荷记录数据".to_string());
         }
 
-        // 提取特定(DI1,DI0)字段
         let mut data = Vec::new();
 
-        // 记录数(1字节)
-        data.push(rows.len().min(255) as u8);
+        // 起始时间(6字节BCD) - 第一条记录的时间（逆序，所以是最新的时间）
+        data.extend(encode_datetime(&found_records[0].sample_time));
 
-        // 起始时间(6字节BCD)
-        data.extend(encode_datetime(&rows[0].sample_time));
 
-        // 数据标识(4字节)：DI0 DI1 DI2 DI3
-        data.extend(&[di0, di1, 0x10, 0x06]);
-
-        // 遍历记录，提取(DI1,DI0)对应的字段值
-        for row in &rows {
+        // 遍历记录，只输出数据值，不输出每条记录的时间
+        for row in &found_records {
             let record_data: LoadRecordData = serde_json::from_value(row.payload.clone())
                 .map_err(|e| format!("负荷记录数据反序列化失败: {}", e))?;
 
-            // 时间(6字节BCD)
-            data.extend(encode_datetime(&row.sample_time));
-
-            // 数据值（根据DI1,DI0映射到JSON字段）
+            // 只输出数据值（根据DI1,DI0映射到JSON字段）
             data.extend(self.extract_curve_data_value(di1, di0, &record_data)?);
+        }
+
+        Ok(data)
+    }
+
+    /// 第二类负荷记录：按时间点列表读取数据块
+    ///
+    /// **响应格式**（正确）：
+    /// 记录数(1B) + 起始时间(6B) + DI(4B=FF DI1 10 06) + Σ[多组数据值]
+    /// 
+    /// 注意：
+    /// 1. 数据块的DI就是FF DI1 10 06（不是多个DI标识）
+    /// 2. 只有一个起始时间
+    /// 3. 后面直接是所有时间点的数据值（按通道顺序：Va,Vb,Vc; Va,Vb,Vc; ...）
+    async fn handle_load_profile_curve_block_read_by_timepoints(
+        &self,
+        di1: u8,
+        address: &str,
+        db_pool: &sqlx::SqlitePool,
+        time_points: &[chrono::DateTime<chrono::Utc>],
+    ) -> Result<Vec<u8>, String> {
+        use crate::persistence::worker::PersistenceWorker;
+
+        // 根据DI1获取该数据块包含的所有通道
+        let di0_list = get_block_channels(di1)?;
+
+        // 逐个查询时间点
+        let mut found_records = Vec::new();
+
+        for &time_point in time_points {
+            // 查询精确时间点（允许±30秒的误差）
+            let tolerance = chrono::Duration::seconds(30);
+            let rows = PersistenceWorker::query_load_records_range(
+                db_pool,
+                address,
+                Some(1), // 固定第1类
+                &(time_point - tolerance),
+                &(time_point + tolerance),
+                1, // 只取1条最接近的
+            )
+            .await
+            .map_err(|e| format!("数据库查询失败: {}", e))?;
+
+            if let Some(row) = rows.first() {
+                found_records.push(row.clone());
+            }
+        }
+
+        if found_records.is_empty() {
+            return Err("未找到负荷记录数据".to_string());
+        }
+
+        let mut data = Vec::new();
+
+        // 起始时间(6字节BCD) - 第一条记录的时间（逆序，所以是最新的时间）
+        data.extend(encode_datetime(&found_records[0].sample_time));
+
+        // 遍历记录，只输出数据值（按通道顺序），不输出时间
+        for row in &found_records {
+            let record_data: LoadRecordData = serde_json::from_value(row.payload.clone())
+                .map_err(|e| format!("负荷记录数据反序列化失败: {}", e))?;
+
+            // 按DI顺序输出各通道数据值
+            for di0 in &di0_list {
+                data.extend(self.extract_curve_data_value(di1, *di0, &record_data)?);
+            }
         }
 
         Ok(data)
@@ -594,4 +783,69 @@ fn decode_bcd_datetime_ymd_hm(bcd: &[u8]) -> Result<chrono::DateTime<chrono::Utc
         .and_then(|date| date.and_hms_opt(hh, minute, 0))
         .and_then(|dt| Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)))
         .ok_or_else(|| format!("无效的日期时间：{}-{}-{} {}:{}", yy, mm, dd, hh, minute))
+}
+
+/// 获取数据块包含的通道列表（根据DI1）
+///
+/// 根据附录A.7规定，当DI0=FF时返回数据块，包含该类型所有通道
+fn get_block_channels(di1: u8) -> Result<Vec<u8>, String> {
+    match di1 {
+        // 01: 电压曲线数据块 - A/B/C三相
+        0x01 => Ok(vec![0x01, 0x02, 0x03]),
+        
+        // 02: 电流曲线数据块 - A/B/C三相
+        0x02 => Ok(vec![0x01, 0x02, 0x03]),
+        
+        // 03: 有功功率曲线数据块 - 总/A/B/C
+        0x03 => Ok(vec![0x00, 0x01, 0x02, 0x03]),
+        
+        // 04: 无功功率曲线数据块 - 总/A/B/C
+        0x04 => Ok(vec![0x00, 0x01, 0x02, 0x03]),
+        
+        // 05: 功率因数数据块 - 总/A/B/C
+        0x05 => Ok(vec![0x00, 0x01, 0x02, 0x03]),
+        
+        // 06: 有功、无功曲线总电能总数据块 - 正向有功/反向有功/组合无功1/组合无功2
+        0x06 => Ok(vec![0x01, 0x02, 0x03, 0x04]),
+        
+        // 07: 四象限无功曲线总数据块 - Q1/Q2/Q3/Q4
+        0x07 => Ok(vec![0x01, 0x02, 0x03, 0x04]),
+        
+        // 08: 当前需量曲线数据块 - 有功需量/无功需量
+        0x08 => Ok(vec![0x01, 0x02]),
+        
+        _ => Err(format!(
+            "不支持的负荷记录数据块类型：DI1={:02X}（期望01-08）",
+            di1
+        )),
+    }
+}
+
+/// 解析负荷记录时间参数（5字节BCD：mm hh DD MM YY，低字节在前）
+///
+/// 注意：协议规定时间字段按"低字节在前"传输
+/// - 字节0: mm（分钟）
+/// - 字节1: hh（小时）
+/// - 字节2: DD（日期）
+/// - 字节3: MM（月份）
+/// - 字节4: YY（年份）
+fn parse_load_profile_time(bcd: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    if bcd.len() < 5 {
+        return Err(format!(
+            "负荷记录时间参数长度不足：期望5字节，实际{}字节",
+            bcd.len()
+        ));
+    }
+
+    // 按低字节在前的顺序解析：mm hh DD MM YY
+    let minute = ((bcd[0] >> 4) * 10 + (bcd[0] & 0x0F)) as u32;
+    let hh = ((bcd[1] >> 4) * 10 + (bcd[1] & 0x0F)) as u32;
+    let dd = ((bcd[2] >> 4) * 10 + (bcd[2] & 0x0F)) as u32;
+    let mm = ((bcd[3] >> 4) * 10 + (bcd[3] & 0x0F)) as u32;
+    let yy = ((bcd[4] >> 4) * 10 + (bcd[4] & 0x0F)) as i32 + 2000;
+
+    chrono::NaiveDate::from_ymd_opt(yy, mm, dd)
+        .and_then(|date| date.and_hms_opt(hh, minute, 0))
+        .and_then(|dt| Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc)))
+        .ok_or_else(|| format!("无效的日期时间：{}-{:02}-{:02} {:02}:{:02}", yy, mm, dd, hh, minute))
 }

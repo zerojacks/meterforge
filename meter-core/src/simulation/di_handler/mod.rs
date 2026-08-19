@@ -43,6 +43,63 @@ impl DIHandler {
         Self
     }
 
+    /// 异步读数据（支持数据库查询）
+    ///
+    /// 统一入口，处理所有DI的读取请求：
+    /// - DI3=06 负荷记录：查询数据库
+    /// - DI3=05 冻结数据：根据DI0判断内存/数据库
+    /// - 其他：内存同步读取
+    ///
+    /// 参数：
+    /// - data: 完整的DATA字段（DI + 额外参数）
+    /// - state: 电表状态
+    /// - address: 电表地址字符串
+    /// - db_pool: 数据库连接池（可选）
+    pub async fn handle_read_async(
+        &self,
+        data: &[u8],
+        state: &MeterState,
+        address: &str,
+        db_pool: Option<&sqlx::SqlitePool>,
+    ) -> Result<Vec<u8>, String> {
+        if data.len() < 4 {
+            return Err("数据长度不足（至少需要4字节DI）".to_string());
+        }
+
+        let di = [data[0], data[1], data[2], data[3]];
+        let rest = &data[4..];
+
+        // 根据DI3分发
+        match di[3] {
+            0x06 => {
+                // 负荷记录（DI3=06）
+                let pool = db_pool.ok_or_else(|| "负荷记录查询需要数据库支持".to_string())?;
+                self.handle_load_profile_with_params(di, state, address, pool, rest)
+                    .await
+            }
+            0x05 => {
+                // 冻结数据（DI3=05）
+                // 根据DI0判断是否需要查询数据库
+                if let Some(trigger) = crate::simulation::state::FreezeTrigger::from_di2(di[2]) {
+                    if di[0] > trigger.max_history_count() {
+                        // DI0超过内存缓冲容量，查询数据库
+                        let pool = db_pool
+                            .ok_or_else(|| "历史冻结查询需要数据库支持".to_string())?;
+                        return self
+                            .handle_freeze_data_read_async(di, state, address, pool)
+                            .await;
+                    }
+                }
+                // 内存读取
+                self.handle_read(di, state)
+            }
+            _ => {
+                // 其他DI - 内存同步读取
+                self.handle_read(di, state)
+            }
+        }
+    }
+
     /// 处理写数据命令
     ///
     /// 参数：
