@@ -551,7 +551,7 @@ impl Render for MeterDetailView {
                         .child(
                             resizable_panel()
                                 .size(px(180.))
-                                .size_range(px(120.)..px(320.))
+                                .size_range(px(120.)..px(480.))
                                 .child(
                                     div()
                                         .size_full()

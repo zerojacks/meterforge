@@ -24,6 +24,9 @@ tokio-serial = "5.0"
 # SQLite persistence
 sqlx.workspace = true
 
+# 报文完整解析（DL/T 645-2007，内嵌 spec-engine 数据项解析）
+dlt645-2007.workspace = true
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.0"
