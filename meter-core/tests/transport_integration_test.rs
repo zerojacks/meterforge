@@ -4,15 +4,11 @@
 
 use meter_core::actor::{MeterActor, MeterActorConfig, MeterActorHandle, MeterRegistry};
 use meter_core::protocol::{decode_frame, encode_frame, Frame};
-use meter_core::router::{Router, RouterConfig};
 use meter_core::simulation::{VirtualMeter, VirtualMeterConfig};
-use meter_core::transport::{TcpChannel, TcpChannelConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
-use tokio::time::{timeout, Duration};
 
 /// 测试辅助：创建并启动一个电表Actor
+#[allow(dead_code)]
 async fn setup_meter_actor(address: [u8; 6]) -> (MeterActorHandle, tokio::task::JoinHandle<()>) {
     let meter_config = VirtualMeterConfig {
         address,

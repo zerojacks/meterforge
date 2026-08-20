@@ -12,7 +12,7 @@ use meter_core::persistence::{
 };
 use meter_core::simulation::{virtual_meter::address_to_string, VirtualMeter, VirtualMeterConfig};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 
@@ -31,6 +31,8 @@ async fn setup_test_db() -> (TempDir, SqlitePool, PersistenceConfig) {
         batch_max_size: 10,
         batch_timeout_ms: 100,
         max_connections: 2,
+        load_profile_max_records_per_class: 2000,
+        load_profile_cleanup_interval_secs: 600,
     };
 
     let pool = SqlitePoolOptions::new()

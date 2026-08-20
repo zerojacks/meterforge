@@ -34,6 +34,8 @@ async fn setup_test_db() -> (TempDir, SqlitePool, PersistenceConfig) {
         batch_max_size: 10,
         batch_timeout_ms: 100,
         max_connections: 2,
+        load_profile_max_records_per_class: 2000,
+        load_profile_cleanup_interval_secs: 600,
     };
 
     // 创建连接池（用于测试查询）
@@ -365,7 +367,7 @@ async fn test_persistence_worker_batch_write() {
 async fn test_query_nonexistent_snapshot() {
     let (_temp_dir, pool, config) = setup_test_db().await;
 
-    let (persist_tx, persist_rx) = mpsc::channel(100);
+    let (_persist_tx, persist_rx) = mpsc::channel(100);
     let worker = PersistenceWorker::new(config.clone(), persist_rx)
         .await
         .unwrap();
@@ -373,7 +375,7 @@ async fn test_query_nonexistent_snapshot() {
         worker.run().await;
     });
 
-    let mut state = MeterState::default();
+    let state = MeterState::default();
     let handler = DIHandler::new();
     let address = "999999999999"; // 不存在的地址
 

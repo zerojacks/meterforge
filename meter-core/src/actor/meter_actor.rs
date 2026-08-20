@@ -2015,8 +2015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_meter_actor_broadcast_time_sync() {
-        use crate::protocol::{encode_frame, format::u64_to_bcd};
-        use chrono::Timelike;
+        use crate::protocol::{encode_frame, u64_to_bcd};
 
         // 创建 tick 广播通道
         let (_tick_tx, tick_rx) = broadcast::channel(16);
@@ -2100,7 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_meter_actor_write_command() {
-        use crate::protocol::{encode_frame, format::u64_to_bcd};
+        use crate::protocol::encode_frame;
 
         // 创建 tick 广播通道
         let (_tick_tx, tick_rx) = broadcast::channel(16);

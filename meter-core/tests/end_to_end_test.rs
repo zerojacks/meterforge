@@ -31,6 +31,8 @@ async fn setup_test_db() -> (TempDir, sqlx::SqlitePool, PersistenceConfig) {
         batch_max_size: 50,
         batch_timeout_ms: 200,
         max_connections: 4,
+        load_profile_max_records_per_class: 2000,
+        load_profile_cleanup_interval_secs: 600,
     };
 
     let pool = SqlitePoolOptions::new()
@@ -177,7 +179,7 @@ async fn test_full_system_lifecycle() {
             .send_admin_command(AdminCommand::GetSnapshot)
             .await
             .unwrap();
-        let json: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let _json: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
         // 简单提取（实际应该从快照中解析）
         energies_before.push(1000.0 * (i + 1) as f64 + 0.3); // 估算值
         println!("  ✓ 电表#{} 关闭前状态已记录", i);
