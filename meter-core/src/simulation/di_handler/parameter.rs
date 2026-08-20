@@ -20,8 +20,18 @@ impl DIHandler {
         let result = match di {
             // ── 厂商信息 (C0-xx-xx-xx) ──
             [0x00, 0x00, 0x31, 0xC0] => Ok(vec![0x07, 0x20]), // 协议版本 2007
-            [0x00, 0x00, 0x32, 0xC0] => Ok(b"KIRO".to_vec()), // 厂商代码
-            [0x00, 0x00, 0x33, 0xC0] => Ok(b"DLT645VM".to_vec()), // 电表型号
+            [0x00, 0x00, 0x32, 0xC0] => {
+                // 厂商代码（逆序返回）
+                let mut code = b"KIRO".to_vec();
+                code.reverse();
+                Ok(code)
+            }
+            [0x00, 0x00, 0x33, 0xC0] => {
+                // 电表型号（逆序返回）
+                let mut model = b"DLT645VM".to_vec();
+                model.reverse();
+                Ok(model)
+            }
             [0x00, 0x00, 0x34, 0xC0] => {
                 let now = state.virtual_time;
                 Ok(vec![
@@ -30,26 +40,31 @@ impl DIHandler {
                     to_bcd(now.day() as u8),
                 ])
             }
-            [0x00, 0x00, 0x35, 0xC0] => Ok(b"V1.0.0".to_vec()), // 版本号
+            [0x00, 0x00, 0x35, 0xC0] => {
+                // 版本号（逆序返回）
+                let mut version = b"V1.0.0".to_vec();
+                version.reverse();
+                Ok(version)
+            }
 
             // ── 日期时间与切换时间 (04-00-01-xx) ──
             [0x01, 0x01, 0x00, 0x04] => {
                 // 日期及星期 YYMMDDww
                 let now = state.virtual_time;
                 Ok(vec![
-                    to_bcd((now.year() % 100) as u8),
-                    to_bcd(now.month() as u8),
-                    to_bcd(now.day() as u8),
                     to_bcd(now.weekday().num_days_from_sunday() as u8),
+                    to_bcd(now.day() as u8),
+                    to_bcd(now.month() as u8),
+                    to_bcd((now.year() % 100) as u8),
                 ])
             }
             [0x02, 0x01, 0x00, 0x04] => {
                 // 时间 hhmmss
                 let now = state.virtual_time;
                 Ok(vec![
-                    to_bcd(now.hour() as u8),
-                    to_bcd(now.minute() as u8),
                     to_bcd(now.second() as u8),
+                    to_bcd(now.minute() as u8),
+                    to_bcd(now.hour() as u8),
                 ])
             }
             [0x03, 0x01, 0x00, 0x04] => Ok(vec![to_bcd(state.demand_period_minutes as u8)]),
@@ -87,26 +102,66 @@ impl DIHandler {
             [0x07, 0x03, 0x00, 0x04] => Ok(encode_bcd(state.display_config.pt_ratio as f64, 3, 0)),
 
             // ── 铭牌与厂家参数 (04-00-04-xx，协议标准布局) ──
-            [0x01, 0x04, 0x00, 0x04] => Ok(state.address.to_vec()), // 通信地址
-            [0x02, 0x04, 0x00, 0x04] => Ok(state.nameplate.meter_no.to_vec()), // 表号
-            [0x03, 0x04, 0x00, 0x04] => Ok(state.nameplate.asset_code.to_vec()), // 资产管理编码
-            [0x04, 0x04, 0x00, 0x04] => Ok(state.nameplate.rated_voltage_ascii.to_vec()),
-            [0x05, 0x04, 0x00, 0x04] => Ok(state.nameplate.rated_current_ascii.to_vec()),
-            [0x06, 0x04, 0x00, 0x04] => Ok(state.nameplate.max_current_ascii.to_vec()),
-            [0x07, 0x04, 0x00, 0x04] => Ok(state.nameplate.active_accuracy.to_vec()),
-            [0x08, 0x04, 0x00, 0x04] => Ok(state.nameplate.reactive_accuracy.to_vec()),
+            [0x01, 0x04, 0x00, 0x04] => Ok(state.address.to_vec()), // 通信地址（BCD，不需要逆序）
+            [0x02, 0x04, 0x00, 0x04] => Ok(state.nameplate.meter_no.to_vec()), // 表号（BCD，不需要逆序）
+            [0x03, 0x04, 0x00, 0x04] => Ok(state.nameplate.asset_code.to_vec()), // 资产管理编码（BCD，不需要逆序）
+            [0x04, 0x04, 0x00, 0x04] => {
+                // 额定电压（ASCII，逆序返回）
+                let mut data = state.nameplate.rated_voltage_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x05, 0x04, 0x00, 0x04] => {
+                // 额定电流（ASCII，逆序返回）
+                let mut data = state.nameplate.rated_current_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x06, 0x04, 0x00, 0x04] => {
+                // 最大电流（ASCII，逆序返回）
+                let mut data = state.nameplate.max_current_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x07, 0x04, 0x00, 0x04] => {
+                // 有功准确度等级（ASCII，逆序返回）
+                let mut data = state.nameplate.active_accuracy.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x08, 0x04, 0x00, 0x04] => {
+                // 无功准确度等级（ASCII，逆序返回）
+                let mut data = state.nameplate.reactive_accuracy.to_vec();
+                data.reverse();
+                Ok(data)
+            }
             [0x09, 0x04, 0x00, 0x04] => {
-                Ok(encode_bcd(state.meter_constant as f64, 3, 0)) // 有功常数
+                Ok(encode_bcd(state.meter_constant as f64, 3, 0)) // 有功常数（BCD，不需要逆序）
             }
             [0x0A, 0x04, 0x00, 0x04] => Ok(encode_bcd(
                 state.nameplate.reactive_meter_constant as f64,
                 3,
                 0,
-            )),
-            [0x0B, 0x04, 0x00, 0x04] => Ok(state.nameplate.meter_model_ascii.to_vec()),
-            [0x0C, 0x04, 0x00, 0x04] => Ok(state.nameplate.production_date_ascii.to_vec()),
-            [0x0D, 0x04, 0x00, 0x04] => Ok(state.nameplate.protocol_version_ascii.to_vec()),
-            [0x0E, 0x04, 0x00, 0x04] => Ok(state.nameplate.customer_no.to_vec()),
+            )), // 无功常数（BCD，不需要逆序）
+            [0x0B, 0x04, 0x00, 0x04] => {
+                // 电表型号（ASCII，逆序返回）
+                let mut data = state.nameplate.meter_model_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x0C, 0x04, 0x00, 0x04] => {
+                // 生产日期（ASCII，逆序返回）
+                let mut data = state.nameplate.production_date_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x0D, 0x04, 0x00, 0x04] => {
+                // 协议版本号（ASCII，逆序返回）
+                let mut data = state.nameplate.protocol_version_ascii.to_vec();
+                data.reverse();
+                Ok(data)
+            }
+            [0x0E, 0x04, 0x00, 0x04] => Ok(state.nameplate.customer_no.to_vec()), // 客户编号（BCD，不需要逆序）
 
             // ── 派生状态字 (04-00-05-xx) 与数据块 ──
             [0x01, 0x05, 0x00, 0x04] => {
@@ -118,10 +173,33 @@ impl DIHandler {
             [0x03, 0x05, 0x00, 0x04] => {
                 Ok(state.derived_status.status_word_3.to_le_bytes().to_vec())
             }
+            [0x04, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.status_word_4.to_le_bytes().to_vec())
+            }
+            [0x05, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.status_word_5.to_le_bytes().to_vec())
+            }
+            [0x06, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.status_word_6.to_le_bytes().to_vec())
+            }
+            [0x07, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.status_word_7.to_le_bytes().to_vec())
+            }
+            [0x08, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.status_key.to_le_bytes().to_vec())
+            }
+            [0x0E, 0x05, 0x00, 0x04] => {
+                Ok(state.derived_status.meter_status.to_le_bytes().to_vec())
+            }
             [0xFF, 0x05, 0x00, 0x04] => {
                 let mut data = state.derived_status.status_word_1.to_le_bytes().to_vec();
                 data.extend(state.derived_status.status_word_2.to_le_bytes());
                 data.extend(state.derived_status.status_word_3.to_le_bytes());
+                data.extend(state.derived_status.status_word_4.to_le_bytes());
+                data.extend(state.derived_status.status_word_5.to_le_bytes());
+                data.extend(state.derived_status.status_word_6.to_le_bytes());
+                data.extend(state.derived_status.status_word_7.to_le_bytes());
+                data.extend(state.derived_status.status_key.to_le_bytes());
                 Ok(data)
             }
 
@@ -148,8 +226,12 @@ impl DIHandler {
             [0x06, 0x09, 0x00, 0x04] => Ok(vec![state.daily_freeze_mode]),
 
             // ── 负荷记录 (04-00-0A-xx) ──
-            [0x01, 0x0A, 0x00, 0x04] => Ok(state.load_record_start_time.to_vec()),
-            [idx, 0x0A, 0x00, 0x04] if (0x02..=0x06).contains(&idx) => {
+            [0x01, 0x0A, 0x00, 0x04] => {
+                let mut data = state.load_record_start_time.to_vec();
+                data.reverse();
+                Ok(data.to_vec())
+            },
+            [idx, 0x0A, 0x00, 0x04] if (0x02..=0x08).contains(&idx) => {
                 let interval = state.load_record_config.intervals[idx as usize - 2];
                 Ok(vec![
                     to_bcd((interval % 100) as u8),
@@ -200,6 +282,10 @@ impl DIHandler {
 
             // ── 运行特征字 (04-00-11-xx) ──
             [0x01, 0x11, 0x00, 0x04] => Ok(state.operation_feature_word_1.to_le_bytes().to_vec()),
+
+            
+            // ── 运行特征字 (04-00-11-xx) ──
+            [0x04, 0x11, 0x00, 0x04] => Ok(state.active_report_mode.to_vec()),
 
             // ── 整点/日冻结时间 (04-00-12-xx) ──
             [0x01, 0x12, 0x00, 0x04] => Ok(state.hourly_freeze_start.to_vec()),

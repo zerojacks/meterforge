@@ -156,8 +156,8 @@ impl VirtualMeter {
                     self.state.load_profile_state = 
                         super::state::LoadProfileSamplingState::from_last_sample_times(last_sample_times);
                     println!(
-                        "[VirtualMeter] Restored last sample times for {} class(es)",
-                        non_empty_count
+                        "[VirtualMeter] Restored last sample times for {} class(es) {:?}",
+                        non_empty_count, last_sample_times
                     );
                 }
             }
@@ -191,8 +191,25 @@ impl VirtualMeter {
         state.hourly_freeze_start = settings.hourly_freeze_start;
         state.hourly_freeze_interval_min = settings.hourly_freeze_interval_min;
         state.appointment_freeze_time = settings.appointment_freeze_time;
-        // 恢复的约定冻结时间允许重新触发一次
-        state.appointment_freeze_fired = false;
+        // 约定冻结是否已"触发过"要跟着虚拟时钟走，不能每次重启都无脑
+        // 清成 false：
+        // - 如果这次恢复出来的虚拟时钟已经过了约定时间点，说明这个
+        //   约定早就该触发过了（哪怕是很久以前的某次运行里），重启时
+        //   绝不能让它在下一个 tick 里立刻又触发一次——这正是之前"软件
+        //   一启动就触发一次冻结"的根因：appointment_freeze_time 解出来
+        //   是一个早已过去的时间，而这里把 fired 强制重置成了 false。
+        // - 只有虚拟时钟还没到约定时间点时，才应该保持"未触发"，留给
+        //   未来某个 tick 去触发。
+        state.appointment_freeze_fired =
+            match crate::simulation::physics_engine::decode_bcd_datetime(
+                &state.appointment_freeze_time,
+            ) {
+                Some(target) => state.virtual_time >= target,
+                // 未配置约定时间（比如全0），谈不上"已触发"，保持 false
+                // 即可——check_freeze_schedule 那边同样解不出 target，
+                // 不会误触发。
+                None => false,
+            };
 
         state.settlement_days = settings.settlement_days;
         state.settlement_hours = settings.settlement_hours;
@@ -708,7 +725,7 @@ impl VirtualMeter {
     ///
     /// 工作流程：
     /// 1. PhysicsEngine 更新 MeterState（包括冻结检测）
-    /// 2. 检查 pending_freeze_trigger 标志
+    /// 2. 检查 pending_freeze_triggers 列表
     /// 3. 如果有待处理的冻结，异步生成快照
     /// 4. 检查电能寄存器是否需要 flush
     pub fn tick(&mut self, elapsed: std::time::Duration, time_scale: f64) {
@@ -772,15 +789,19 @@ impl VirtualMeter {
 
     /// 处理待处理的冻结触发
     ///
-    /// 此方法在 tick() 之后调用，检查 pending_freeze_trigger 标志
-    /// 如果有待处理的冻结，生成快照并提交到 PersistenceWorker
+    /// 此方法在 tick() 之后调用，检查 pending_freeze_triggers 列表
+    /// 如果有待处理的冻结，逐个生成快照并提交到 PersistenceWorker
     ///
     /// 持久化策略（按设计方案 4.6.4 节）：
     /// - 内存环形缓冲：定时冻结12次，瞬时冻结3次
     /// - 数据库持久化：日冻结62次，月冻结24次
     /// - 本方法同时处理内存写入和数据库提交
+    ///
+    /// 用 `for` 遍历而不是只取第一个：同一 tick 里可能同时有多种冻结
+    /// 触发（比如 Timed 按日周期和日冻结配在同一秒），必须全部处理，
+    /// 不能只处理其中一个然后把其余的悄悄丢弃。
     fn process_pending_freeze(&mut self) {
-        if let Some(freeze_type) = self.state.pending_freeze_trigger.take() {
+        for freeze_type in std::mem::take(&mut self.state.pending_freeze_triggers) {
             // 根据 FreezeType 确定 FreezeTrigger
             let trigger = match freeze_type {
                 super::state::FreezeType::Timed => super::state::FreezeTrigger::Timed,

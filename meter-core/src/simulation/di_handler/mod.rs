@@ -78,20 +78,11 @@ impl DIHandler {
                     .await
             }
             0x05 => {
-                // 冻结数据（DI3=05）
-                // 根据DI0判断是否需要查询数据库
-                if let Some(trigger) = crate::simulation::state::FreezeTrigger::from_di2(di[2]) {
-                    if di[0] > trigger.max_history_count() {
-                        // DI0超过内存缓冲容量，查询数据库
-                        let pool = db_pool
-                            .ok_or_else(|| "历史冻结查询需要数据库支持".to_string())?;
-                        return self
-                            .handle_freeze_data_read_async(di, state, address, pool)
-                            .await;
-                    }
-                }
-                // 内存读取
-                self.handle_read(di, state)
+                // 冻结数据（DI3=05）- 统一走异步版本（支持从数据库加载）
+                let pool = db_pool
+                    .ok_or_else(|| "冻结数据查询需要数据库支持（从数据库加载历史快照）".to_string())?;
+                self.handle_freeze_data_read_async(di, state, address, pool)
+                    .await
             }
             _ => {
                 // 其他DI - 内存同步读取
@@ -403,13 +394,15 @@ impl DIHandler {
             return result;
         }
         match di {
-            // 冻结数据 (05-DI2-DI1-DI0)
-            di if di[3] == 0x05 => self.handle_freeze_data_read(di, state),
             // 事件记录 (03-DI2-DI1-DI0)
             di if di[3] == 0x03 => self.handle_event_record_read(di, state),
             // 负荷记录 (06-10-DI1-DI0) 需要数据库，走异步版本
             di if di[3] == 0x06 && di[2] == 0x10 => {
                 Err("负荷记录需要数据库查询，请使用异步版本 handle_read_async()".to_string())
+            }
+            // 冻结数据 (05-xx-xx-xx) 需要数据库支持，走异步版本
+            di if di[3] == 0x05 => {
+                Err("冻结数据需要数据库支持，请使用异步版本 handle_read_async()".to_string())
             }
             _ => Err(format!(
                 "未支持的 DI: {:02X}{:02X}{:02X}{:02X}",

@@ -109,7 +109,7 @@ async fn test_freeze_snapshot_write_and_read() {
         "SELECT * FROM freeze_snapshots WHERE address = ? AND trigger_type = ? AND occurrence_idx = ?"
     )
     .bind("123456789012")
-    .bind(trigger as u8)
+    .bind(trigger.to_di2()) // 使用协议值（DI2）
     .bind(1u8)
     .fetch_one(&pool)
     .await
@@ -157,7 +157,7 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
     for i in 4..=15 {
         let snapshot_row = FreezeSnapshotRow {
             meter_address: address.to_string(),
-            trigger_type: trigger as u8,
+            trigger_type: trigger.to_di2(), // 使用协议值（DI2）
             category: 0x01, // DI1=01 正向有功总电能（与测试查询匹配）
             occurrence_idx: i,
             snapshot_time: chrono::Utc::now(),
@@ -246,7 +246,7 @@ async fn test_ring_buffer_overflow_with_database() {
         let occurrence_idx = ((i - 1) % 3 + 1) as u8; // 循环 1->2->3->1->2
         let snapshot_row = FreezeSnapshotRow {
             meter_address: address.to_string(),
-            trigger_type: trigger as u8,
+            trigger_type: trigger.to_di2(), // 使用协议值（DI2）
             category: 0xFF,
             occurrence_idx,
             snapshot_time: chrono::Utc::now(),
@@ -287,7 +287,7 @@ async fn test_ring_buffer_overflow_with_database() {
         "SELECT COUNT(*) FROM freeze_snapshots WHERE address = ? AND trigger_type = ?",
     )
     .bind(address)
-    .bind(trigger as u8)
+    .bind(trigger.to_di2()) // 使用协议值（DI2）
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -318,7 +318,7 @@ async fn test_persistence_worker_batch_write() {
     for i in 1..=20 {
         let snapshot_row = FreezeSnapshotRow {
             meter_address: address.to_string(),
-            trigger_type: FreezeTrigger::Timed as u8,
+            trigger_type: FreezeTrigger::Timed.to_di2(), // 使用协议值（DI2）
             category: 0xFF,
             occurrence_idx: (i % 12 + 1) as u8, // 模拟环形覆盖
             snapshot_time: chrono::Utc::now(),

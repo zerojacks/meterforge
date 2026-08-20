@@ -724,7 +724,7 @@ impl Default for NameplateConfig {
     fn default() -> Self {
         Self {
             meter_no: *b"000000",
-            asset_code: [0x20; 32],
+            asset_code: [0x31; 32],
             rated_voltage_ascii: *b"220V  ",
             rated_current_ascii: *b"10(60)",
             max_current_ascii: *b"60A   ",
@@ -830,14 +830,14 @@ impl Default for FreezeConfig {
 #[derive(Debug, Clone)]
 pub struct LoadRecordConfig {
     pub mode_word: u8,       // 04-00-09-01 负荷记录模式字（位图）
-    pub intervals: [u16; 6], // 04-00-0A-01~06 第1-6类负荷记录间隔（分钟）
+    pub intervals: [u16; 8], // 04-00-0A-01~06 第1-6类负荷记录间隔（分钟）
 }
 
 impl Default for LoadRecordConfig {
     fn default() -> Self {
         Self {
             mode_word: 0,
-            intervals: [0; 6],
+            intervals: [0; 8],
         }
     }
 }
@@ -1004,8 +1004,20 @@ impl LoadProfileSamplingState {
     }
 
     /// 检查某类是否到达采样节拍
+    ///
+    /// 对齐点用"UTC 纪元整分钟数 / 周期 * 周期"计算（见
+    /// [`Self::aligned_slot`]），而不是只取当前时间的 `hour*60+minute`：
+    /// - 纪元 1970-01-01 00:00:00 本身就是整点/整天对齐的，所以按周期
+    ///   取模后仍然精确落在标准分钟点上（周期15分钟 → :00/:15/:30/:45，
+    ///   周期60分钟 → 整点），不会因为换用绝对时间而算错刻度。
+    /// - 对齐点包含日期信息，天然连续跨天：不会在跨午夜时把"昨天
+    ///   23:45"和"今天00:00"错误地判定成同一或反向的对齐点。
+    /// - 校时把虚拟时钟往回拨之后，`aligned(now)` 会正确地小于等于
+    ///   `aligned(last)`，从而正确地判定"还没到下一个采样点"，而不是
+    ///   永久性地卡死（旧实现只比较一天以内的分钟数，回拨后可能再也追不上
+    ///   之前记录的、数值更大的"上次对齐点"）。
     pub fn should_sample(
-        &self,
+        &mut self,
         class_idx: usize,
         current_time: &DateTime<Utc>,
         interval_minutes: u16,
@@ -1016,24 +1028,31 @@ impl LoadProfileSamplingState {
         if class_idx >= 6 {
             return false;
         }
-        
-        // 计算当前时间对应的对齐点（向下取整到最近的间隔倍数）
-        // 例如：15分钟间隔，12:17 的对齐点是 12:15
-        let total_minutes = current_time.hour() as i64 * 60 + current_time.minute() as i64;
-        let aligned_minutes = (total_minutes / interval_minutes as i64) * interval_minutes as i64;
-        
+
         match self.last_sample_times[class_idx] {
+            // 从未采样过：使用当前对齐点的起始时间作为虚拟的"上次采样时间"
+            // 这样只有当跨越到下一个对齐点时才会触发采样
             None => {
-                // 从未采样过，直接采样
-                true
+                let time_stmp = chrono::DateTime::timestamp(&current_time);
+                if time_stmp % (interval_minutes as i64 * 60) == 0 {
+                    return true;
+                }
+                return false;
             }
             Some(last_time) => {
-                // 计算上次采样时的对齐点
-                let last_total_minutes = last_time.hour() as i64 * 60 + last_time.minute() as i64;
-                let last_aligned_minutes = (last_total_minutes / interval_minutes as i64) * interval_minutes as i64;
+                // 检测时间倒退：如果当前时间早于上次采样时间，说明发生了校时回拨
+                if *current_time < last_time {
+                    self.last_sample_times[class_idx] = None;
+                    
+                    // 时间倒退后不立即采样，等待跨越到下一个对齐点
+                    return false;
+                }
                 
-                // 如果当前对齐点不同于上次对齐点，说明已经跨过了至少一个采样点
-                aligned_minutes > last_aligned_minutes
+                let time_stmp = chrono::DateTime::timestamp(&current_time);
+                if time_stmp % (interval_minutes as i64 * 60) == 0 {
+                    return true;
+                }
+                return false;
             }
         }
     }
@@ -1111,6 +1130,8 @@ pub struct DerivedStatusWords {
     pub status_word_5: u16, // 04-00-05-05 运行状态字5（B相）
     pub status_word_6: u16, // 04-00-05-06 运行状态字6（C相）
     pub status_word_7: u16, // 04-00-05-07 运行状态字7（合相）
+    pub status_key: u32,  // 密钥状态字 4字节
+    pub meter_status: u16,  // 电表自检状态字 2字节
 }
 
 /// 电表完整状态（设计方案 4.6 节）
@@ -1285,6 +1306,9 @@ pub struct MeterState {
     pub last_settlement_rollover: Option<DateTime<Utc>>,
     // 04-00-11-01 电表运行特征字1
     pub operation_feature_word_1: u16,
+    // 04-00-11-04 主动上报模式字
+    pub active_report_mode: [u8; 8],
+
     // 04-00-12-xx 整点/日冻结时间
     pub hourly_freeze_start: [u8; 5], // YYMMDDhhmm
     pub hourly_freeze_interval_min: u8,
@@ -1337,17 +1361,22 @@ pub struct MeterState {
     // ─────────────────────────────────────────────────────────────
     // 冻结触发标志（tick检测到冻结点时设置，由MeterActor处理）
     // ─────────────────────────────────────────────────────────────
-    /// 待处理的冻结触发类型（None表示无待处理冻结）
+    /// 待处理的冻结触发类型列表（空表示无待处理冻结）
+    ///
+    /// 用 Vec 而不是单个 Option，是因为同一个虚拟时刻可能同时命中多种
+    /// 冻结条件（比如 Timed 配的是"按日周期"、日冻结时间恰好也是
+    /// 00:00，两者会在同一秒都满足触发条件），这时必须把它们都记下来，
+    /// 不能因为先命中了一个就把另一个漏掉。
     ///
     /// 工作流程：
-    /// 1. PhysicsEngine::tick() 检测到冻结触发点时设置此字段
+    /// 1. PhysicsEngine::tick() 检测到冻结触发点时把命中的类型 push 进来
     /// 2. MeterActor 在 tick 后检查此字段
-    /// 3. MeterActor 异步生成快照，然后清空此字段
+    /// 3. MeterActor 依次处理每一个，然后清空此字段
     ///
     /// 性能考虑：
     /// - tick() 中只做轻量级检测（<1μs）
     /// - 快照生成异步化，不阻塞实时性
-    pub pending_freeze_trigger: Option<FreezeType>,
+    pub pending_freeze_triggers: Vec<FreezeType>,
 
     /// Per-meter multiplier applied to the global simulation clock.
     pub simulation_time_scale: f64,
@@ -1463,6 +1492,7 @@ impl Default for MeterState {
             appointment_freeze_fired: false,
             last_settlement_rollover: None,
             operation_feature_word_1: 0,
+            active_report_mode: [0; 8],
             hourly_freeze_start: [0; 5],
             hourly_freeze_interval_min: 60,
             daily_freeze_time: [0; 2],
@@ -1498,7 +1528,7 @@ impl Default for MeterState {
             recent_load_records: HashMap::new(),
 
             // 冻结触发标志
-            pending_freeze_trigger: None,
+            pending_freeze_triggers: Vec::new(),
             simulation_time_scale: 1.0,
         };
 
@@ -1822,7 +1852,7 @@ impl MeterState {
         });
         let row = FreezeSnapshotRow {
             meter_address: String::new(), // 由VirtualMeter填充
-            trigger_type: trigger as u8,
+            trigger_type: trigger.to_di2(), // 使用协议值（DI2）
             category: 0xFF, // 0xFF表示完整快照（包含所有类别）
             occurrence_idx: occurrence_index,
             snapshot_time: self.virtual_time.with_timezone(&chrono::Utc),

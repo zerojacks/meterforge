@@ -51,7 +51,7 @@ pub enum MeterAction {
     ApplyLoadRecordConfig {
         mode_word: u8,
         start_time: [u8; 4],
-        intervals: [u16; 6],
+        intervals: [u16; 8],
     },
     InjectFault {
         event_type: u8,

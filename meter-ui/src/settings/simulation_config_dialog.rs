@@ -56,8 +56,8 @@ pub struct LoadRecordSettings {
     pub mode_word: u8,
     /// 04-00-0A-01 负荷记录起始时间 [MM,DD,hh,mi]（BCD）
     pub start_time: [u8; 4],
-    /// 04-00-0A-02~07 第 1~6 类负荷记录间隔（分钟，0=不记录）
-    pub intervals: [u16; 6],
+    /// 04-00-0A-02~07 第 1~8 类负荷记录间隔（分钟，0=不记录）
+    pub intervals: [u16; 8],
 }
 
 /// The only load curves supported by the simulation engine.
@@ -173,7 +173,7 @@ pub struct SimulationConfigPanel {
     // ── 负荷记录 ──
     load_mode_word: Entity<InputState>,
     load_start: [Entity<InputState>; 4], // MM DD hh mi
-    load_intervals: [Entity<InputState>; 6],
+    load_intervals: [Entity<InputState>; 8],
 
     // ── 故障注入 ──
     fault_kind: Entity<SelectState<Vec<String>>>,
@@ -321,6 +321,8 @@ impl SimulationConfigPanel {
                 num(value.load_record_intervals[3].min(255) as u8, window, cx),
                 num(value.load_record_intervals[4].min(255) as u8, window, cx),
                 num(value.load_record_intervals[5].min(255) as u8, window, cx),
+                num(value.load_record_intervals[6].min(255) as u8, window, cx),
+                num(value.load_record_intervals[7].min(255) as u8, window, cx),
             ],
 
             fault_kind,
@@ -491,7 +493,7 @@ impl SimulationConfigPanel {
             load_start_dec[1] = self.u8_in(&self.load_start[1], cx, "负荷记录起始日", 1, 31)?;
             load_start_dec[2] = self.u8_in(&self.load_start[2], cx, "负荷记录起始时", 0, 23)?;
             load_start_dec[3] = self.u8_in(&self.load_start[3], cx, "负荷记录起始分", 0, 59)?;
-            let mut intervals = [0u16; 6];
+            let mut intervals = [0u16; 8];
             for (i, input) in self.load_intervals.iter().enumerate() {
                 intervals[i] = self.u8_in(input, cx, &format!("第{}类间隔", i + 1), 0, 255)? as u16;
             }
@@ -686,7 +688,9 @@ impl Render for SimulationConfigPanel {
                                 .child(row("第3类间隔 (min)", &self.load_intervals[2]))
                                 .child(row("第4类间隔 (min)", &self.load_intervals[3]))
                                 .child(row("第5类间隔 (min)", &self.load_intervals[4]))
-                                .child(row("第6类间隔 (min)", &self.load_intervals[5]))),
+                                .child(row("第6类间隔 (min)", &self.load_intervals[5]))
+                                .child(row("第7类间隔 (min)", &self.load_intervals[6]))
+                                .child(row("第8类间隔 (min)", &self.load_intervals[7]))),
                     ))
                     // ── 故障注入 ──
                     .child(card("故障注入（附录 A.4 事件生成，立即生效）").child(

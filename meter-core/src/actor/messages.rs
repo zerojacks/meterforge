@@ -119,7 +119,7 @@ pub enum AdminCommand {
     ApplyLoadRecordConfig {
         mode_word: u8,
         start_time: [u8; 4],
-        intervals: [u16; 6],
+        intervals: [u16; 8],
     },
 
     /// 故障注入（事件生成测试）：强制产生/解除指定故障事件

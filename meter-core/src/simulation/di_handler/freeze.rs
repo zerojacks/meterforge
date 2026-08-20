@@ -7,63 +7,21 @@ use super::MeterState;
 use crate::simulation::di_handler::DIHandler;
 
 impl DIHandler {
-    /// 处理冻结数据读取（DI3=05）
+    /// 异步版本：处理冻结数据读取（支持数据库查询）
+    ///
+    /// 此方法应在异步上下文中调用，用于支持从数据库加载历史冻结快照。
     ///
     /// 冻结数据格式：05-DI2-DI1-DI0
     /// - DI2：触发类型
     /// - DI1：数据类别
     /// - DI0：快照序号
     ///
-    /// 读取策略（按设计方案4.6.4节）：
-    /// - DI0=00: 当前数据（实时查询）
-    /// - DI0=01-0C: 内存环形缓冲（定时12次/瞬时3次）
-    /// - DI0>0C: 数据库查询（日冻结62次/月冻结24次）
-    pub(super) fn handle_freeze_data_read(
-        &self,
-        di: [u8; 4],
-        state: &MeterState,
-    ) -> Result<Vec<u8>, String> {
-        use crate::simulation::state::{FreezeDataCategory, FreezeTrigger};
-        use chrono::{Datelike, Timelike};
-
-        // 解析 DI 字段
-        let di0 = di[0]; // 快照序号
-        let di1 = di[1]; // 数据类别
-        let di2 = di[2]; // 触发类型
-
-        // 解析触发类型
-        let trigger = FreezeTrigger::from_di2(di2)
-            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di2))?;
-
-        // DI0=00 表示"当前"数据，直接从 MeterState 当前状态读取
-        if di0 == 0x00 {
-            return self.read_current_freeze_data(di1, state);
-        }
-
-        // 检查是否需要从数据库查询
-        let max_memory_index = trigger.max_history_count();
-
-        if di0 > max_memory_index {
-            // DI0 > 内存容量，需要从数据库查询
-            return Err(format!(
-                "历史冻结数据查询需要数据库支持: trigger={:?}, index={:02X}, max_memory={:02X}. \
-                 请使用异步版本 handle_read_async() 并提供数据库连接池",
-                trigger, di0, max_memory_index
-            ));
-        }
-
-        // DI0=01-0C 表示历史快照，从内存环形缓冲区读取
-        let snapshot = state
-            .get_freeze_snapshot(trigger, di0)
-            .ok_or_else(|| format!("冻结快照不存在: trigger={:?}, index={:02X}", trigger, di0))?;
-
-        // 根据 DI1 返回对应的数据
-        self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time)
-    }
-
-    /// 异步版本：处理冻结数据读取（支持数据库查询）
+    /// 读取策略：
+    /// - DI0=00: 当前数据（从 MeterState 实时查询）
+    /// - DI0=01 ~ max_memory_index: 优先从内存环形缓冲读取，若内存中没有则从数据库查询
+    /// - DI0 > max_memory_index: 仅从数据库查询
     ///
-    /// 此方法应在异步上下文中调用，用于支持 DI0 > 0C 的历史数据查询
+    /// 这样即使软件启动时内存中没有冻结快照，也能从数据库中加载历史数据。
     pub async fn handle_freeze_data_read_async(
         &self,
         di: [u8; 4],
@@ -76,7 +34,7 @@ impl DIHandler {
 
         let di0 = di[0];
         let di1 = di[1];
-        let di2 = di[2];
+        let di2: u8 = di[2];
 
         let trigger = FreezeTrigger::from_di2(di2)
             .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di2))?;
@@ -88,16 +46,14 @@ impl DIHandler {
 
         let max_memory_index = trigger.max_history_count();
 
-        // DI0 ≤ max_memory_index: 从内存读取
+        // DI0 ≤ max_memory_index: 优先从内存读取
         if di0 <= max_memory_index {
-            let snapshot = state.get_freeze_snapshot(trigger, di0).ok_or_else(|| {
-                format!("冻结快照不存在: trigger={:?}, index={:02X}", trigger, di0)
-            })?;
-
-            return self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time);
+            if let Some(snapshot) = state.get_freeze_snapshot(trigger, di0) {
+                return self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time);
+            }
         }
 
-        // DI0 > max_memory_index: 从数据库查询
+        // 内存中没有数据（或 DI0 > max_memory_index），从数据库查询
         //
         // 注意：数据库里每次冻结只落一行完整摘要（category=0xFF，见
         // write_freeze_snapshot），具体某个 DI1 类别的数据是从这行完整快照里
@@ -105,12 +61,12 @@ impl DIHandler {
         // 固定传 0xFF，不能直接传 di1 —— 之前这里传 di1 会导致除 di1=0xFF 外的
         // 查询永远查不到数据（库里根本没有那个 category 的行）。
         let snapshot_row =
-            PersistenceWorker::query_freeze_snapshot(db_pool, address, di2, 0xFF, di0)
+            PersistenceWorker::query_freeze_snapshot(db_pool, address, trigger.to_di2(), 0xFF, di0)
                 .await
                 .map_err(|e| format!("数据库查询失败: {}", e))?
                 .ok_or_else(|| {
                     format!(
-                        "数据库中无此冻结快照: trigger={:?}, index={:02X}",
+                        "冻结快照不存在（内存和数据库均无记录）: trigger={:?}, index={:02X}",
                         trigger, di0
                     )
                 })?;
@@ -181,9 +137,7 @@ impl DIHandler {
         match di1 {
             // 00: 冻结时间 YYMMDDWW hh:mm:ss
             0x00 => {
-                let mut data = encode_datetime(snapshot_time);
-                let weekday = snapshot_time.weekday().num_days_from_sunday() as u8;
-                data.insert(3, to_bcd(weekday));
+                let data = encode_datetime(snapshot_time);
                 Ok(data)
             }
             // 01~04: 正/反向有功、正/反向无功（总+费率）

@@ -586,20 +586,23 @@ impl PhysicsEngine {
     ///
     /// 检测类型：
     /// 1. 定时冻结：每整点/日/月触发
-    /// 2. 约定冻结：检查约定时间
+    /// 2. 日冻结 / 整点冻结：各自独立的模式字+时间参数
+    /// 3. 约定冻结：检查约定时间（一次性）
     ///
     /// 性能要求：只做时间比较，耗时 < 0.5μs
     ///
     /// 工作流程：
-    /// - 检测到冻结点 → 设置 state.pending_freeze_trigger
-    /// - MeterActor 检测到标志 → 异步生成快照
-    /// - 快照生成完成 → 清空标志
+    /// - 检测到冻结点 → push 进 state.pending_freeze_triggers
+    /// - MeterActor 检测到非空 → 依次异步生成快照
+    /// - 全部处理完成 → 清空列表
+    ///
+    /// 注意：这里**不会**在命中一种冻结后提前返回。同一个虚拟时刻完全
+    /// 可能同时满足多种冻结条件——最典型的就是"定时冻结=按日周期"
+    /// （每天 00:00:00）和"日冻结时间=00:00"同时配置，两者会在同一秒
+    /// 都成立。如果检测到一种就 return，后面的条件那一秒就永远没机会
+    /// 被判断到，等于那种冻结被无声吞掉。所以每种冻结都要独立判断、
+    /// 独立 push，谁也不抢谁的。
     fn check_freeze_schedule(&self, state: &mut MeterState) {
-        // 避免重复触发：如果已有待处理的冻结，跳过检测
-        if state.pending_freeze_trigger.is_some() {
-            return;
-        }
-
         let now = state.virtual_time;
 
         // ─────────────────────────────────────────────────────────────
@@ -609,23 +612,20 @@ impl PhysicsEngine {
             3 => {
                 // 按小时周期：每小时整点（XX:00:00）
                 if now.minute() == 0 && now.second() == 0 {
-                    state.pending_freeze_trigger = Some(FreezeType::Timed);
-                    return;
+                    state.pending_freeze_triggers.push(FreezeType::Timed);
                 }
             }
             2 => {
                 // 按日周期：每天00:00:00
                 if now.hour() == 0 && now.minute() == 0 && now.second() == 0 {
-                    state.pending_freeze_trigger = Some(FreezeType::Timed);
-                    return;
+                    state.pending_freeze_triggers.push(FreezeType::Timed);
                 }
             }
             1 => {
                 // 按月周期：每月1日00:00:00
                 use chrono::Datelike;
                 if now.day() == 1 && now.hour() == 0 && now.minute() == 0 && now.second() == 0 {
-                    state.pending_freeze_trigger = Some(FreezeType::Timed);
-                    return;
+                    state.pending_freeze_triggers.push(FreezeType::Timed);
                 }
             }
             _ => {}
@@ -638,37 +638,42 @@ impl PhysicsEngine {
             let hh = bcd_to_dec(state.daily_freeze_time[0]);
             let mm = bcd_to_dec(state.daily_freeze_time[1]);
             if now.hour() == hh && now.minute() == mm && now.second() == 0 {
-                state.pending_freeze_trigger = Some(FreezeType::Daily);
-                return;
+                state.pending_freeze_triggers.push(FreezeType::Daily);
             }
         }
 
         // ─────────────────────────────────────────────────────────────
         // 3. 整点冻结检测（04-00-09-05 模式字 + 04-00-12-01 起始时间
         //    + 04-00-12-02 间隔分钟）
+        //
+        // 对齐方式：分钟数按"周期"对齐到标准刻度（60分钟→整点 :00；
+        // 15分钟→ :00/:15/:30/:45……），而不是用 (now - start) 对 interval
+        // 取模。取模方式在 start 本身没有落在整点/整刻度上时（比如
+        // start 配的是 xx:05）会把所有触发点整体偏移成 :05/:20/:35/:50，
+        // 偏离标准刻度；这里的 start 只作为"从什么时候开始生效"的闸门，
+        // 不参与刻度计算，才能保证周期分钟数据永远是 0/15/30/45 这类值，
+        // 秒永远是 0。
         // ─────────────────────────────────────────────────────────────
         if state.hourly_freeze_mode != 0 && state.hourly_freeze_interval_min > 0 {
             if let Some(start) = decode_bcd_datetime(&state.hourly_freeze_start) {
-                let interval = chrono::Duration::minutes(state.hourly_freeze_interval_min as i64);
-                if now >= start {
-                    let elapsed = now.signed_duration_since(start);
-                    if elapsed.num_seconds() % interval.num_seconds() == 0 {
-                        state.pending_freeze_trigger = Some(FreezeType::Hourly);
-                        return;
+                let interval = state.hourly_freeze_interval_min as i64;
+                if now >= start && now.second() == 0 {
+                    let minute_of_day = now.hour() as i64 * 60 + now.minute() as i64;
+                    if minute_of_day % interval == 0 {
+                        state.pending_freeze_triggers.push(FreezeType::Hourly);
                     }
                 }
             }
         }
 
         // ─────────────────────────────────────────────────────────────
-        // 4. 约定冻结检测（04-00-09-04 模式字 + appointment_freeze_time）
+        // 4. 约定冻结检测（04-00-09-04 模式字 + appointment_freeze_time，一次性）
         // ─────────────────────────────────────────────────────────────
         if state.freeze_config.appointment_freeze_mode != 0 && !state.appointment_freeze_fired {
             if let Some(target) = decode_bcd_datetime(&state.appointment_freeze_time) {
                 if now >= target {
                     state.appointment_freeze_fired = true;
-                    state.pending_freeze_trigger = Some(FreezeType::Appointment);
-                    return;
+                    state.pending_freeze_triggers.push(FreezeType::Appointment);
                 }
             }
         }
@@ -989,7 +994,10 @@ fn decode_bcd_start_time(bcd: &[u8; 4], reference: DateTime<Utc>) -> Option<Date
 }
 
 /// 解码 BCD 时间（YYMMDDhhmm, 5 字节）为本地时间
-fn decode_bcd_datetime(bcd: &[u8; 5]) -> Option<DateTime<Utc>> {
+///
+/// `pub(crate)`：virtual_meter.rs 在恢复约定冻结的 `appointment_freeze_fired`
+/// 状态时也需要用同一份解码逻辑判断"约定时间是否已经过去"。
+pub(crate) fn decode_bcd_datetime(bcd: &[u8; 5]) -> Option<DateTime<Utc>> {
     use chrono::TimeZone;
     let yy = bcd_to_dec(bcd[0]);
     let mm = bcd_to_dec(bcd[1]);
@@ -1132,16 +1140,16 @@ mod tests {
             .single()
             .unwrap();
         engine.check_freeze_schedule(&mut state);
-        assert!(state.pending_freeze_trigger.is_some());
+        assert!(!state.pending_freeze_triggers.is_empty());
 
         // 非冻结时刻不触发
-        state.pending_freeze_trigger = None;
+        state.pending_freeze_triggers.clear();
         state.virtual_time = Utc
             .with_ymd_and_hms(2025, 6, 2, 0, 31, 0)
             .single()
             .unwrap();
         engine.check_freeze_schedule(&mut state);
-        assert!(state.pending_freeze_trigger.is_none());
+        assert!(state.pending_freeze_triggers.is_empty());
     }
 
     #[test]
@@ -1235,15 +1243,14 @@ mod tests {
 
         // 第1次tick：59秒，不应触发
         engine.check_freeze_schedule(&mut state);
-        assert!(state.pending_freeze_trigger.is_none(), "59秒不应触发冻结");
+        assert!(state.pending_freeze_triggers.is_empty(), "59秒不应触发冻结");
 
         // 推进到整点
         state.virtual_time = Utc.with_ymd_and_hms(2024, 6, 15, 11, 0, 0).unwrap();
 
         // 第2次tick：整点，应触发
         engine.check_freeze_schedule(&mut state);
-        assert!(state.pending_freeze_trigger.is_some(), "整点应触发冻结");
-        assert_eq!(state.pending_freeze_trigger.unwrap(), FreezeType::Timed);
+        assert_eq!(state.pending_freeze_triggers, vec![FreezeType::Timed], "整点应触发冻结");
 
         println!("✓ 小时周期冻结触发检测正常");
     }
@@ -1351,16 +1358,26 @@ mod tests {
 
     #[test]
     fn test_load_record_sampling_logic() {
+        use chrono::{Duration, TimeZone, Timelike};
+        
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
 
-        // 配置负荷记录：模式字选通电压电流频率块，第1类间隔5分钟
+        // 配置负荷记录：模式字选通电压电流频率块，第1类间隔15分钟
         state.load_record_config.mode_word = 0b00000001; // bit0=电压电流频率块
-        state.load_record_config.intervals[0] = 5; // 第1类5分钟
+        state.load_record_config.intervals[0] = 15; // 第1类15分钟
 
-        // 第一次采样应该立即触发（第1类一行）
+        // 设置虚拟时间为非对齐点：09:07:30（不在0/15/30/45分上）
+        state.virtual_time = chrono::Utc.with_ymd_and_hms(2026, 8, 20, 9, 7, 30).unwrap();
+
+        // 第一次检查：不在对齐点，不应采样
         let samples = engine.check_load_record_sampling(&mut state);
-        assert_eq!(samples.len(), 1, "首次应该立即采样，且只产生一行");
+        assert!(samples.is_empty(), "非对齐点不应采样");
+
+        // 推进到对齐点：09:15:00
+        state.virtual_time = chrono::Utc.with_ymd_and_hms(2026, 8, 20, 9, 15, 0).unwrap();
+        let samples = engine.check_load_record_sampling(&mut state);
+        assert_eq!(samples.len(), 1, "在对齐点应该采样");
         assert_eq!(samples[0].class_id, 1);
         assert_eq!(samples[0].sample_time, state.virtual_time);
         assert!(samples[0].data.vif.is_some(), "模式字 bit0 选通 vif 块");
@@ -1370,26 +1387,30 @@ mod tests {
         assert!((vif.voltage_a - 220.0).abs() < 1.0, "A相电压应接近220V");
         assert!((vif.frequency - 50.0).abs() < 1.0, "频率应接近50Hz");
 
-        println!("✓ 首次负荷记录采样正常（按类整行）");
+        println!("✓ 首次负荷记录采样在对齐点触发");
 
-        // 推进2分钟，不应再次采样
-        use chrono::Duration;
+        // 推进2分钟到09:17:00，不应再次采样（未跨越下一个对齐点）
         state.virtual_time = state.virtual_time + Duration::minutes(2);
         let samples = engine.check_load_record_sampling(&mut state);
-        assert!(samples.is_empty(), "2分钟后不应采样（间隔5分钟）");
+        assert!(samples.is_empty(), "2分钟后不应采样（未到下一个对齐点）");
 
-        // 推进到5分钟，应该再次采样
-        state.virtual_time = state.virtual_time + Duration::minutes(3);
+        // 推进到下一个对齐点：09:30:00
+        state.virtual_time = chrono::Utc.with_ymd_and_hms(2026, 8, 20, 9, 30, 0).unwrap();
         let samples = engine.check_load_record_sampling(&mut state);
-        assert_eq!(samples.len(), 1, "5分钟后应该再次采样");
+        assert_eq!(samples.len(), 1, "到达下一个对齐点应该再次采样");
 
-        println!("✓ 负荷记录采样间隔控制正常");
+        println!("✓ 负荷记录采样间隔控制正常（对齐到0/15/30/45分）");
     }
 
     #[test]
     fn test_load_record_mode_word_selects_blocks() {
+        use chrono::TimeZone;
+        
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();
+
+        // 设置虚拟时间为对齐点（秒数为0）
+        state.virtual_time = chrono::Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap();
 
         // 设置一些已知值
         state.voltage_a = 220.0;
@@ -1491,16 +1512,16 @@ mod tests {
             }
 
             // 检查冻结触发
-            if state.pending_freeze_trigger.is_some() {
+            if !state.pending_freeze_triggers.is_empty() {
                 println!(
                     "冻结触发: {}, 触发类型: {:?}",
                     state.virtual_time.format("%H:%M:%S"),
-                    state.pending_freeze_trigger
+                    state.pending_freeze_triggers
                 );
 
                 // 生成快照
                 state.create_freeze_snapshot(FreezeTrigger::Timed);
-                state.pending_freeze_trigger = None;
+                state.pending_freeze_triggers.clear();
             }
         }
 

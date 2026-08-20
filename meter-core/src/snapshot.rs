@@ -34,7 +34,7 @@ pub struct SimulationSnapshot {
     /// 负荷记录配置（04-00-09-01 / 04-00-0A-xx）
     pub load_record_mode_word: u8,
     pub load_record_start_time: [u8; 4], // 十进制 [MM,DD,hh,mm]
-    pub load_record_intervals: [u16; 6],
+    pub load_record_intervals: [u16; 8],
 }
 
 /// 冻结配置快照，时间字段为十进制分量（非 BCD）
@@ -266,7 +266,7 @@ impl MeterSnapshot {
                 settlement_hours: [0; 3],
                 load_record_mode_word: 0,
                 load_record_start_time: [0; 4],
-                load_record_intervals: [0; 6],
+                load_record_intervals: [0; 8],
             },
         }
     }

@@ -22,7 +22,7 @@ pub struct PersistedMeterSettings {
     pub settlement_hours: [u8; 3],
     pub load_record_mode_word: u8,
     pub load_record_start_time: [u8; 4],
-    pub load_record_intervals: [u16; 6],
+    pub load_record_intervals: [u16; 8],
 }
 
 /// 持久化请求枚举

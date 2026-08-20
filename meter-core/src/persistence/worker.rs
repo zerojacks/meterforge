@@ -1411,7 +1411,7 @@ impl PersistenceWorker {
         address: &str,
         mode_word: u8,
         start_time: [u8; 4],
-        intervals: [u16; 6],
+        intervals: [u16; 8],
     ) -> Result<(), sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
         let mut extra = Self::read_extra_config(pool, address).await?;
@@ -1564,7 +1564,7 @@ impl PersistenceWorker {
                 load_record_start_time[i] = value.as_u64().unwrap_or(0) as u8;
             }
         }
-        let mut load_record_intervals = [0u16; 6];
+        let mut load_record_intervals = [0u16; 8];
         if let Some(intervals) = load_record.get("intervals").and_then(|v| v.as_array()) {
             for (i, value) in intervals.iter().take(6).enumerate() {
                 load_record_intervals[i] = value.as_u64().unwrap_or(0) as u16;

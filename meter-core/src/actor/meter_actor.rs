@@ -1344,7 +1344,7 @@ impl MeterActor {
 
                 // 持久化负荷记录配置
                 if let Some(pool) = &self.config.db_pool {
-                    let addr = format_address(&self.config.address);
+                    let addr: String = format_address(&self.config.address);
                     if let Err(e) = crate::persistence::PersistenceWorker::save_load_record_config(
                         pool,
                         &addr,
@@ -1411,7 +1411,7 @@ impl MeterActor {
                     1 => FreezeType::Instant(0),
                     _ => unreachable!(),
                 };
-                self.meter.state_mut().pending_freeze_trigger = Some(ft);
+                self.meter.state_mut().pending_freeze_triggers.push(ft);
                 Ok(format!("Freeze triggered: type={}", freeze_type))
             }
 
