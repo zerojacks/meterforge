@@ -1,7 +1,7 @@
 //! 参数设置卡片：展示与触发动作分离，具体命令仍由详情视图统一处理。
 use super::meter_detail::MeterDetailView;
 use crate::types::MeterSnapshot;
-use chrono::{Datelike, FixedOffset, Local, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 use gpui::*;
 use gpui_component::{
     badge::Badge,
@@ -47,7 +47,7 @@ fn card(
 }
 
 pub fn render(
-    view: &MeterDetailView,
+    _view: &MeterDetailView,
     snapshot: &MeterSnapshot,
     cx: &mut Context<MeterDetailView>,
 ) -> impl IntoElement {

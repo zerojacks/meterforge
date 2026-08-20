@@ -99,14 +99,18 @@ impl PhysicsEngine {
     /// - elapsed: 真实流逝时间（由全局 tick 广播传入）
     /// - time_scale: 时间加速倍率（由全局 tick 广播传入，默认 1.0）
     ///
+    /// 返回值：
+    /// - bool: 是否发生了结算日转存
+    ///
     /// 执行步骤（设计方案 4.5.1 节）：
     /// 1. 推进虚拟时钟
     /// 2. 根据负荷模型更新瞬时量
     /// 3. 脉冲累加电能
     /// 4. 更新最大需量
     /// 5. 事件检测（TODO）
-    /// 6. 冻结调度（TODO）
-    pub fn tick(&mut self, state: &mut MeterState, elapsed: Duration, time_scale: f64) {
+    /// 6. 结算日转存（TODO）
+    /// 7. 冻结调度（TODO）
+    pub fn tick(&mut self, state: &mut MeterState, elapsed: Duration, time_scale: f64) -> bool {
         // ─────────────────────────────────────────────────────────────
         // 步骤1: 推进虚拟时钟（应用时间倍率）
         // ─────────────────────────────────────────────────────────────
@@ -142,7 +146,7 @@ impl PhysicsEngine {
         // ─────────────────────────────────────────────────────────────
         // 步骤6: 结算日转存（按结算日参数归档电能/需量）
         // ─────────────────────────────────────────────────────────────
-        state.settlement_rollover_if_due();
+        let settlement_rolled_over = state.settlement_rollover_if_due();
 
         // ─────────────────────────────────────────────────────────────
         // 步骤7: 冻结调度（轻量级检测，设置标志）
@@ -159,6 +163,8 @@ impl PhysicsEngine {
         // 步骤8: 派生状态字更新
         // ─────────────────────────────────────────────────────────────
         self.update_derived_status(state);
+
+        settlement_rolled_over
     }
 
     /// 步骤2: 更新瞬时量（电压/电流/功率）
@@ -1358,7 +1364,7 @@ mod tests {
 
     #[test]
     fn test_load_record_sampling_logic() {
-        use chrono::{Duration, TimeZone, Timelike};
+        use chrono::{Duration, TimeZone};
         
         let engine = PhysicsEngine::new(LoadModelConfig::default());
         let mut state = MeterState::default();

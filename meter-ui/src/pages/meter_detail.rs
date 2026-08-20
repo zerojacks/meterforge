@@ -6,14 +6,11 @@ use crate::{
     state::GlobalMeterRegistry,
     types::MeterSnapshot,
 };
-use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
+use chrono::{Datelike, Timelike, Utc};
 use gpui::*;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     badge::Badge,
-    button::Button,
-    form::{field, v_form},
-    input::{Input, InputState},
     label::Label,
     resizable::{resizable_panel, v_resizable},
     tab::{Tab, TabBar},

@@ -8,7 +8,7 @@
 // 4. 将响应回传到 Transport
 
 use crate::actor::MeterRegistry;
-use crate::protocol::{decode_frame, Frame};
+use crate::protocol::decode_frame;
 use crate::transport::{FrameSource, RawFrame};
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,6 +41,7 @@ pub struct Router {
     registry: Arc<Mutex<MeterRegistry>>,
 
     /// 配置
+    #[allow(dead_code)]
     config: RouterConfig,
 }
 
@@ -135,7 +136,7 @@ impl Router {
 
         // 2. 获取注册表锁并路由到目标电表
         let route_start = Instant::now();
-        let mut registry = self.registry.lock().await;
+        let registry = self.registry.lock().await;
         match registry
             .route_frame(frame, raw_frame.conn_id, raw_frame.reply_channel)
             .await
@@ -227,7 +228,7 @@ impl RouterRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::{MeterActor, MeterActorConfig, MeterActorHandle, TickMsg};
+    use crate::actor::{MeterActor, MeterActorConfig, MeterActorHandle};
     use crate::protocol::{decode_frame, encode_frame, Frame};
     use crate::simulation::{VirtualMeter, VirtualMeterConfig};
     use crate::transport::{FrameSource, RawFrame};

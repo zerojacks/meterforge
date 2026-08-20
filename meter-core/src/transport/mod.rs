@@ -8,7 +8,6 @@
 pub mod serial;
 pub mod tcp;
 
-use crate::protocol::Frame;
 use tokio::sync::mpsc;
 
 // 导出 TCP 相关类型

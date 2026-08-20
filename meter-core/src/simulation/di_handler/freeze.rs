@@ -1,7 +1,5 @@
 // 表A.6 冻结数据读取（DI3=05）
 
-use chrono::{Datelike, Timelike};
-
 use super::encoding::*;
 use super::MeterState;
 use crate::simulation::di_handler::DIHandler;

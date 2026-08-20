@@ -31,7 +31,9 @@ const HISTORY_CAPACITY: usize = 120;
 /// 设计原则：UI 侧只持有快照数据，不直接与 VirtualMeter 交互
 /// 数据更新由 meter-core 后端主动推送
 pub struct MeterState {
+    #[allow(dead_code)]
     pub address: String,
+
     pub snapshot: MeterSnapshot,
     /// 实时曲线历史（随快照推送滚动追加）
     pub history: VecDeque<RealtimeSample>,
@@ -41,15 +43,6 @@ pub struct MeterState {
 impl EventEmitter<()> for MeterState {}
 
 impl MeterState {
-    /// 创建新的MeterState（初始快照为默认值，等待 MeterActor 推送）
-    pub fn new(address: String) -> Self {
-        Self {
-            address: address.clone(),
-            snapshot: MeterSnapshot::default_with_address(address),
-            history: VecDeque::new(),
-        }
-    }
-
     /// 用已知快照创建 MeterState（用于启动时已经从数据库恢复出配置的场景，
     /// 避免 UI 先渲染一份默认快照、等第一次 tick 推送才刷新成真实数据——
     /// 像"模拟配置"这种只在构造时读取一次快照的表单组件，如果构造时拿到
@@ -66,7 +59,7 @@ impl MeterState {
     ///
     /// 使用 cx.spawn() + entity.update() 模式，这是 GPUI 推荐的异步更新方式
     pub fn start_update_loop(
-        entity: Entity<Self>,
+        _entity: Entity<Self>,
         mut update_rx: mpsc::UnboundedReceiver<MeterSnapshot>,
         cx: &mut Context<Self>,
     ) {

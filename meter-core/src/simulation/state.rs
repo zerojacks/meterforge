@@ -1595,6 +1595,26 @@ impl MeterState {
         }
     }
 
+    /// 判断结算日电能是否已在内存中（供协议读取按需回退数据库判断使用）
+    ///
+    /// - settlement=0（当前结算周期）恒为 true：直接从 energy_registers 实时读取
+    /// - settlement=1~12：只有在内存 settlement_energies 里有对应槽位时才为 true；
+    ///   缺失时（如进程刚启动、数据库恢复尚未完成或从未恢复过）调用方应改为
+    ///   查询数据库（见 di_handler/energy.rs 的 handle_energy_read_async）
+    pub fn has_settlement_energy(
+        &self,
+        settlement: u8,
+        energy_type: EnergyType,
+        rate: Option<u8>,
+    ) -> bool {
+        if settlement == 0 {
+            return true;
+        }
+        let rate_num = rate.unwrap_or(0);
+        self.settlement_energies
+            .contains_key(&(settlement, energy_type, rate_num))
+    }
+
     /// 设置结算日电能（settlement=1~12）
     pub fn set_settlement_energy(
         &mut self,
@@ -1674,7 +1694,7 @@ impl MeterState {
     ///
     /// 转存后需量按结算周期归零（max_demand 清零、当前需量寄存器清除），
     /// 电能寄存器按协议继续累计。
-    pub fn settlement_rollover_if_due(&mut self) {
+    pub fn settlement_rollover_if_due(&mut self) -> bool {
         use chrono::{Datelike, TimeZone};
 
         let now = self.virtual_time;
@@ -1722,7 +1742,7 @@ impl MeterState {
             .any(|(&d, &h)| crossed(d as u32, h as u32));
         self.last_settlement_rollover = Some(now);
         if !due {
-            return;
+            return false; // 未到结算日，不执行转存
         }
 
         // 1. 结算日电能：槽位顺移 11→12 … 1→2
@@ -1772,6 +1792,8 @@ impl MeterState {
         // 4. 需量按结算周期归零，电能继续累计
         self.max_demand = 0.0;
         self.max_demand_time = now;
+
+        true // 成功执行了结算日转存
     }
 
     /// 相角（U/I 夹角，单位：度），由功率因数反推

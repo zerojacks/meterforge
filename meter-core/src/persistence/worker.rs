@@ -12,7 +12,7 @@ use sqlx::{Row, SqlitePool};
 use std::path::Path;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::types::*;
 use serde_json::{json, Value};
@@ -273,6 +273,10 @@ impl PersistenceWorker {
 
             PersistRequest::WriteLoadRecord(row) => {
                 self.write_load_record_tx(tx, row).await
+            }
+
+            PersistRequest::WriteSettlementEnergies(row) => {
+                self.write_settlement_energies(tx, row).await
             }
 
             PersistRequest::SaveVirtualTime {
@@ -537,6 +541,59 @@ impl PersistenceWorker {
         .bind(occurred_at_ms)
         .execute(&mut **tx)
         .await?;
+
+        Ok(())
+    }
+
+    /// 批量写入结算日历史电能数据（settlement_day=1~24）
+    ///
+    /// 结算日转存后，将所有结算日槽位的历史电能数据写入 energy_registers 表。
+    /// 
+    /// 设计说明：
+    /// - 只写入 settlement_day > 0 的历史数据（当前结算周期 settlement_day=0 由 write_energy_register 处理）
+    /// - 使用 REPLACE INTO 或 ON CONFLICT REPLACE 语义，确保每次转存后覆盖旧值
+    /// - Key = (address, energy_kind, rate_index, settlement_day)
+    /// - energy_kind: DI2编码（01=正向有功, 02=反向有功, 03=组合无功1, 04=组合无功2等）
+    /// - rate_index: DI1编码（00=总, 01~3F=费率1~63）
+    /// - settlement_day: DI0编码（01~18H = 上1~24个结算日）
+    async fn write_settlement_energies(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        row: SettlementEnergiesRow,
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        let address = &row.meter_address;
+
+        // 将 f64 转换为定点数（*100）
+        let to_fp = |v: f64| (v * 100.0) as i64;
+
+        // 批量写入所有结算日历史数据
+        for ((settlement_day, energy_kind, rate_index), value) in row.energies {
+            // 只写入 settlement_day > 0 的历史数据（0=当前周期，由 write_energy_register 处理）
+            if settlement_day == 0 {
+                continue;
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO energy_registers (
+                    address, energy_kind, rate_index, settlement_day, value_fp, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(address, energy_kind, rate_index, settlement_day)
+                DO UPDATE SET
+                    value_fp = excluded.value_fp,
+                    updated_at_ms = excluded.updated_at_ms
+                "#,
+            )
+            .bind(address)
+            .bind(energy_kind)
+            .bind(rate_index)
+            .bind(settlement_day)
+            .bind(to_fp(value))
+            .bind(now_ms)
+            .execute(&mut **tx)
+            .await?;
+        }
 
         Ok(())
     }
@@ -1029,6 +1086,130 @@ impl PersistenceWorker {
         }
 
         Ok(registers)
+    }
+
+    /// 恢复结算日历史电能数据（settlement_day=1~24）
+    ///
+    /// 从 energy_registers 表中读取所有结算日历史数据（settlement_day > 0），
+    /// 返回 HashMap<(settlement_day, energy_kind, rate_index), value>。
+    /// 
+    /// 调用时机：
+    /// - 虚拟电表启动时，从数据库恢复结算日历史数据到内存的 settlement_energies HashMap
+    /// 
+    /// 设计说明：
+    /// - 只查询 settlement_day > 0 的记录（0 表示当前结算周期，由 restore_energy_registers 处理）
+    /// - Key = (settlement_day, energy_kind, rate_index)
+    /// - Value = 电能值（kWh/kvarh），从定点数（*100）转换为浮点数
+    pub async fn restore_settlement_energies(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<std::collections::HashMap<(u8, u8, u8), f64>, sqlx::Error> {
+        use std::collections::HashMap;
+
+        // 只加载最近6个结算日的数据（可根据需求调整）
+        // DL/T645-2007协议支持12个结算日，但实际应用中可能只需要最近几个月
+        const MAX_SETTLEMENT_DAYS: u8 = 12; // 改为6可以减半内存占用
+
+        let rows = sqlx::query(
+            r#"
+            SELECT settlement_day, energy_kind, rate_index, value_fp
+            FROM energy_registers
+            WHERE address = ? 
+              AND settlement_day > 0 
+              AND settlement_day <= ?
+            ORDER BY settlement_day, energy_kind, rate_index
+            "#,
+        )
+        .bind(address)
+        .bind(MAX_SETTLEMENT_DAYS as i64)
+        .fetch_all(pool)
+        .await?;
+
+        let mut energies = HashMap::new();
+
+        for row in rows {
+            let settlement_day: u8 = row.get::<i64, _>("settlement_day") as u8;
+            let energy_kind: u8 = row.get::<i64, _>("energy_kind") as u8;
+            let rate_index: u8 = row.get::<i64, _>("rate_index") as u8;
+            let value_fp: i64 = row.get("value_fp");
+
+            // 将定点数转换回浮点数（除以100）
+            let value = value_fp as f64 / 100.0;
+
+            energies.insert((settlement_day, energy_kind, rate_index), value);
+        }
+
+        Ok(energies)
+    }
+
+    /// 查询单个结算日历史电能值（供 DIHandler 内存未命中时按需查询数据库）
+    ///
+    /// 与 `query_freeze_snapshot` 的按需回退设计一致：`settlement_energies`
+    /// 内存 HashMap 正常情况下在电表连接时由 `restore_settlement_energies`
+    /// 整体恢复，但如果恢复失败/尚未完成，或读取请求先于恢复完成到达，
+    /// 单条查询可以兜底，避免直接返回错误的 0 值。
+    pub async fn query_settlement_energy(
+        pool: &SqlitePool,
+        address: &str,
+        energy_kind: u8,
+        rate_index: u8,
+        settlement_day: u8,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT value_fp
+            FROM energy_registers
+            WHERE address = ? AND energy_kind = ? AND rate_index = ? AND settlement_day = ?
+            "#,
+        )
+        .bind(address)
+        .bind(energy_kind)
+        .bind(rate_index)
+        .bind(settlement_day)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| {
+            let value_fp: i64 = r.get("value_fp");
+            value_fp as f64 / 100.0
+        }))
+    }
+
+    /// 查询某地址全部结算日历史电能（供 UI 切到"结算日电能"标签页时加载使用）
+    ///
+    /// 返回按 settlement_day/energy_kind/rate_index 排序的全部记录（settlement_day
+    /// > 0），由调用方按需筛选/聚合成展示摘要。
+    pub async fn query_settlement_energy_history(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<Vec<crate::persistence::SettlementEnergyDbRow>, sqlx::Error> {
+        use crate::persistence::SettlementEnergyDbRow;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT settlement_day, energy_kind, rate_index, value_fp, updated_at_ms
+            FROM energy_registers
+            WHERE address = ? AND settlement_day > 0
+            ORDER BY settlement_day, energy_kind, rate_index
+            "#,
+        )
+        .bind(address)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let value_fp: i64 = row.get("value_fp");
+                SettlementEnergyDbRow {
+                    settlement_day: row.get::<i64, _>("settlement_day") as u8,
+                    energy_kind: row.get::<i64, _>("energy_kind") as u8,
+                    rate_index: row.get::<i64, _>("rate_index") as u8,
+                    value: value_fp as f64 / 100.0,
+                    updated_at_ms: row.get("updated_at_ms"),
+                }
+            })
+            .collect())
     }
 
     /// 从数据库恢复虚拟时钟

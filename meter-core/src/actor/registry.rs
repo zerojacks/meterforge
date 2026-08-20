@@ -5,7 +5,7 @@
 // 2. 处理精确地址、通配地址、广播地址的路由
 // 3. 管理电表的生命周期（添加/删除/更新地址）
 
-use super::messages::{AdminCommand, EngineMsg};
+use super::messages::EngineMsg;
 use super::meter_actor::MeterActorHandle;
 use crate::protocol::{
     is_broadcast_address, is_wildcard_address, match_address, validate_broadcast_command, Frame,

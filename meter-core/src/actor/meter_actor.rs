@@ -9,6 +9,8 @@ use super::messages::{AdminCommand, EngineMsg, RegistryMsg, TickMsg};
 use crate::protocol::format::format_address;
 use crate::simulation::VirtualMeter;
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -135,7 +137,6 @@ impl MeterActor {
                             self.on_protocol_command(conn_id, frame, reply_tx).await;
                         }
                         EngineMsg::AdminCommand { cmd, reply_tx } => {
-                            let should_shutdown = matches!(cmd, AdminCommand::Shutdown);
                             self.on_admin_command(cmd, reply_tx).await;
                         }
                     }
@@ -179,22 +180,20 @@ impl MeterActor {
         #[cfg(debug_assertions)]
         {
             // 每10秒打印一次状态（用于调试）
-            static mut TICK_COUNT: u64 = 0;
-            unsafe {
-                TICK_COUNT += 1;
-                if TICK_COUNT % 10 == 0 {
-                    debug!(
-                        "[MeterActor {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}] Tick #{}, vtime={}",
-                        self.config.address[5],
-                        self.config.address[4],
-                        self.config.address[3],
-                        self.config.address[2],
-                        self.config.address[1],
-                        self.config.address[0],
-                        TICK_COUNT,
-                        self.meter.state().virtual_time.format("%Y-%m-%d %H:%M:%S")
-                    );
-                }
+            static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+            let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count % 10 == 0 {
+                debug!(
+                    "[MeterActor {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}] Tick #{}, vtime={}",
+                    self.config.address[5],
+                    self.config.address[4],
+                    self.config.address[3],
+                    self.config.address[2],
+                    self.config.address[1],
+                    self.config.address[0],
+                    count,
+                    self.meter.state().virtual_time.format("%Y-%m-%d %H:%M:%S")
+                );
             }
         }
     }
@@ -223,7 +222,7 @@ impl MeterActor {
         frame: crate::protocol::Frame,
         reply_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) {
-        use crate::protocol::{encode_error_response, encode_frame, ErrorInfoWord};
+        use crate::protocol::{encode_error_response, ErrorInfoWord};
 
         let cmd_start = Instant::now();
         let control = frame.control;
@@ -1395,21 +1394,16 @@ impl MeterActor {
             }
 
             AdminCommand::TriggerFreeze { freeze_type } => {
-                use crate::simulation::state::{FreezeTrigger, FreezeType};
-                let trigger = match freeze_type {
-                    0 => FreezeTrigger::Timed,
-                    1 => FreezeTrigger::Instant,
-                    _ => {
-                        let _ = reply_tx.send(Err("Invalid freeze_type".to_string()));
-                        return;
-                    }
-                };
+                use crate::simulation::state::FreezeType;
 
                 // 手动设置pending标志，下次tick会处理
                 let ft = match freeze_type {
                     0 => FreezeType::Timed,
                     1 => FreezeType::Instant(0),
-                    _ => unreachable!(),
+                    _ => {
+                        let _ = reply_tx.send(Err("Invalid freeze_type".to_string()));
+                        return;
+                    }
                 };
                 self.meter.state_mut().pending_freeze_triggers.push(ft);
                 Ok(format!("Freeze triggered: type={}", freeze_type))

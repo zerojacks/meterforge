@@ -43,6 +43,9 @@ pub enum PersistRequest {
     /// 写入负荷记录（load_profile_records 表，JSON payload）
     WriteLoadRecord(LoadRecordRow),
 
+    /// 批量写入结算日历史电能数据（settlement_day=1~24）
+    WriteSettlementEnergies(SettlementEnergiesRow),
+
     /// 保存虚拟时间和配置（用于定期持久化，防止异常退出丢失）
     SaveVirtualTime {
         address: String,
@@ -109,6 +112,39 @@ pub struct MaxDemandRow {
     pub rate_index: u8,
     pub value_fp: i64,
     pub occurred_at: DateTime<Utc>,
+}
+
+/// 结算日历史电能数据（批量写入 energy_registers 表，settlement_day=1~24）
+///
+/// 设计说明：
+/// - 结算日转存后，需要批量保存所有结算日槽位的历史电能数据
+/// - Key = (settlement_day, energy_kind, rate_index)
+/// - settlement_day: 1~24 表示上1~24个结算日，对应DI0=01~18H
+/// - energy_kind: 对应DI2编码（01=正向有功, 02=反向有功, 03=组合无功1, 04=组合无功2等）
+/// - rate_index: 对应DI1编码（00=总, 01~3F=费率1~63）
+#[derive(Debug, Clone)]
+pub struct SettlementEnergiesRow {
+    pub meter_address: String,
+    /// 结算日电能数据：Key = (settlement_day, energy_kind, rate_index), Value = 电能值(kWh/kvarh)
+    pub energies: std::collections::HashMap<(u8, u8, u8), f64>,
+}
+
+/// 结算日历史电能查询结果（单条数据库记录，供 UI 历史加载使用）
+///
+/// 与 `SettlementEnergiesRow`（写入用，一次批量提交多条）不同，这是
+/// `query_settlement_energy_history` 的读取结果，一行对应一条数据库记录。
+#[derive(Debug, Clone)]
+pub struct SettlementEnergyDbRow {
+    /// 结算日序号（1~12，对应协议 DI0=01~0C）
+    pub settlement_day: u8,
+    /// 对应DI2编码（01=正向有功, 02=反向有功, 03=组合无功1, 04=组合无功2等）
+    pub energy_kind: u8,
+    /// 对应DI1编码（00=总, 01~3F=费率1~63）
+    pub rate_index: u8,
+    /// 电能值（kWh/kvarh）
+    pub value: f64,
+    /// 落库时间（毫秒时间戳）
+    pub updated_at_ms: i64,
 }
 
 /// 负荷记录采样数据行（查询结果）

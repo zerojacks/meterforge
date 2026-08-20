@@ -178,7 +178,7 @@ impl Focusable for TimeSettingDialog {
 }
 
 impl Render for TimeSettingDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
          v_flex()
@@ -871,7 +871,7 @@ impl TouConfigDialog {
 }
 
 impl Render for TouConfigDialog {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let error_msg = self.error_message.clone();
 

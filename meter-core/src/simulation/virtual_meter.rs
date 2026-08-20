@@ -126,6 +126,55 @@ impl VirtualMeter {
             }
         }
 
+        // 2.5. 恢复结算日历史电能数据（settlement_energies）
+        match PersistenceWorker::restore_settlement_energies(pool, &address_str).await {
+            Ok(settlement_energies_raw) => {
+                if !settlement_energies_raw.is_empty() {
+                    // 转换类型：(u8, u8, u8) -> (u8, EnergyType, u8)
+                    use super::state::EnergyType;
+                    let mut settlement_energies = std::collections::HashMap::new();
+                    
+                    for ((settlement_day, energy_kind_u8, rate_index), value) in settlement_energies_raw {
+                        // 将 u8 转换为 EnergyType（须与 EnergyType 的判别值定义
+                        // 及写入侧 `energy_type as u8` 完全一致，否则重启后会把
+                        // 无功象限/视在电能的结算日历史错配到别的类型）
+                        let energy_type = match energy_kind_u8 {
+                            1 => EnergyType::ForwardActive,
+                            2 => EnergyType::ReverseActive,
+                            3 => EnergyType::ForwardReactive,
+                            4 => EnergyType::ReverseReactive,
+                            5 => EnergyType::CombinedActive,
+                            6 => EnergyType::Quadrant1Reactive,
+                            7 => EnergyType::Quadrant2Reactive,
+                            8 => EnergyType::Quadrant3Reactive,
+                            9 => EnergyType::Quadrant4Reactive,
+                            10 => EnergyType::ForwardApparent,
+                            11 => EnergyType::ReverseApparent,
+                            _ => {
+                                eprintln!(
+                                    "Warning: Unknown energy_kind {} in settlement_energies, skipping",
+                                    energy_kind_u8
+                                );
+                                continue;
+                            }
+                        };
+                        
+                        settlement_energies.insert((settlement_day, energy_type, rate_index), value);
+                    }
+                    
+                    self.state.settlement_energies = settlement_energies;
+                    println!(
+                        "[VirtualMeter] Restored {} settlement energy records",
+                        self.state.settlement_energies.len()
+                    );
+                }
+            }
+            Err(e) => {
+                // 非致命错误，只记录警告，不阻止启动
+                eprintln!("Warning: Failed to restore settlement_energies: {}", e);
+            }
+        }
+
         // 3. 恢复表配置（仿真参数 / 冻结模式 / 结算日 / 负荷记录配置）
         //
         // 对应 admin 命令实时下发时写的那份数据（save_simulation_config /
@@ -729,8 +778,13 @@ impl VirtualMeter {
     /// 3. 如果有待处理的冻结，异步生成快照
     /// 4. 检查电能寄存器是否需要 flush
     pub fn tick(&mut self, elapsed: std::time::Duration, time_scale: f64) {
-        // PhysicsEngine 更新 MeterState
-        self.physics.tick(&mut self.state, elapsed, time_scale);
+        // PhysicsEngine 更新 MeterState（返回是否发生了结算日转存）
+        let settlement_rolled_over = self.physics.tick(&mut self.state, elapsed, time_scale);
+
+        // 检查结算日转存并持久化
+        if settlement_rolled_over {
+            self.check_settlement_rollover();
+        }
 
         // 负荷记录采样（设计 4.5.1.7 / §12.2）：检测采样条件并提交持久化
         let samples = self.physics.check_load_record_sampling(&mut self.state);
@@ -820,7 +874,7 @@ impl VirtualMeter {
 
             // 如果有持久化通道，生成带持久化的快照
             if let Some(persist_tx) = &self.persist_tx {
-                let (occurrence_index, snapshot_row) =
+                let (_occurrence_index, snapshot_row) =
                     self.state.create_freeze_snapshot_with_persist(trigger);
 
                 // 转换地址为字符串
@@ -846,15 +900,15 @@ impl VirtualMeter {
                         address_str,
                         trigger,
                         self.state.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC"),
-                        occurrence_index
+                        _occurrence_index
                     );
                 }
             } else {
                 // 无持久化通道，只生成内存快照
                 let _occurrence_index = self.state.create_freeze_snapshot(trigger);
-                let address_str = address_to_string(&self.state.address);
                 #[cfg(debug_assertions)]
                 {
+                    let address_str = address_to_string(&self.state.address);
                     println!(
                         "[VirtualMeter {}] 冻结快照已生成(仅内存): trigger={:?}, time={}, occurrence={}",
                         address_str,
@@ -985,6 +1039,71 @@ impl VirtualMeter {
         }
     }
 
+    /// 检查结算日转存并持久化
+    ///
+    /// 当 physics.tick() 返回 true 时调用此方法，表示发生了结算日转存
+    /// 将 settlement_energies 中的历史电能数据提交到 PersistenceWorker
+    ///
+    /// settlement_energies 结构：
+    /// - key: (settlement_day, energy_kind, rate_index)
+    ///   - settlement_day: 1=上1结算日, 2=上2结算日, ..., 12=上12结算日
+    ///   - energy_kind: 1=正向有功总, 2=反向有功总, ..., 17=四象限无功（见DI定义）
+    ///   - rate_index: 0=组合, 1=费率1, 2=费率2, ..., 4=费率4
+    /// - value: 电能值（kWh）
+    fn check_settlement_rollover(&mut self) {
+        // 检查是否有持久化通道
+        if self.persist_tx.is_none() {
+            return;
+        }
+
+        // 如果没有历史电能数据，跳过
+        if self.state.settlement_energies.is_empty() {
+            return;
+        }
+
+        // 构造 SettlementEnergiesRow
+        //
+        // state.settlement_energies 的 key 是 (u8, EnergyType, u8)，而
+        // SettlementEnergiesRow.energies 要求 (u8, u8, u8)（energy_kind 用协议
+        // DI2 编码，即 EnergyType 的判别值）——写入前需要做这层转换。
+        use crate::persistence::SettlementEnergiesRow;
+        let address_str = address_to_string(&self.state.address);
+
+        let energies = self
+            .state
+            .settlement_energies
+            .iter()
+            .map(|(&(settlement_day, energy_type, rate_index), &value)| {
+                ((settlement_day, energy_type as u8, rate_index), value)
+            })
+            .collect();
+
+        let row = SettlementEnergiesRow {
+            meter_address: address_str.clone(),
+            energies,
+        };
+
+        // 非阻塞提交结算日电能数据
+        if let Some(persist_tx) = &self.persist_tx {
+            if let Err(e) = persist_tx.try_send(PersistRequest::WriteSettlementEnergies(row)) {
+                warn!(
+                    "[VirtualMeter {}] 结算日电能持久化队列已满或已关闭: {}",
+                    address_str, e
+                );
+            } else {
+                #[cfg(debug_assertions)]
+                {
+                    println!(
+                        "[VirtualMeter {}] 结算日电能已提交持久化: time={}, count={}",
+                        address_str,
+                        self.state.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC"),
+                        self.state.settlement_energies.len()
+                    );
+                }
+            }
+        }
+    }
+
     /// 强制flush电能寄存器（公开方法，用于优雅关闭）
     ///
     /// 返回发送器的clone，调用方可用于等待写入完成
@@ -1064,33 +1183,6 @@ impl Default for EnergyFlushConfig {
 pub use crate::protocol::format::{
     format_address as address_to_string, parse_address as string_to_address,
 };
-
-/// 解析负荷记录读取命令的时间范围字段（5 字节 BCD：mm hh DD MM YY，低字段先传）
-fn parse_load_profile_time(data: &[u8]) -> Result<chrono::DateTime<chrono::Utc>, String> {
-    use crate::protocol::format::bcd_to_u64;
-
-    if data.len() != 5 {
-        return Err("负荷记录时间字段长度错误".to_string());
-    }
-
-    let mm = bcd_to_u64(&data[0..1]).map_err(|e| e.to_string())? as u32;
-    let hh = bcd_to_u64(&data[1..2]).map_err(|e| e.to_string())? as u32;
-    let dd = bcd_to_u64(&data[2..3]).map_err(|e| e.to_string())? as u32;
-    let month = bcd_to_u64(&data[3..4]).map_err(|e| e.to_string())? as u32;
-    let yy = bcd_to_u64(&data[4..5]).map_err(|e| e.to_string())? as i32;
-    let year = 2000 + yy;
-
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(year, month, dd, hh, mm, 0)
-        .single()
-        .ok_or_else(|| {
-            format!(
-                "无效的负荷记录时间：{:04}-{:02}-{:02} {:02}:{:02}",
-                year, month, dd, hh, mm
-            )
-        })
-}
 
 #[cfg(test)]
 mod tests {

@@ -25,7 +25,6 @@ mod load_profile;
 mod parameter;
 
 use super::state::{EnergyType, MeterState};
-use chrono::{Datelike, Timelike};
 
 /// DI 数据处理器 - 无状态的纯映射层
 ///
@@ -145,7 +144,7 @@ impl DIHandler {
                         // data[3] = ww 星期，暂不使用
 
                         // 更新虚拟时钟的日期部分（保持时分秒不变）
-                        use chrono::{Datelike, Utc, TimeZone, Timelike};
+                        use chrono::{Utc, TimeZone, Timelike};
                         let current = state.virtual_time;
                         let year = 2000 + yy;
 
@@ -356,6 +355,50 @@ impl DIHandler {
             }
 
             // ========================================
+            // 结算日设置 (04-00-0B-01~03)，DDhh，2字节BCD
+            //
+            // 结算日存储冻结（(上N结算日)电能，DI3=00 DI0=01~0C）由
+            // MeterState::settlement_rollover_if_due() 在虚拟时钟越过此处配置的
+            // 结算日 DD 日 hh 时边界时自动触发转存，此处只负责写入触发条件本身。
+            // ========================================
+            (0x00, 0x0B) => {
+                let idx = match di[0] {
+                    idx @ 0x01..=0x03 => idx as usize - 1,
+                    _ => {
+                        return Err(format!(
+                            "DI {:02X}{:02X}{:02X}{:02X} 暂不支持写入",
+                            di[3], di[2], di[1], di[0]
+                        ))
+                    }
+                };
+                if data.len() != 2 {
+                    return Err(format!("数据长度错误：期望2字节(DDhh)，实际{}字节", data.len()));
+                }
+                let day_bcd = data[0];
+                let hour_bcd = data[1];
+                // 9999（两字节均为 0x99）表示未设置该结算日
+                if day_bcd == 0x99 && hour_bcd == 0x99 {
+                    state.settlement_days[idx] = 0;
+                    state.settlement_hours[idx] = 0;
+                    return Ok(());
+                }
+                let day = encoding::bcd_to_decimal(day_bcd);
+                let hour = encoding::bcd_to_decimal(hour_bcd);
+                if day < 1 || day > 28 {
+                    return Err(format!(
+                        "结算日日期无效: {} (应为01~28，或9999表示未设置)",
+                        day
+                    ));
+                }
+                if hour > 23 {
+                    return Err(format!("结算日小时无效: {} (应为00~23)", hour));
+                }
+                state.settlement_days[idx] = day;
+                state.settlement_hours[idx] = hour;
+                Ok(())
+            }
+
+            // ========================================
             // 其他不支持写入的DI2
             // ========================================
             _ => Err(format!(
@@ -412,12 +455,16 @@ impl DIHandler {
     }
 }
 
+#[cfg(test)]
 mod tests {
-    use super::encoding::encode_bcd_current;
+    use chrono::Datelike;
+
+use super::encoding::encode_bcd_current;
     use super::encoding::encode_bcd_energy;
     use super::encoding::encode_bcd_voltage;
     use super::encoding::to_bcd;
     use super::*;
+    use chrono::Timelike;
 
     #[test]
     fn test_encode_bcd() {
@@ -496,6 +543,52 @@ mod tests {
             (state.get_settlement_energy(1, EnergyType::ForwardActive, None) - 100.0).abs() < 1e-9
         );
         let _ = state.virtual_time.day();
+    }
+
+    #[test]
+    fn test_write_settlement_day_config() {
+        let mut state = MeterState::default();
+        let handler = DIHandler::new();
+
+        // 写入 04-00-0B-01：每月第1结算日 = 15日8时（DDhh BCD：15 08）
+        assert!(handler
+            .handle_write([0x01, 0x0B, 0x00, 0x04], &[0x15, 0x08], &mut state)
+            .is_ok());
+        assert_eq!(state.settlement_days[0], 15);
+        assert_eq!(state.settlement_hours[0], 8);
+
+        // 读回验证与写入一致 (04-00-0B-01 读格式为 DDhh 两字节BCD)
+        let result = handler
+            .handle_read([0x01, 0x0B, 0x00, 0x04], &state)
+            .unwrap();
+        assert_eq!(result, vec![0x15, 0x08]);
+
+        // 写入 04-00-0B-02：9999 表示取消该结算日设置
+        assert!(handler
+            .handle_write([0x02, 0x0B, 0x00, 0x04], &[0x99, 0x99], &mut state)
+            .is_ok());
+        assert_eq!(state.settlement_days[1], 0);
+        assert_eq!(state.settlement_hours[1], 0);
+
+        // 非法日期（0日、29日以上）应报错
+        assert!(handler
+            .handle_write([0x03, 0x0B, 0x00, 0x04], &[0x00, 0x08], &mut state)
+            .is_err());
+        assert!(handler
+            .handle_write([0x03, 0x0B, 0x00, 0x04], &[0x29, 0x08], &mut state)
+            .is_err());
+        // 非法小时（24时以上）应报错
+        assert!(handler
+            .handle_write([0x03, 0x0B, 0x00, 0x04], &[0x01, 0x24], &mut state)
+            .is_err());
+        // 数据长度错误应报错
+        assert!(handler
+            .handle_write([0x01, 0x0B, 0x00, 0x04], &[0x15], &mut state)
+            .is_err());
+        // 序号越界（idx=4）应报错
+        assert!(handler
+            .handle_write([0x04, 0x0B, 0x00, 0x04], &[0x15, 0x08], &mut state)
+            .is_err());
     }
 
     #[test]

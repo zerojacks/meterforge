@@ -123,7 +123,6 @@ impl DIHandler {
             };
 
             // 第一类不需要时间范围，使用虚拟时间作为占位
-            let now = state.virtual_time;
             return self
                 .handle_load_profile_read_async(
                     di,
@@ -162,7 +161,7 @@ impl DIHandler {
     pub async fn handle_load_profile_read_async(
         &self,
         di: [u8; 4],
-        state: &MeterState,
+        _state: &MeterState,
         address: &str,
         db_pool: &sqlx::SqlitePool,
         time_param: Option<&[u8]>,

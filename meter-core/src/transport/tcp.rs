@@ -121,7 +121,6 @@ impl TcpConnection {
         let write_desc = description.clone();
         let read_buffer_size = config.read_buffer_size;
         let frame_timeout = config.frame_timeout;
-        let shutdown = Arc::clone(&config.shutdown);
         let log_service = config.log_service.clone();
         let read_log = log_service.clone();
         let write_log = log_service.clone();
@@ -355,7 +354,6 @@ impl TcpChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[tokio::test]
     async fn test_extract_frame_simple() {

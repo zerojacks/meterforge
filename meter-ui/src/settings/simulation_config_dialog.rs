@@ -584,7 +584,7 @@ impl SimulationConfigPanel {
 }
 
 impl Render for SimulationConfigPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let error = self.error.clone();
         let row = |label: &'static str, state: &Entity<InputState>| {
