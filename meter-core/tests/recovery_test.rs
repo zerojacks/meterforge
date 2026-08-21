@@ -106,9 +106,15 @@ async fn test_energy_register_recovery() {
 
     // 保存虚拟时钟
     let virtual_time = meter.state().virtual_time;
-    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time, 1.0)
-        .await
-        .unwrap();
+    PersistenceWorker::save_virtual_time(
+        &pool,
+        &address_str,
+        virtual_time,
+        Utc::now().timestamp_millis(),
+        1.0,
+    )
+    .await
+    .unwrap();
 
     // 等待写入完成
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -240,9 +246,15 @@ async fn test_full_lifecycle_with_recovery() {
         .unwrap();
 
     let virtual_time1 = meter1.state().virtual_time;
-    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time1, 1.0)
-        .await
-        .unwrap();
+    PersistenceWorker::save_virtual_time(
+        &pool,
+        &address_str,
+        virtual_time1,
+        Utc::now().timestamp_millis(),
+        1.0,
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
@@ -271,6 +283,144 @@ async fn test_full_lifecycle_with_recovery() {
     );
 
     println!("✓ 完整生命周期测试通过（运行->保存->重启->恢复->继续运行）");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_virtual_time_catch_up_after_downtime() {
+    let (_temp_dir, pool, _config) = setup_test_db().await;
+
+    // 模拟一次"10 秒前退出、倍速 60 运行"的停机：保存虚拟时间时把锚点
+    // 写成 10 秒前，重启恢复时应补 10s × 60 = 600s 虚拟时间
+    let meter_config = VirtualMeterConfig::default();
+    let meter = VirtualMeter::new(meter_config.clone());
+    let address_str = address_to_string(&meter.address());
+    let virtual_time = meter.state().virtual_time;
+
+    let downtime_ms = 10_000_i64;
+    let anchor_ms = Utc::now().timestamp_millis() - downtime_ms;
+    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time, anchor_ms, 60.0)
+        .await
+        .unwrap();
+
+    // 模拟重启恢复
+    let mut meter2 = VirtualMeter::new(meter_config.clone());
+    assert!(
+        meter2.restore_from_database(&pool).await.unwrap(),
+        "应该成功恢复数据"
+    );
+
+    let catch_up_ms =
+        meter2.state().virtual_time.timestamp_millis() - virtual_time.timestamp_millis();
+    let expected_ms = downtime_ms as f64 * 60.0;
+    assert!(
+        ((catch_up_ms as f64) - expected_ms).abs() < 10_000.0,
+        "停机补时应约为 {}ms（真实停机 {}ms × 倍速60），实际 {}ms",
+        expected_ms,
+        downtime_ms,
+        catch_up_ms
+    );
+
+    println!("✓ 停机补时测试通过：虚拟时钟补了 {}ms", catch_up_ms);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_virtual_time_no_catch_up_without_anchor() {
+    let (_temp_dir, pool, _config) = setup_test_db().await;
+
+    // 老库升级场景：virtual_time_synced_at_ms 还没有写过（NULL），
+    // 恢复时应跳过补时，原样使用 virtual_time
+    let meter_config = VirtualMeterConfig::default();
+    let meter = VirtualMeter::new(meter_config.clone());
+    let address_str = address_to_string(&meter.address());
+    let virtual_time = meter.state().virtual_time;
+
+    PersistenceWorker::save_virtual_time(
+        &pool,
+        &address_str,
+        virtual_time,
+        Utc::now().timestamp_millis(),
+        60.0,
+    )
+    .await
+    .unwrap();
+
+    // 手工抹掉锚点，模拟从旧版本数据库升级上来的行
+    sqlx::query("UPDATE meters SET virtual_time_synced_at_ms = NULL WHERE address = ?")
+        .bind(&address_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut meter2 = VirtualMeter::new(meter_config.clone());
+    assert!(
+        meter2.restore_from_database(&pool).await.unwrap(),
+        "应该成功恢复数据"
+    );
+
+    let diff_ms =
+        (meter2.state().virtual_time.timestamp_millis() - virtual_time.timestamp_millis()).abs();
+    assert!(
+        diff_ms < 2_000,
+        "无锚点时不应补时（倍速60若误补会放大到分钟级），diff={}ms",
+        diff_ms
+    );
+
+    println!("✓ 无锚点跳过补时测试通过");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn test_protocol_parameters_recovery() {
+    let (_temp_dir, pool, _config) = setup_test_db().await;
+
+    let mut passwords = [[0u8; 4]; 10];
+    for (i, pwd) in passwords.iter_mut().enumerate() {
+        *pwd = [i as u8, 0x11, 0x22, 0x33];
+    }
+    let time_slots = vec![(0u8, 0u8, 1u8), (7u8, 30u8, 2u8), (17u8, 0u8, 3u8)];
+
+    let meter_config = VirtualMeterConfig::default();
+    let address_str = address_to_string(&meter_config.address);
+
+    PersistenceWorker::save_protocol_parameters(
+        &pool,
+        &address_str,
+        0x08,
+        &passwords,
+        &time_slots,
+    )
+    .await
+    .unwrap();
+
+    // 保存后应能原样恢复
+    let settings = PersistenceWorker::restore_meter_config(&pool, &address_str)
+        .await
+        .unwrap()
+        .expect("save 后应能读到配置记录");
+    assert_eq!(settings.baudrate, Some(0x08));
+    assert_eq!(settings.passwords, Some(passwords));
+    assert_eq!(settings.tou_time_slots, Some(time_slots.clone()));
+
+    // 应用到新表后内存状态一致
+    let mut meter = VirtualMeter::new(meter_config);
+    meter.apply_persisted_settings(&settings);
+    let state = meter.state();
+    assert_eq!(state.baudrate, 0x08);
+    assert_eq!(state.password_config.passwords, passwords);
+    assert_eq!(state.num_time_slots as usize, time_slots.len());
+    let applied: Vec<(u8, u8, u8)> = state
+        .tou_config
+        .day_table_1
+        .slots
+        .iter()
+        .map(|s| (s.start_hour, s.start_minute, s.rate_number))
+        .collect();
+    assert_eq!(applied, time_slots);
 
     pool.close().await;
 }

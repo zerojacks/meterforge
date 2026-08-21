@@ -183,9 +183,15 @@ async fn test_persistence_worker_final_flush() {
     use meter_core::simulation::virtual_meter::address_to_string;
     let address_str = address_to_string(&meter.address());
     let virtual_time = meter.state().virtual_time;
-    PersistenceWorker::save_virtual_time(&pool, &address_str, virtual_time, 1.0)
-        .await
-        .unwrap();
+    PersistenceWorker::save_virtual_time(
+        &pool,
+        &address_str,
+        virtual_time,
+        chrono::Utc::now().timestamp_millis(),
+        1.0,
+    )
+    .await
+    .unwrap();
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 

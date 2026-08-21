@@ -282,9 +282,20 @@ impl PersistenceWorker {
             PersistRequest::SaveVirtualTime {
                 address,
                 virtual_time,
+                synced_at_ms,
                 time_scale,
                 simulation_config,
-            } => self.save_virtual_time_tx(tx, &address, virtual_time, time_scale, &simulation_config).await,
+            } => {
+                self.save_virtual_time_tx(
+                    tx,
+                    &address,
+                    virtual_time,
+                    synced_at_ms,
+                    time_scale,
+                    &simulation_config,
+                )
+                .await
+            }
         }
     }
 
@@ -606,10 +617,13 @@ impl PersistenceWorker {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         address: &str,
         virtual_time: chrono::DateTime<chrono::Utc>,
+        synced_at_ms: i64,
         time_scale: f64,
         simulation_config: &crate::simulation::SimulationConfig,
     ) -> Result<(), sqlx::Error> {
-        let now_ms = chrono::Utc::now().timestamp_millis();
+        // 锚点由调用方与 virtual_time 同一时刻采集，这里不能用 now()——请求
+        // 经过批量队列后落盘可能延迟，若以落盘时刻为锚点，停机补时会重复
+        // 计入这段队列延迟。
         let virtual_time_ms = virtual_time.timestamp_millis();
 
         // 转换配置参数
@@ -646,6 +660,7 @@ impl PersistenceWorker {
         .to_string();
 
         // 尝试更新现有记录
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let result = sqlx::query(
             r#"
             UPDATE meters
@@ -655,6 +670,7 @@ impl PersistenceWorker {
                 demand_period_min = ?,
                 load_model_json = ?,
                 virtual_time_ms = ?,
+                virtual_time_synced_at_ms = ?,
                 time_scale = ?,
                 rated_frequency_hz = ?,
                 initial_power_factor = ?,
@@ -668,6 +684,7 @@ impl PersistenceWorker {
         .bind(demand_period_min)
         .bind(&load_model_json)
         .bind(virtual_time_ms)
+        .bind(synced_at_ms)
         .bind(time_scale)
         .bind(rated_frequency_hz)
         .bind(initial_power_factor)
@@ -684,8 +701,9 @@ impl PersistenceWorker {
                     address, meter_constant, rated_voltage_mv, rated_current_ma,
                     demand_period_min, sliding_window_min, freeze_mode_word, load_record_mode_word,
                     settlement_days_json, tou_config_json, passwords_json, comm_baud_json, load_model_json,
-                    virtual_time_ms, time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    virtual_time_ms, virtual_time_synced_at_ms, time_scale,
+                    rated_frequency_hz, initial_power_factor, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#
             )
             .bind(address)
@@ -702,6 +720,7 @@ impl PersistenceWorker {
             .bind("{}") // comm_baud_json - 默认空对象
             .bind(load_model_json)
             .bind(virtual_time_ms)
+            .bind(synced_at_ms)
             .bind(time_scale)
             .bind(rated_frequency_hz)
             .bind(initial_power_factor)
@@ -1214,14 +1233,15 @@ impl PersistenceWorker {
 
     /// 从数据库恢复虚拟时钟
     ///
-    /// 读取meters表中保存的virtual_time_ms
+    /// 读取 meters 表中保存的 virtual_time_ms 及其落盘锚点
+    /// virtual_time_synced_at_ms，供调用方计算停机补时。
     pub async fn restore_virtual_time(
         pool: &SqlitePool,
         address: &str,
-    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+    ) -> Result<Option<RestoredVirtualTime>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT virtual_time_ms
+            SELECT virtual_time_ms, virtual_time_synced_at_ms
             FROM meters
             WHERE address = ?
             "#,
@@ -1237,7 +1257,10 @@ impl PersistenceWorker {
                 .ok_or_else(|| sqlx::Error::Protocol("Invalid timestamp".to_string()))?
                 .with_timezone(&chrono::Utc);
 
-            Ok(Some(dt))
+            Ok(Some(RestoredVirtualTime {
+                virtual_time: dt,
+                synced_at_ms: row.get("virtual_time_synced_at_ms"),
+            }))
         } else {
             Ok(None)
         }
@@ -1247,26 +1270,36 @@ impl PersistenceWorker {
     ///
     /// 用于快速保存虚拟时钟状态，不更新其他配置字段
     /// 如需更新完整的仿真配置，请使用 save_simulation_config
+    ///
+    /// `synced_at_ms` 是 `virtual_time` 快照对应的本地真实时间（停机补时锚点），
+    /// 由调用方与 virtual_time 同一时刻采集。
     pub async fn save_virtual_time(
         pool: &SqlitePool,
         address: &str,
         virtual_time: chrono::DateTime<chrono::Utc>,
+        synced_at_ms: i64,
         time_scale: f64,
     ) -> Result<(), sqlx::Error> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let virtual_time_ms = virtual_time.timestamp_millis();
+
+        // UPDATE 对不存在的行是静默空操作（比如电表运行期间从未触发过任何
+        // 配置保存，meters 行还没建），先确保行存在再更新
+        Self::ensure_meter_row(pool, address).await?;
 
         // 只更新虚拟时间和时间倍率，不覆盖其他配置字段
         sqlx::query(
             r#"
             UPDATE meters
             SET virtual_time_ms = ?,
+                virtual_time_synced_at_ms = ?,
                 time_scale = ?,
                 updated_at_ms = ?
             WHERE address = ?
             "#
         )
         .bind(virtual_time_ms)
+        .bind(synced_at_ms)
         .bind(time_scale)
         .bind(now_ms)
         .bind(address)
@@ -1661,6 +1694,47 @@ impl PersistenceWorker {
         Ok(())
     }
 
+    /// 保存或更新协议参数（`comm_baud_json` + `passwords_json` + `tou_config_json["tou"]`）
+    ///
+    /// 虚拟时间不在这里写——它有独立锚点语义（`save_virtual_time`），由调用方处理。
+    pub async fn save_protocol_parameters(
+        pool: &SqlitePool,
+        address: &str,
+        baudrate: u8,
+        passwords: &[[u8; 4]; 10],
+        time_slots: &[(u8, u8, u8)],
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+
+        let mut extra = Self::read_extra_config(pool, address).await?;
+        extra["tou"] = json!({
+            "time_slots": time_slots
+                .iter()
+                .map(|(h, m, r)| [*h, *m, *r])
+                .collect::<Vec<[u8; 3]>>(),
+        });
+
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            r#"
+            UPDATE meters
+            SET comm_baud_json = ?,
+                passwords_json = ?,
+                tou_config_json = ?,
+                updated_at_ms = ?
+            WHERE address = ?
+            "#,
+        )
+        .bind(json!({"baudrate": baudrate}).to_string())
+        .bind(json!({"passwords": passwords}).to_string())
+        .bind(extra.to_string())
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// 从 `meters` 表恢复一表完整配置
     pub async fn restore_meter_config(
         pool: &SqlitePool,
@@ -1671,7 +1745,8 @@ impl PersistenceWorker {
             SELECT meter_constant, rated_voltage_mv, rated_current_ma, demand_period_min,
                    time_scale, rated_frequency_hz, initial_power_factor,
                    load_model_json, settlement_days_json, tou_config_json,
-                   freeze_mode_word, load_record_mode_word
+                   freeze_mode_word, load_record_mode_word,
+                   comm_baud_json, passwords_json
             FROM meters
             WHERE address = ?
             "#,
@@ -1752,6 +1827,53 @@ impl PersistenceWorker {
             }
         }
 
+        // 协议参数（老库从未保存过时保持 None，由调用方沿用默认值）
+        let baudrate: Option<u8> = {
+            let raw: String = row.get("comm_baud_json");
+            serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("baudrate").and_then(|x| x.as_u64()).map(|n| n as u8))
+        };
+        let passwords: Option<[[u8; 4]; 10]> = {
+            let raw: String = row.get("passwords_json");
+            serde_json::from_str::<Value>(&raw).ok().and_then(|v| {
+                let arr = v.get("passwords")?.as_array()?;
+                if arr.len() < 10 {
+                    return None;
+                }
+                let mut out = [[0u8; 4]; 10];
+                for (i, entry) in arr.iter().take(10).enumerate() {
+                    let bytes = entry.as_array()?;
+                    if bytes.len() < 4 {
+                        return None;
+                    }
+                    for (j, byte) in bytes.iter().take(4).enumerate() {
+                        out[i][j] = byte.as_u64()? as u8;
+                    }
+                }
+                Some(out)
+            })
+        };
+        let tou_time_slots: Option<Vec<(u8, u8, u8)>> = extra
+            .get("tou")
+            .and_then(|t| t.get("time_slots"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|slot| {
+                        let bytes = slot.as_array()?;
+                        if bytes.len() < 3 {
+                            return None;
+                        }
+                        Some((
+                            bytes[0].as_u64()? as u8,
+                            bytes[1].as_u64()? as u8,
+                            bytes[2].as_u64()? as u8,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            });
+
         Ok(Some(PersistedMeterSettings {
             simulation,
             timed_freeze_mode: timed_mode,
@@ -1768,6 +1890,9 @@ impl PersistenceWorker {
             load_record_mode_word: load_record_mode_word as u8,
             load_record_start_time,
             load_record_intervals,
+            baudrate,
+            passwords,
+            tou_time_slots,
         }))
     }
 

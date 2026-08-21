@@ -22,6 +22,10 @@ pub struct CommunicationLogPanel {
     pub store: CommunicationLogStore,
     list_state: ListState,
     auto_scroll: bool,
+    /// 是否展示内联的帧解析结果。关闭时每条记录只渲染原始报文，跳过
+    /// `flatten_value_tree` 的构建与整棵解析树的渲染，条目变矮很多、也更省
+    /// CPU——报文量大或者只想看原始收发数据时可以关掉，减少卡顿。
+    show_parsed: bool,
 }
 
 impl CommunicationLogPanel {
@@ -44,6 +48,7 @@ impl CommunicationLogPanel {
             store,
             list_state,
             auto_scroll: true,
+            show_parsed: true,
         }
     }
 
@@ -178,17 +183,21 @@ impl CommunicationLogPanel {
                     .text_color(theme.foreground)
                     .child(hex),
             );
-        if let Some(tree) = &entry.parsed {
-            item = item.child(v_flex().children(
-                flatten_value_tree(tree).into_iter().map(|node| render_flat_node(&node, &theme)),
-            ));
-        } else if !entry.data.is_empty() {
-            item = item.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child("（非完整 DL/T 645-2007 帧，未解析）"),
-            );
+        if self.show_parsed {
+            if let Some(tree) = &entry.parsed {
+                item = item.child(v_flex().children(
+                    flatten_value_tree(tree)
+                        .into_iter()
+                        .map(|node| render_flat_node(&node, &theme)),
+                ));
+            } else if !entry.data.is_empty() {
+                item = item.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("（非完整 DL/T 645-2007 帧，未解析）"),
+                );
+            }
         }
         div()
             .id(("comm-log-item", ix))
@@ -270,6 +279,24 @@ impl Render for CommunicationLogPanel {
                             .text_color(theme.muted_foreground),
                     )
                     .child(div().flex_1())
+                    .child(
+                        Button::new("comm-log-toggle-parse")
+                            .label(if self.show_parsed {
+                                "解析:开"
+                            } else {
+                                "解析:关"
+                            })
+                            .small()
+                            .ghost()
+                            .tooltip("切换是否内联展示帧解析结果，关闭可减少卡顿")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.show_parsed = !this.show_parsed;
+                                // 每条item高度都会因为解析树的有无而变化，
+                                // remeasure 保留滚动位置的同时强制重新测量所有行高。
+                                this.list_state.remeasure();
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("comm-log-auto-scroll")
                             .label(if self.auto_scroll {

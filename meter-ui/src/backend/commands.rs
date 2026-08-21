@@ -138,6 +138,16 @@ impl From<MeterAction> for AdminCommand {
     }
 }
 
+/// 当前表的协议参数（`AdminCommand::GetProtocolParameters` 返回 JSON 的
+/// 反序列化目标），用于"一键同步参数到所有表"读取源表已生效的值。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProtocolParameters {
+    pub virtual_time_ms: i64,
+    pub baudrate: u8,
+    pub passwords: [[u8; 4]; 10],
+    pub time_slots: Vec<(u8, u8, u8)>,
+}
+
 /// Long-lived backend services exposed to the presentation layer.
 ///
 /// Keeping this as one GPUI global makes views easy to construct and test: no
@@ -177,6 +187,75 @@ impl AppBackend {
                 }
             })
             .detach();
+    }
+
+    /// 向所有表（可排除一块，比如同步的源表）广播同一条命令。
+    ///
+    /// 与 `dispatch` 一样 fire-and-forget：命令在各自 MeterActor 的 tokio
+    /// 上下文里执行（含落库），失败只记日志，不阻塞 UI。返回值为目标表数，
+    /// 供调用方提示。
+    pub fn dispatch_all(&self, exclude: Option<&str>, action: MeterAction, cx: &App) -> usize {
+        let targets: Vec<(String, MeterActorHandle)> = self
+            .meters
+            .read()
+            .iter()
+            .filter(|(address, _)| Some(address.as_str()) != exclude)
+            .map(|(address, handle)| (address.clone(), handle.clone()))
+            .collect();
+        let count = targets.len();
+        for (address, handle) in targets {
+            let command = action.clone().into();
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(error) = handle.send_admin_command(command).await {
+                        tracing::warn!(%address, %error, "meter broadcast command failed");
+                    }
+                })
+                .detach();
+        }
+        count
+    }
+
+    /// 一键同步协议参数：读取源表（参数设置页的当前表）已生效的
+    /// 虚拟时间 / 密码 / 通信速率 / 费率时段表，下发给其余所有表。
+    ///
+    /// 只走 mpsc/oneshot 通道；数据库写入在目标表 MeterActor 的 tokio
+    /// 上下文里完成，与 `load_freeze_history` 同一模式。返回成功同步的
+    /// 表数，供 UI 弹通知。
+    pub fn sync_protocol_parameters(
+        &self,
+        source: String,
+        cx: &App,
+    ) -> Task<Result<usize, String>> {
+        let meters = self.meters.read().clone();
+        let Some(origin) = meters.get(&source).cloned() else {
+            return Task::ready(Err(format!("meter {source} not found")));
+        };
+        let targets: Vec<(String, MeterActorHandle)> = meters
+            .into_iter()
+            .filter(|(address, _)| address != &source)
+            .collect();
+        cx.background_executor().spawn(async move {
+            let json = origin
+                .send_admin_command(AdminCommand::GetProtocolParameters)
+                .await?;
+            let params: ProtocolParameters =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+            let command = AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms: params.virtual_time_ms,
+                baudrate: params.baudrate,
+                passwords: params.passwords,
+                time_slots: params.time_slots,
+            };
+            let mut synced = 0usize;
+            for (address, handle) in targets {
+                match handle.send_admin_command(command.clone()).await {
+                    Ok(_) => synced += 1,
+                    Err(error) => tracing::warn!(%address, %error, "参数同步失败"),
+                }
+            }
+            Ok(synced)
+        })
     }
 
     /// 异步加载某块表的冻结历史（内存环形缓冲 + 数据库，已合并去重）。

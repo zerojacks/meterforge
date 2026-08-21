@@ -1389,14 +1389,14 @@ impl Default for MeterState {
 
             // 04-00-04-xx 电表运行参数
             meter_constant: 1600,
-            baudrate: 0x0C,        // 9600 bps
+            baudrate: 0x10,        // 9600 bps（01/02/04/08/10/20 = 600/1200/2400/4800/9600/19200，见 SetBaudrate 校验表）
             rated_voltage: 220000, // 220V (毫伏)
             rated_current: 60000,  // 60A (毫安)
             rated_frequency: 50,   // 50Hz
             demand_period_minutes: 15,
             sliding_window_minutes: 1,
             calibration_pulse_constant: 3200,
-            comm_speed_feature: [0x0C; 5], // 默认全部 9600bps
+            comm_speed_feature: [0x10; 5], // 默认全部 9600bps
 
             // 费率时段参数
             num_rates: 4,
@@ -2122,7 +2122,7 @@ mod tests {
         // 验证基本字段
         assert_eq!(state.address, [0x12, 0x34, 0x56, 0x78, 0x90, 0x12]);
         assert_eq!(state.meter_constant, 1600);
-        assert_eq!(state.baudrate, 0x0C);
+        assert_eq!(state.baudrate, 0x10);
 
         // 验证事件记录初始化
         assert_eq!(state.event_records.len(), 0);

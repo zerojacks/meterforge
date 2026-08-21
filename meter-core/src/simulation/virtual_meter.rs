@@ -84,14 +84,15 @@ impl VirtualMeter {
 
         let address_str = address_to_string(&self.state.address);
 
-        // 1. 恢复虚拟时钟
-        match PersistenceWorker::restore_virtual_time(pool, &address_str).await {
-            Ok(Some(virtual_time)) => {
-                self.state.restore_virtual_time(virtual_time);
+        // 1. 恢复虚拟时钟（含落盘锚点，供步骤 3.5 计算停机补时）
+        let restored_clock = match PersistenceWorker::restore_virtual_time(pool, &address_str).await {
+            Ok(Some(restored)) => {
+                self.state.restore_virtual_time(restored.virtual_time);
                 println!(
                     "[VirtualMeter] Restored virtual_time: {}",
-                    virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC")
+                    restored.virtual_time.with_timezone(&chrono::Utc).format("%Y-%m-%d %H:%M:%S UTC")
                 );
+                Some(restored)
             }
             Ok(None) => {
                 // 数据库中没有此地址的数据，这是正常的（首次启动）
@@ -100,7 +101,7 @@ impl VirtualMeter {
             Err(e) => {
                 return Err(format!("Failed to restore virtual_time: {}", e));
             }
-        }
+        };
 
         // 2. 恢复电能寄存器
         match PersistenceWorker::restore_energy_registers(pool, &address_str).await {
@@ -194,6 +195,36 @@ impl VirtualMeter {
             }
         }
 
+        // 3.5 停机补时：软件关闭期间虚拟时钟不走，重启时按真实流逝时间
+        // × time_scale 一次性补上。
+        //
+        // - 补时必须放在步骤 3 之后：time_scale 要等配置恢复完成才是权威值。
+        // - 老数据库升级上来没有锚点（synced_at_ms = NULL）时跳过补时，
+        //   按旧逻辑原样使用 virtual_time（见 RestoredVirtualTime 的说明）。
+        // - 真实流逝时间取 max(0)，防御系统时钟被回拨导致负数。
+        // - 这里只补时钟本身，不回补停机期间的电能/冻结/负荷记录：那些
+        //   数据依赖逐 tick 的物理仿真，无法从单个时间差可靠重建。
+        if let Some(clock) = restored_clock {
+            if let Some(synced_at_ms) = clock.synced_at_ms {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let elapsed_real_ms = (now_ms - synced_at_ms).max(0);
+                let catch_up_ms =
+                    (elapsed_real_ms as f64 * self.state.simulation_time_scale).round() as i64;
+                if catch_up_ms > 0 {
+                    self.state.virtual_time += chrono::Duration::milliseconds(catch_up_ms);
+                    println!(
+                        "[VirtualMeter] Caught up virtual_time by {}ms (downtime {}ms × scale {}): now {}",
+                        catch_up_ms,
+                        elapsed_real_ms,
+                        self.state.simulation_time_scale,
+                        self.state.virtual_time
+                            .with_timezone(&chrono::Utc)
+                            .format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                }
+            }
+        }
+
         // 4. 恢复负荷记录采样状态（每个类别的最后一次采样时间）
         //
         // 防止重启后重复采样：如果重启前刚采样过 12:15，重启后在 12:16
@@ -266,6 +297,28 @@ impl VirtualMeter {
         state.load_record_config.mode_word = settings.load_record_mode_word;
         state.load_record_start_time = settings.load_record_start_time;
         state.load_record_config.intervals = settings.load_record_intervals;
+
+        // 协议参数（老库没保存过时是 None，保留出厂默认值）
+        if let Some(baudrate) = settings.baudrate {
+            state.baudrate = baudrate;
+        }
+        if let Some(passwords) = settings.passwords {
+            state.password_config.passwords = passwords;
+        }
+        if let Some(time_slots) = &settings.tou_time_slots {
+            // 与 SetTouConfig 实时应用时同样的上限约束
+            if time_slots.len() <= 14 {
+                state.tou_config.day_table_1.slots = time_slots
+                    .iter()
+                    .map(|(h, m, r)| crate::simulation::state::TimeSlot {
+                        start_hour: *h,
+                        start_minute: *m,
+                        rate_number: *r,
+                    })
+                    .collect();
+                state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
+            }
+        }
     }
 
     /// 创建默认虚拟电表
@@ -1001,6 +1054,9 @@ impl VirtualMeter {
             }
 
             // 同时保存虚拟时间和配置（防止异常退出时丢失）
+            // 锚点必须与读取 state.virtual_time 同一时刻采集，这样停机补时
+            // 计算才不会引入额外的误差
+            let synced_at_ms = chrono::Utc::now().timestamp_millis();
             let simulation_config = crate::simulation::SimulationConfig {
                 load_model: self.config.physics_config.load_model.clone(),
                 rated_voltage: self.state.rated_voltage as f64 / 1000.0, // 毫伏转伏
@@ -1011,10 +1067,11 @@ impl VirtualMeter {
                 demand_period_minutes: self.state.demand_period_minutes,
                 time_scale: self.state.simulation_time_scale,
             };
-            
+
             if let Err(e) = persist_tx.try_send(PersistRequest::SaveVirtualTime {
                 address: address_str.clone(),
                 virtual_time: self.state.virtual_time.with_timezone(&chrono::Utc),
+                synced_at_ms,
                 time_scale: self.state.simulation_time_scale,
                 simulation_config,
             }) {
@@ -1119,11 +1176,14 @@ impl VirtualMeter {
         use crate::persistence::PersistenceWorker;
 
         let address_str = address_to_string(&self.state.address);
+        // 锚点与读取 state.virtual_time 同一时刻采集
+        let synced_at_ms = chrono::Utc::now().timestamp_millis();
         PersistenceWorker::save_virtual_time(
             pool,
             &address_str,
             self.state.virtual_time,
-            1.0, // time_scale默认为1.0
+            synced_at_ms,
+            self.state.simulation_time_scale,
         )
         .await
         .map_err(|e| format!("Failed to save virtual time: {}", e))

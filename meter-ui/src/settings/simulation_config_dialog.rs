@@ -1,9 +1,11 @@
 //! 仿真与电表参数配置面板：物理引擎参数、冻结、结算日、负荷记录、故障注入。
+use super::parameter_dialogs::SyncConfirmDialog;
 use gpui::*;
 use gpui_component::select::{Select, SelectState};
 use gpui_component::{
     button::{Button, ButtonVariants},
     form::field,
+    group_box::{GroupBox, GroupBoxVariants as _},
     input::{Input, InputState},
     label::Label,
     *,
@@ -181,6 +183,8 @@ pub struct SimulationConfigPanel {
 
     error: Option<SharedString>,
     on_confirm: Option<Box<dyn Fn(MeterSettings, &mut Window, &mut Context<Self>) + 'static>>,
+    /// "应用到所有表"回调：参数与 on_confirm 相同，由详情视图广播给全部表。
+    on_sync_all: Option<Box<dyn Fn(MeterSettings, &mut Window, &mut Context<Self>) + 'static>>,
     on_inject_fault: Option<Box<dyn Fn(u8, u8, bool, &mut Window, &mut Context<Self>) + 'static>>,
 }
 
@@ -330,6 +334,7 @@ impl SimulationConfigPanel {
 
             error: None,
             on_confirm: None,
+            on_sync_all: None,
             on_inject_fault: None,
         }
     }
@@ -339,6 +344,16 @@ impl SimulationConfigPanel {
         F: Fn(MeterSettings, &mut Window, &mut Context<Self>) + 'static,
     {
         self.on_confirm = Some(Box::new(callback));
+        self
+    }
+
+    /// "应用到所有表"回调：确认对话框通过后触发，携带与"应用配置"
+    /// 相同的完整表单配置。
+    pub fn on_sync_all<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(MeterSettings, &mut Window, &mut Context<Self>) + 'static,
+    {
+        self.on_sync_all = Some(Box::new(callback));
         self
     }
 
@@ -397,8 +412,9 @@ impl SimulationConfigPanel {
         .map(|parts: [u8; 5]| parts.map(to_bcd))
     }
 
-    fn confirm(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let result = (|| -> Result<MeterSettings, String> {
+    /// 校验表单并收集完整配置；"应用配置"与"应用到所有表"共用。
+    fn collect_settings(&self, cx: &App) -> Result<MeterSettings, String> {
+        (|| -> Result<MeterSettings, String> {
             // ── 物理引擎 ──
             let fixed: f64 = self.value(&self.fixed_factor, cx, "固定负荷系数")?;
             let profile = self
@@ -510,9 +526,11 @@ impl SimulationConfigPanel {
                 settlement_hours,
                 load_record,
             })
-        })();
+        })()
+    }
 
-        match result {
+    fn confirm(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match self.collect_settings(cx) {
             Ok(settings) => {
                 self.error = None;
                 if let Some(callback) = self.on_confirm.take() {
@@ -525,6 +543,46 @@ impl SimulationConfigPanel {
                 cx.notify();
             }
         }
+    }
+
+    /// "应用到所有表"：先走与"应用配置"完全相同的校验，通过后弹确认框，
+    /// 用户确认再触发 on_sync_all（由详情视图广播给全部表，含当前表）。
+    fn sync_to_all(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = match self.collect_settings(cx) {
+            Ok(settings) => {
+                self.error = None;
+                settings
+            }
+            Err(error) => {
+                self.error = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        // 对话框确认发生在 SyncConfirmDialog 的上下文里，需要回到本面板
+        // 才能拿到 on_sync_all 回调。
+        let this = cx.entity();
+        let dialog_entity = cx.new(|_| {
+            SyncConfirmDialog::new(
+                "同步模拟配置到所有表",
+                "确认后将当前表单的模拟计算、冻结、结算日、负荷记录配置覆盖所有电表（含当前表），并写入数据库。此操作不可撤销。",
+                "应用到所有表",
+            )
+            .on_confirm(move |window, cx| {
+                this.update(cx, |panel, cx| {
+                    if let Some(callback) = panel.on_sync_all.take() {
+                        callback(settings.clone(), window, cx);
+                        panel.on_sync_all = Some(callback);
+                    }
+                });
+            })
+        });
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("同步模拟配置").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
+        });
     }
 
     /// 解析当前选择的故障 (event_type, phase)
@@ -729,11 +787,19 @@ impl Render for SimulationConfigPanel {
                     .child(Label::new(message).text_sm().text_color(theme.danger))
             }))
             .child(
-                h_flex().justify_end().child(
-                    Button::new("apply-simulation-config")
-                        .label("应用配置")
-                        .on_click(cx.listener(Self::confirm)),
-                ),
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("apply-simulation-config-to-all")
+                            .label("应用到所有表")
+                            .on_click(cx.listener(Self::sync_to_all)),
+                    )
+                    .child(
+                        Button::new("apply-simulation-config")
+                            .label("应用配置")
+                            .on_click(cx.listener(Self::confirm)),
+                    ),
             )
     }
 }

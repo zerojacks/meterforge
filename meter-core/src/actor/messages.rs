@@ -159,6 +159,28 @@ pub enum AdminCommand {
     /// 返回值为 JSON 字符串，反序列化为 `Vec<crate::snapshot::LoadRecordSummary>`。
     /// 用于 UI 切换到"负荷记录"标签页时按需加载。
     LoadLoadProfileHistory { max_records: u32 },
+
+    /// 读取协议参数（虚拟时间 / 10 级密码 / 通信速率 / 费率时段表）
+    ///
+    /// 返回值为 JSON 字符串，供 UI 在"一键同步参数到所有表"时读取源表
+    /// 当前已生效的参数，再通过 `ApplyProtocolParameters` 下发给其他表。
+    GetProtocolParameters,
+
+    /// 原子应用一组协议参数（虚拟时间 / 密码 / 通信速率 / 费率时段表）
+    ///
+    /// 用于把源表的参数同步到目标表：直接写内存状态并落库
+    /// （`comm_baud_json` / `passwords_json` / `tou_config_json["tou"]` /
+    /// 虚拟时间），绕过协议层的逐项写入流程。
+    ApplyProtocolParameters {
+        /// 虚拟时间（Unix 毫秒时间戳）
+        virtual_time_ms: i64,
+        /// 通信速率编码（04-00-07-03）
+        baudrate: u8,
+        /// 10 级密码（04-00-0C-01~0A）
+        passwords: [[u8; 4]; 10],
+        /// 费率时段表（起始时/起始分/费率号，04-00-02-xx / 04-00-03-xx）
+        time_slots: Vec<(u8, u8, u8)>,
+    },
 }
 
 /// Tick 消息（全局时钟广播）

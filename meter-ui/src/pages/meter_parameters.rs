@@ -6,44 +6,33 @@ use gpui::*;
 use gpui_component::{
     badge::Badge,
     button::{Button, ButtonVariants},
+    group_box::{GroupBox, GroupBoxVariants as _},
     label::Label,
     *,
 };
 
-fn card(
-    title: &str,
-    description: &str,
-    action: Button,
-    content: impl IntoElement,
-    theme: &Theme,
-) -> impl IntoElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap_4()
-        .p_5()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.background)
+/// 用 gpui-component 的 `GroupBox`（outline 变体）承担卡片的边框/圆角/
+/// 内边距/主题色，而不是手写 `div().border_1().rounded_lg()...` 那一整条
+/// 链。相比之前手搓的版本，这里 `card()` 自身构建时的链式调用层数少了
+/// 很多——每张卡片自己的栈帧变小了，不再是"只把外层 render() 那条链
+/// 装箱、卡片自己内部还是又长又深"的半吊子优化。
+/// 仍然返回 `AnyElement`：即便单张卡片本身已经轻量很多，`render()` 里
+/// 逐张 `.child(card(...))` 叠加时也不需要外层继续携带每张卡片的具体
+/// 类型，装箱成本很低，稳妥起见保留。
+fn card(title: &str, description: &str, action: Button, content: impl IntoElement) -> AnyElement {
+    GroupBox::new()
+        .outline()
+        .title(title.to_string())
         .child(
             h_flex()
                 .justify_between()
                 .items_center()
-                .child(
-                    v_flex()
-                        .gap_1()
-                        .child(Label::new(title).text_lg().font_semibold())
-                        .child(
-                            Label::new(description)
-                                .text_sm()
-                                .text_color(theme.muted_foreground),
-                        ),
-                )
+                .gap_2()
+                .child(Label::new(description).text_sm())
                 .child(action),
         )
         .child(content)
+        .into_any_element()
 }
 
 pub fn render(
@@ -73,6 +62,18 @@ pub fn render(
                 .text_sm()
                 .text_color(theme.muted_foreground),
         )
+        .child(card(
+            "一键同步参数到所有表",
+            "时间 / 密码 / 通信速率 / 费率时段表",
+            Button::new("sync-parameters-dialog")
+                .label("一键同步到所有表")
+                .small()
+                .on_click(cx.listener(MeterDetailView::show_sync_parameters_dialog)),
+            Label::new(
+                "将当前表已生效的协议参数同步到其他所有电表，并写入数据库（重启后保持）。 ",
+            )
+            .text_sm(),
+        ))
         .child(card(
             "电表时间设置",
             "DI: 04-00-01-01 / 04-00-01-02",
@@ -124,7 +125,6 @@ pub fn render(
                             .font_semibold(),
                         ),
                 ),
-            theme,
         ))
         .child(card(
             "最大需量清零",
@@ -135,7 +135,6 @@ pub fn render(
                 .danger()
                 .on_click(cx.listener(MeterDetailView::show_clear_demand_dialog)),
             Label::new(format!("当前最大需量：{:.4} kW", snapshot.max_demand_kw)).text_sm(),
-            theme,
         ))
         .child(card(
             "密码管理",
@@ -145,7 +144,6 @@ pub fn render(
                 .small()
                 .on_click(cx.listener(MeterDetailView::show_password_dialog)),
             Label::new("支持普通、抄表与管理员权限密码。 ").text_sm(),
-            theme,
         ))
         .child(card(
             "通信速率",
@@ -158,7 +156,6 @@ pub fn render(
                     move |view, _, window, cx| view.show_baudrate_dialog(&snapshot, window, cx)
                 })),
             Label::new("通信速率修改将由电表核心状态保存。 ").text_sm(),
-            theme,
         ))
         .child(card(
             "费率时段表",
@@ -168,7 +165,6 @@ pub fn render(
                 .small()
                 .on_click(cx.listener(MeterDetailView::show_tou_dialog)),
             Label::new("配置日时段与费率编号。 ").text_sm(),
-            theme,
         ))
         .child(card(
             "电表清零",
@@ -181,6 +177,5 @@ pub fn render(
             Label::new("清零电能与最大需量；事件和冻结记录会保留。 ")
                 .text_sm()
                 .text_color(theme.danger),
-            theme,
         ))
 }

@@ -1,0 +1,11 @@
+-- 虚拟时钟的"补时锚点"：记录 virtual_time_ms 落盘时对应的本地真实时间
+--
+-- 背景：meters.updated_at_ms 是个被很多写路径共用的"最后修改时间"字段
+-- （结算日/费率时段表/负荷记录模式/冻结模式等配置保存都会更新它），
+-- 不能保证它和 virtual_time_ms 是同一时刻的快照——如果拿它来算"软件关闭
+-- 期间过了多久真实时间"，可能被一次无关的配置修改污染，算出错误的补时量。
+--
+-- virtual_time_synced_at_ms 只在保存虚拟时间的两个路径（周期性 flush /
+-- 退出时的 graceful shutdown）里跟 virtual_time_ms 同时写入，保证两者
+-- 严格对应同一时刻，补时计算才靠得住。
+ALTER TABLE meters ADD COLUMN virtual_time_synced_at_ms INTEGER;

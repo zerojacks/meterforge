@@ -1207,6 +1207,7 @@ impl MeterActor {
                         .state_mut()
                         .password_config
                         .set_password(level, &pwd);
+                    self.persist_protocol_parameters().await;
                     Ok(format!("Password level {} updated", level))
                 }
             }
@@ -1214,6 +1215,7 @@ impl MeterActor {
             AdminCommand::SetBaudrate { baudrate } => match baudrate {
                 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 => {
                     self.meter.state_mut().baudrate = baudrate;
+                    self.persist_protocol_parameters().await;
                     Ok(format!("Baudrate set to 0x{:02X}", baudrate))
                 }
                 _ => Err("Invalid baudrate code".to_string()),
@@ -1246,9 +1248,12 @@ impl MeterActor {
                             rate_number: r,
                         })
                         .collect();
-                    let state = self.meter.state_mut();
-                    state.tou_config.day_table_1.slots = slots;
-                    state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
+                    {
+                        let state = self.meter.state_mut();
+                        state.tou_config.day_table_1.slots = slots;
+                        state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
+                    }
+                    self.persist_protocol_parameters().await;
                     Ok("TOU config updated".to_string())
                 }
             }
@@ -1437,12 +1442,112 @@ impl MeterActor {
             AdminCommand::LoadLoadProfileHistory { max_records } => {
                 self.load_load_profile_history(max_records).await
             }
+
+            AdminCommand::GetProtocolParameters => {
+                let state = self.meter.state();
+                let time_slots: Vec<[u8; 3]> = state
+                    .tou_config
+                    .day_table_1
+                    .slots
+                    .iter()
+                    .map(|s| [s.start_hour, s.start_minute, s.rate_number])
+                    .collect();
+                let snapshot = serde_json::json!({
+                    "virtual_time_ms": state.virtual_time.timestamp_millis(),
+                    "baudrate": state.baudrate,
+                    "passwords": state.password_config.passwords,
+                    "time_slots": time_slots,
+                });
+                Ok(snapshot.to_string())
+            }
+
+            AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms,
+                baudrate,
+                passwords,
+                time_slots,
+            } => {
+                const VALID_BAUDRATES: [u8; 6] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20];
+                if !VALID_BAUDRATES.contains(&baudrate) {
+                    Err("Invalid baudrate code".to_string())
+                } else if time_slots.len() > 14 {
+                    Err("Too many time slots (max 14)".to_string())
+                } else {
+                    match chrono::DateTime::from_timestamp_millis(virtual_time_ms) {
+                        None => Err("Invalid virtual_time_ms".to_string()),
+                        Some(dt) => {
+                            use crate::simulation::state::TimeSlot;
+                            {
+                                let state = self.meter.state_mut();
+                                state.virtual_time = dt;
+                                state.baudrate = baudrate;
+                                state.password_config.passwords = passwords;
+                                state.tou_config.day_table_1.slots = time_slots
+                                    .into_iter()
+                                    .map(|(h, m, r)| TimeSlot {
+                                        start_hour: h,
+                                        start_minute: m,
+                                        rate_number: r,
+                                    })
+                                    .collect();
+                                state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
+                            }
+                            self.persist_protocol_parameters().await;
+                            // 虚拟时间单独走 save_virtual_time（带停机补时锚点语义）
+                            if let Some(pool) = &self.config.db_pool {
+                                let addr = format_address(&self.config.address);
+                                if let Err(e) = self.meter.save_virtual_time(pool).await {
+                                    warn!(
+                                        "[MeterActor {}] Failed to persist virtual time: {}",
+                                        addr, e
+                                    );
+                                }
+                            }
+                            Ok("Protocol parameters applied".to_string())
+                        }
+                    }
+                }
+            }
         };
 
         // 命令执行后立即推送快照（反映最新状态）
         self.push_snapshot();
 
         let _ = reply_tx.send(result);
+    }
+
+    /// 把当前协议参数（波特率 / 密码 / 费率时段表）落库。
+    ///
+    /// 单表编辑命令（SetBaudrate / ChangePassword / SetTouConfig）与批量同步
+    /// （ApplyProtocolParameters）共用，保证任何一条修改路径重启后都不丢。
+    /// 失败只告警不报错——内存状态已经改了，不应该因为落库失败回滚。
+    async fn persist_protocol_parameters(&self) {
+        let Some(pool) = &self.config.db_pool else {
+            return;
+        };
+        let addr = format_address(&self.config.address);
+        let state = self.meter.state();
+        let time_slots: Vec<(u8, u8, u8)> = state
+            .tou_config
+            .day_table_1
+            .slots
+            .iter()
+            .map(|s| (s.start_hour, s.start_minute, s.rate_number))
+            .collect();
+        if let Err(e) = crate::persistence::PersistenceWorker::save_protocol_parameters(
+            pool,
+            &addr,
+            state.baudrate,
+            &state.password_config.passwords,
+            &time_slots,
+        )
+        .await
+        {
+            warn!(
+                "[MeterActor {}] Failed to persist protocol parameters: {}",
+                addr, e
+            );
+        }
     }
 
     /// 加载冻结历史：合并内存环形缓冲 + 数据库历史，去重后按时间倒序，
@@ -2725,6 +2830,104 @@ mod tests {
         assert_eq!(response_frame.data.len(), 0, "事件清零正常应答应该无数据");
 
         // 关闭
+        let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn test_protocol_parameters_round_trip() {
+        let (_tick_tx, tick_rx) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let config = VirtualMeterConfig::default();
+        let address = config.address;
+        let actor = MeterActor::new(
+            VirtualMeter::new(config),
+            tick_rx,
+            cmd_rx,
+            MeterActorConfig {
+                address,
+                ..Default::default()
+            },
+        );
+        let handle = MeterActorHandle::new(cmd_tx, address);
+        tokio::spawn(async move { actor.run().await });
+
+        let mut passwords = [[0u8; 4]; 10];
+        for (i, pwd) in passwords.iter_mut().enumerate() {
+            *pwd = [i as u8, 0xA1, 0xB2, 0xC3];
+        }
+        let time_slots = vec![(0u8, 0u8, 1u8), (8u8, 30u8, 2u8), (18u8, 0u8, 1u8)];
+        let virtual_time_ms = 1_760_000_000_000i64;
+
+        handle
+            .send_admin_command(AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms,
+                baudrate: 0x08,
+                passwords,
+                time_slots,
+            })
+            .await
+            .unwrap();
+
+        let json = handle
+            .send_admin_command(AdminCommand::GetProtocolParameters)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["virtual_time_ms"].as_i64().unwrap(), virtual_time_ms);
+        assert_eq!(parsed["baudrate"].as_u64().unwrap(), 0x08);
+        assert_eq!(parsed["passwords"][3].to_string(), "[3,161,178,195]");
+        assert_eq!(parsed["time_slots"].to_string(), "[[0,0,1],[8,30,2],[18,0,1]]");
+
+        let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_protocol_parameters_rejects_invalid_values() {
+        let (_tick_tx, tick_rx) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let config = VirtualMeterConfig::default();
+        let address = config.address;
+        let actor = MeterActor::new(
+            VirtualMeter::new(config),
+            tick_rx,
+            cmd_rx,
+            MeterActorConfig {
+                address,
+                ..Default::default()
+            },
+        );
+        let handle = MeterActorHandle::new(cmd_tx, address);
+        tokio::spawn(async move { actor.run().await });
+
+        // 非法波特率编码
+        let result = handle
+            .send_admin_command(AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms: 0,
+                baudrate: 0x03,
+                passwords: [[0; 4]; 10],
+                time_slots: vec![],
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(msg) if msg.contains("Invalid baudrate")),
+            "got: {result:?}"
+        );
+
+        // 超过 14 个费率时段
+        let result = handle
+            .send_admin_command(AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms: 0,
+                baudrate: 0x04,
+                passwords: [[0; 4]; 10],
+                time_slots: vec![(0, 0, 1); 15],
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(msg) if msg.contains("time slots")),
+            "got: {result:?}"
+        );
+
         let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
     }
 }

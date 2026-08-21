@@ -23,6 +23,24 @@ pub struct PersistedMeterSettings {
     pub load_record_mode_word: u8,
     pub load_record_start_time: [u8; 4],
     pub load_record_intervals: [u16; 8],
+    /// 通信速率（`comm_baud_json`）。老库从未写过时为 `None`，保持默认。
+    pub baudrate: Option<u8>,
+    /// 10 级密码（`passwords_json`）。老库从未写过时为 `None`，保持默认。
+    pub passwords: Option<[[u8; 4]; 10]>,
+    /// 费率时段表（`tou_config_json["tou"]`）。老库从未写过时为 `None`，保持默认。
+    pub tou_time_slots: Option<Vec<(u8, u8, u8)>>,
+}
+
+/// 从数据库恢复出的虚拟时钟状态：virtual_time 本身 + 落盘时对应的本地
+/// （真实）时间锚点。
+///
+/// `synced_at_ms` 在老数据库升级上来、还没写过新列（`virtual_time_synced_at_ms`）
+/// 的情况下会是 `None`——调用方此时不知道 virtual_time 是多久之前保存的，
+/// 应该跳过补时、按老逻辑原样使用。
+#[derive(Debug, Clone, Copy)]
+pub struct RestoredVirtualTime {
+    pub virtual_time: DateTime<Utc>,
+    pub synced_at_ms: Option<i64>,
 }
 
 /// 持久化请求枚举
@@ -47,9 +65,14 @@ pub enum PersistRequest {
     WriteSettlementEnergies(SettlementEnergiesRow),
 
     /// 保存虚拟时间和配置（用于定期持久化，防止异常退出丢失）
+    ///
+    /// `synced_at_ms` 是 `virtual_time` 快照对应的本地真实时间（落盘锚点），
+    /// 必须与读取 `virtual_time` 同一时刻采集，供下次启动时计算停机补时
+    /// （见 `RestoredVirtualTime`）。
     SaveVirtualTime {
         address: String,
         virtual_time: DateTime<Utc>,
+        synced_at_ms: i64,
         time_scale: f64,
         simulation_config: SimulationConfig,
     },
