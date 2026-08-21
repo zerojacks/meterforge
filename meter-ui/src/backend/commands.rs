@@ -241,15 +241,17 @@ impl AppBackend {
                 .await?;
             let params: ProtocolParameters =
                 serde_json::from_str(&json).map_err(|e| e.to_string())?;
-            let command = AdminCommand::ApplyProtocolParameters {
-                virtual_time_ms: params.virtual_time_ms,
-                baudrate: params.baudrate,
-                passwords: params.passwords,
-                time_slots: params.time_slots,
-            };
             let mut synced = 0usize;
             for (address, handle) in targets {
-                match handle.send_admin_command(command.clone()).await {
+                // 每个目标表单独记录下发时刻，让接收端按传输耗时补偿虚拟时间。
+                let command = AdminCommand::ApplyProtocolParameters {
+                    virtual_time_ms: params.virtual_time_ms,
+                    sent_at_ms: chrono::Utc::now().timestamp_millis(),
+                    baudrate: params.baudrate,
+                    passwords: params.passwords,
+                    time_slots: params.time_slots.clone(),
+                };
+                match handle.send_admin_command(command).await {
                     Ok(_) => synced += 1,
                     Err(error) => tracing::warn!(%address, %error, "参数同步失败"),
                 }
@@ -308,14 +310,14 @@ impl AppBackend {
     pub fn shutdown_all_meters(&self) {
         let meters = self.meters.read().clone();
         let connections = self.connections.clone();
-        
+
         tracing::info!("开始优雅关闭所有电表，共 {} 个", meters.len());
-        
+
         // 使用 ConnectionManager 的 runtime 来执行关闭操作
         // 使用 block_on 而不是 spawn，确保在函数返回前完成
         connections.runtime_handle().block_on(async move {
             let mut shutdown_tasks = Vec::new();
-            
+
             for (address, handle) in meters {
                 let addr = address.clone();
                 let h = handle.clone();
@@ -330,14 +332,14 @@ impl AppBackend {
                     }
                 });
             }
-            
+
             // 等待所有关闭命令发送完成
             futures::future::join_all(shutdown_tasks).await;
-            
+
             // 给 Actor 一点时间完成 graceful_shutdown
             // 这里只需要很短的时间，因为 save_virtual_time 是直接数据库操作
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-            
+
             tracing::info!("所有电表关闭完成");
         });
     }

@@ -6,6 +6,7 @@ use meter_core::ConnectionStatus;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// 实时曲线采样点（保留最近 HISTORY_CAPACITY 次快照）
@@ -23,8 +24,16 @@ pub struct RealtimeSample {
     pub reactive_power_kvar: f32,
 }
 
-/// 实时曲线最多保留的采样点数（约 2 分钟 @1s 推送间隔）
-const HISTORY_CAPACITY: usize = 120;
+/// UI 刷新与虚拟表走时使用的全局 tick 间隔。
+pub const UI_TICK_INTERVAL_MS: u64 = 250;
+pub const UI_TICK_INTERVAL: Duration = Duration::from_millis(UI_TICK_INTERVAL_MS);
+
+/// 实时曲线固定保留的历史时长（秒）。
+const REALTIME_HISTORY_WINDOW_SECS: u64 = 120;
+
+/// 实时曲线最多保留的采样点数（固定约 2 分钟窗口，随 tick 间隔自动调整）。
+const HISTORY_CAPACITY: usize =
+    ((REALTIME_HISTORY_WINDOW_SECS * 1000) / UI_TICK_INTERVAL_MS) as usize;
 
 /// 单表状态 Entity
 ///

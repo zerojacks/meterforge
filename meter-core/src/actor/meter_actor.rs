@@ -1463,6 +1463,7 @@ impl MeterActor {
 
             AdminCommand::ApplyProtocolParameters {
                 virtual_time_ms,
+                sent_at_ms,
                 baudrate,
                 passwords,
                 time_slots,
@@ -1473,8 +1474,15 @@ impl MeterActor {
                 } else if time_slots.len() > 14 {
                     Err("Too many time slots (max 14)".to_string())
                 } else {
-                    match chrono::DateTime::from_timestamp_millis(virtual_time_ms) {
-                        None => Err("Invalid virtual_time_ms".to_string()),
+                    let received_at_ms = chrono::Utc::now().timestamp_millis();
+                    let transport_elapsed_ms =
+                        received_at_ms.checked_sub(sent_at_ms).unwrap_or(0).max(0);
+                    let compensated_virtual_time_ms =
+                        virtual_time_ms.checked_add(transport_elapsed_ms);
+                    match compensated_virtual_time_ms
+                        .and_then(chrono::DateTime::from_timestamp_millis)
+                    {
+                        None => Err("Invalid compensated virtual_time_ms".to_string()),
                         Some(dt) => {
                             use crate::simulation::state::TimeSlot;
                             {
@@ -2861,6 +2869,7 @@ mod tests {
         handle
             .send_admin_command(AdminCommand::ApplyProtocolParameters {
                 virtual_time_ms,
+                sent_at_ms: chrono::Utc::now().timestamp_millis(),
                 baudrate: 0x08,
                 passwords,
                 time_slots,
@@ -2874,10 +2883,59 @@ mod tests {
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["virtual_time_ms"].as_i64().unwrap(), virtual_time_ms);
+        assert!(parsed["virtual_time_ms"].as_i64().unwrap() >= virtual_time_ms);
         assert_eq!(parsed["baudrate"].as_u64().unwrap(), 0x08);
         assert_eq!(parsed["passwords"][3].to_string(), "[3,161,178,195]");
         assert_eq!(parsed["time_slots"].to_string(), "[[0,0,1],[8,30,2],[18,0,1]]");
+
+        let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn test_apply_protocol_parameters_compensates_transport_delay() {
+        let (_tick_tx, tick_rx) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let config = VirtualMeterConfig::default();
+        let address = config.address;
+        let actor = MeterActor::new(
+            VirtualMeter::new(config),
+            tick_rx,
+            cmd_rx,
+            MeterActorConfig {
+                address,
+                ..Default::default()
+            },
+        );
+        let handle = MeterActorHandle::new(cmd_tx, address);
+        tokio::spawn(async move { actor.run().await });
+
+        let virtual_time_ms = 1_760_000_000_000i64;
+        let sent_at_ms = chrono::Utc::now().timestamp_millis() - 250;
+        let lower_bound = virtual_time_ms + (chrono::Utc::now().timestamp_millis() - sent_at_ms);
+
+        handle
+            .send_admin_command(AdminCommand::ApplyProtocolParameters {
+                virtual_time_ms,
+                sent_at_ms,
+                baudrate: 0x04,
+                passwords: [[0; 4]; 10],
+                time_slots: vec![],
+            })
+            .await
+            .unwrap();
+
+        let upper_bound = virtual_time_ms + (chrono::Utc::now().timestamp_millis() - sent_at_ms);
+        let json = handle
+            .send_admin_command(AdminCommand::GetProtocolParameters)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let applied_virtual_time_ms = parsed["virtual_time_ms"].as_i64().unwrap();
+
+        assert!(
+            (lower_bound..=upper_bound).contains(&applied_virtual_time_ms),
+            "applied virtual time {applied_virtual_time_ms} not in [{lower_bound}, {upper_bound}]"
+        );
 
         let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
     }
@@ -2904,6 +2962,7 @@ mod tests {
         let result = handle
             .send_admin_command(AdminCommand::ApplyProtocolParameters {
                 virtual_time_ms: 0,
+                sent_at_ms: 0,
                 baudrate: 0x03,
                 passwords: [[0; 4]; 10],
                 time_slots: vec![],
@@ -2918,6 +2977,7 @@ mod tests {
         let result = handle
             .send_admin_command(AdminCommand::ApplyProtocolParameters {
                 virtual_time_ms: 0,
+                sent_at_ms: 0,
                 baudrate: 0x04,
                 passwords: [[0; 4]; 10],
                 time_slots: vec![(0, 0, 1); 15],

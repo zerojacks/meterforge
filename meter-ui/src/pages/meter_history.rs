@@ -6,9 +6,9 @@
 
 use chrono::Utc;
 use gpui::*;
+use gpui_component::StyledExt;
 use gpui_component::{h_flex, label::Label, Theme};
 use meter_core::snapshot::{EventSnapshot, FreezeSnapshotSummary, LoadRecordSnapshot};
-use gpui_component::StyledExt;
 /// 冻结触发类型筛选（对应协议 DI2 的几大类），用于“冻结数据”tab 的筛选条。
 ///
 /// `Settlement` 对应 DI2=00（`FreezeTrigger::Timed`），即协议里的“定时冻结”，
@@ -153,8 +153,12 @@ pub fn render_load_record_item(record: &LoadRecordSnapshot, theme: &Theme) -> im
             h_flex()
                 .justify_between()
                 .child(
-                    Label::new(format!("{} · {}", record.class_label(), record.blocks_summary()))
-                        .font_semibold(),
+                    Label::new(format!(
+                        "{} · {}",
+                        record.class_label(),
+                        record.blocks_summary()
+                    ))
+                    .font_semibold(),
                 )
                 .child(
                     Label::new(time)
@@ -205,13 +209,9 @@ pub fn render_freeze_item(freeze: &FreezeSnapshotSummary, theme: &Theme) -> impl
                 .gap_6()
                 .flex_wrap()
                 .child(
-                    Label::new(format!("正向有功 {:.2} kWh", freeze.forward_active_kwh))
-                        .text_sm(),
+                    Label::new(format!("正向有功 {:.2} kWh", freeze.forward_active_kwh)).text_sm(),
                 )
-                .child(
-                    Label::new(format!("最大需量 {:.4} kW", freeze.max_demand_kw))
-                        .text_sm(),
-                )
+                .child(Label::new(format!("最大需量 {:.4} kW", freeze.max_demand_kw)).text_sm())
                 .child(
                     Label::new(format!(
                         "A相电压 {} V",

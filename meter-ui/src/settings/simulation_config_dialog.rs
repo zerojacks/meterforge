@@ -641,22 +641,18 @@ impl SimulationConfigPanel {
     }
 }
 
+fn section_box(title: &str, content: impl IntoElement) -> AnyElement {
+    GroupBox::new()
+        .outline()
+        .title(title.to_string())
+        .child(content)
+        .into_any_element()
+}
+
 impl Render for SimulationConfigPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let error = self.error.clone();
-        let row = |label: &'static str, state: &Entity<InputState>| {
-            field().label(label).child(Input::new(state))
-        };
-        let card = |title: &'static str| {
-            div()
-                .p_5()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .child(Label::new(title).text_lg().font_semibold())
-        };
-        let grid3 = || div().mt_4().grid().grid_cols(3).gap_4();
 
         div()
             .w_full()
@@ -676,102 +672,311 @@ impl Render for SimulationConfigPanel {
                     .flex_col()
                     .gap_4()
                     // ── 负荷与额定值 ──
-                    .child(card("负荷与额定值").child(grid3()
-                        .child(field().label("负荷类型").child(Select::new(&self.profile).w_full()))
-                        .child(row("固定负荷系数（仅固定负荷）", &self.fixed_factor))
-                        .child(row("额定电压 (V)", &self.voltage))
-                        .child(row("额定电流 (A)", &self.current))
-                        .child(row("额定频率 (Hz)", &self.frequency))
-                        .child(row("初始功率因数", &self.power_factor))))
+                    .child(section_box(
+                        "负荷与额定值",
+                        div()
+                            .grid()
+                            .grid_cols(3)
+                            .gap_4()
+                            .child(
+                                field()
+                                    .label("负荷类型")
+                                    .child(Select::new(&self.profile).w_full()),
+                            )
+                            .child(
+                                field()
+                                    .label("固定负荷系数（仅固定负荷）")
+                                    .child(Input::new(&self.fixed_factor)),
+                            )
+                            .child(field().label("额定电压 (V)").child(Input::new(&self.voltage)))
+                            .child(field().label("额定电流 (A)").child(Input::new(&self.current)))
+                            .child(
+                                field()
+                                    .label("额定频率 (Hz)")
+                                    .child(Input::new(&self.frequency)),
+                            )
+                            .child(
+                                field()
+                                    .label("初始功率因数")
+                                    .child(Input::new(&self.power_factor)),
+                            ),
+                    ))
                     // ── 计量与需量 ──
-                    .child(card("计量与需量").child(grid3()
-                        .child(row("电表常数 (imp/kWh)", &self.meter_constant))
-                        .child(row("需量周期 (min)", &self.demand_period))
-                        .child(row("时间倍率", &self.time_scale))
-                        .child(row("功率因数下限", &self.power_factor_min))
-                        .child(row("功率因数上限", &self.power_factor_max))))
+                    .child(section_box(
+                        "计量与需量",
+                        div()
+                            .grid()
+                            .grid_cols(3)
+                            .gap_4()
+                            .child(
+                                field()
+                                    .label("电表常数 (imp/kWh)")
+                                    .child(Input::new(&self.meter_constant)),
+                            )
+                            .child(
+                                field()
+                                    .label("需量周期 (min)")
+                                    .child(Input::new(&self.demand_period)),
+                            )
+                            .child(field().label("时间倍率").child(Input::new(&self.time_scale)))
+                            .child(
+                                field()
+                                    .label("功率因数下限")
+                                    .child(Input::new(&self.power_factor_min)),
+                            )
+                            .child(
+                                field()
+                                    .label("功率因数上限")
+                                    .child(Input::new(&self.power_factor_max)),
+                            ),
+                    ))
                     // ── 波动与三相修正 ──
-                    .child(card("波动与三相修正").child(grid3()
-                        .child(row("电压波动 (V)", &self.voltage_noise))
-                        .child(row("频率波动 (Hz)", &self.frequency_noise))
-                        .child(row("功率因数波动", &self.power_factor_noise))
-                        .child(row("A相电流系数", &self.phase_a))
-                        .child(row("B相电流系数", &self.phase_b))
-                        .child(row("C相电流系数", &self.phase_c))))
+                    .child(section_box(
+                        "波动与三相修正",
+                        div()
+                            .grid()
+                            .grid_cols(3)
+                            .gap_4()
+                            .child(
+                                field()
+                                    .label("电压波动 (V)")
+                                    .child(Input::new(&self.voltage_noise)),
+                            )
+                            .child(
+                                field()
+                                    .label("频率波动 (Hz)")
+                                    .child(Input::new(&self.frequency_noise)),
+                            )
+                            .child(
+                                field()
+                                    .label("功率因数波动")
+                                    .child(Input::new(&self.power_factor_noise)),
+                            )
+                            .child(
+                                field()
+                                    .label("A相电流系数")
+                                    .child(Input::new(&self.phase_a)),
+                            )
+                            .child(
+                                field()
+                                    .label("B相电流系数")
+                                    .child(Input::new(&self.phase_b)),
+                            )
+                            .child(
+                                field()
+                                    .label("C相电流系数")
+                                    .child(Input::new(&self.phase_c)),
+                            ),
+                    ))
                     // ── 冻结配置 ──
-                    .child(card("冻结配置 (04-00-09 / 04-00-12)").child(
-                        div().mt_4().flex().flex_col().gap_4()
-                            .child(grid3()
-                                .child(field().label("定时冻结周期").child(Select::new(&self.timed_mode).w_full()))
-                                .child(row("日冻结时间 时 (0~23)", &self.daily_time_hh))
-                                .child(row("日冻结时间 分 (0~59)", &self.daily_time_mm)))
-                            .child(grid3()
-                                .child(row("瞬时冻结模式字 (位图)", &self.instant_mode))
-                                .child(row("约定冻结模式字 (位图)", &self.appointment_mode))
-                                .child(row("日冻结模式字 (位图)", &self.daily_mode))
-                                .child(row("整点冻结模式字 (位图)", &self.hourly_mode))
-                                .child(row("整点冻结间隔 (分钟)", &self.hourly_interval)))
-                            .child(div().flex().flex_col().gap_2()
-                                .child(Label::new("整点冻结起始时间（年 月 日 时 分）").text_sm())
-                                .child(h_flex().gap_2()
-                                    .children(self.hourly_start.iter().map(|state| Input::new(state).w(px(64.)))))
-                                .child(Label::new("约定冻结时间（年 月 日 时 分）").text_sm())
-                                .child(h_flex().gap_2()
-                                    .children(self.appointment_time.iter().map(|state| Input::new(state).w(px(64.)))))),
+                    .child(section_box(
+                        "冻结配置 (04-00-09 / 04-00-12)",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .grid()
+                                    .grid_cols(3)
+                                    .gap_4()
+                                    .child(
+                                        field()
+                                            .label("定时冻结周期")
+                                            .child(Select::new(&self.timed_mode).w_full()),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("日冻结时间 时 (0~23)")
+                                            .child(Input::new(&self.daily_time_hh)),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("日冻结时间 分 (0~59)")
+                                            .child(Input::new(&self.daily_time_mm)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .grid()
+                                    .grid_cols(3)
+                                    .gap_4()
+                                    .child(
+                                        field()
+                                            .label("瞬时冻结模式字 (位图)")
+                                            .child(Input::new(&self.instant_mode)),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("约定冻结模式字 (位图)")
+                                            .child(Input::new(&self.appointment_mode)),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("日冻结模式字 (位图)")
+                                            .child(Input::new(&self.daily_mode)),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("整点冻结模式字 (位图)")
+                                            .child(Input::new(&self.hourly_mode)),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("整点冻结间隔 (分钟)")
+                                            .child(Input::new(&self.hourly_interval)),
+                                    ),
+                            )
+                            .child(
+                                field().label("整点冻结起始时间（年 月 日 时 分）").child(
+                                    h_flex().gap_2().children(
+                                        self.hourly_start
+                                            .iter()
+                                            .map(|state| Input::new(state).w(px(64.))),
+                                    ),
+                                ),
+                            )
+                            .child(
+                                field().label("约定冻结时间（年 月 日 时 分）").child(
+                                    h_flex().gap_2().children(
+                                        self.appointment_time
+                                            .iter()
+                                            .map(|state| Input::new(state).w(px(64.))),
+                                    ),
+                                ),
+                            ),
                     ))
                     // ── 结算日 ──
-                    .child(card("结算日 (04-00-0B，DDhh，DD=0 不启用)").child(
-                        div().mt_4().flex().flex_col().gap_2()
-                            .children((0..3usize).map(|i| {
-                                h_flex().gap_2().items_center()
-                                    .child(Label::new(format!("结算日 {}", i + 1)).w(px(72.)))
+                    .child(section_box(
+                        "结算日 (04-00-0B，DDhh，DD=0 不启用)",
+                        div().flex().flex_col().gap_3().children((0..3usize).map(|i| {
+                            field().label(format!("结算日 {}", i + 1)).child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
                                     .child(Input::new(&self.settlement_day[i]).w(px(80.)))
                                     .child(Label::new("日"))
                                     .child(Input::new(&self.settlement_hour[i]).w(px(80.)))
-                                    .child(Label::new("时"))
-                            })),
+                                    .child(Label::new("时")),
+                            )
+                        })),
                     ))
                     // ── 负荷记录 ──
-                    .child(card("负荷记录 (04-00-09-01 / 04-00-0A)").child(
-                        div().mt_4().flex().flex_col().gap_4()
-                            .child(grid3()
-                                .child(row("负荷记录模式字 (位图)", &self.load_mode_word)))
-                            .child(div().flex().flex_col().gap_2()
-                                .child(Label::new("负荷记录起始时间（月 日 时 分）").text_sm())
-                                .child(h_flex().gap_2()
-                                    .children(self.load_start.iter().map(|state| Input::new(state).w(px(64.))))))
-                            .child(grid3()
-                                .child(row("第1类间隔 (min)", &self.load_intervals[0]))
-                                .child(row("第2类间隔 (min)", &self.load_intervals[1]))
-                                .child(row("第3类间隔 (min)", &self.load_intervals[2]))
-                                .child(row("第4类间隔 (min)", &self.load_intervals[3]))
-                                .child(row("第5类间隔 (min)", &self.load_intervals[4]))
-                                .child(row("第6类间隔 (min)", &self.load_intervals[5]))
-                                .child(row("第7类间隔 (min)", &self.load_intervals[6]))
-                                .child(row("第8类间隔 (min)", &self.load_intervals[7]))),
+                    .child(section_box(
+                        "负荷记录 (04-00-09-01 / 04-00-0A)",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .grid()
+                                    .grid_cols(3)
+                                    .gap_4()
+                                    .child(
+                                        field()
+                                            .label("负荷记录模式字 (位图)")
+                                            .child(Input::new(&self.load_mode_word)),
+                                    ),
+                            )
+                            .child(
+                                field().label("负荷记录起始时间（月 日 时 分）").child(
+                                    h_flex().gap_2().children(
+                                        self.load_start
+                                            .iter()
+                                            .map(|state| Input::new(state).w(px(64.))),
+                                    ),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .grid()
+                                    .grid_cols(3)
+                                    .gap_4()
+                                    .child(
+                                        field()
+                                            .label("第1类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[0])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第2类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[1])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第3类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[2])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第4类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[3])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第5类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[4])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第6类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[5])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第7类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[6])),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("第8类间隔 (min)")
+                                            .child(Input::new(&self.load_intervals[7])),
+                                    ),
+                            ),
                     ))
                     // ── 故障注入 ──
-                    .child(card("故障注入（附录 A.4 事件生成，立即生效）").child(
-                        div().mt_4().flex().flex_col().gap_4()
-                            .child(div().grid().grid_cols(3).gap_4()
-                                .child(field().label("故障类型").child(Select::new(&self.fault_kind).w_full()))
-                                .child(field().label("相别").child(Select::new(&self.fault_phase).w_full())))
-                            .child(h_flex().gap_2()
-                                .child(
-                                    Button::new("inject-fault-on")
-                                        .label("注入故障")
-                                        .danger()
-                                        .on_click(cx.listener(move |this, e, w, c| {
-                                            this.inject_fault(true, e, w, c)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("inject-fault-off")
-                                        .label("解除故障")
-                                        .on_click(cx.listener(move |this, e, w, c| {
-                                            this.inject_fault(false, e, w, c)
-                                        })),
-                                ))
+                    .child(section_box(
+                        "故障注入（附录 A.4 事件生成，立即生效）",
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .grid()
+                                    .grid_cols(3)
+                                    .gap_4()
+                                    .child(
+                                        field()
+                                            .label("故障类型")
+                                            .child(Select::new(&self.fault_kind).w_full()),
+                                    )
+                                    .child(
+                                        field()
+                                            .label("相别")
+                                            .child(Select::new(&self.fault_phase).w_full()),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("inject-fault-on")
+                                            .label("注入故障")
+                                            .danger()
+                                            .on_click(cx.listener(move |this, e, w, c| {
+                                                this.inject_fault(true, e, w, c)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("inject-fault-off")
+                                            .label("解除故障")
+                                            .on_click(cx.listener(move |this, e, w, c| {
+                                                this.inject_fault(false, e, w, c)
+                                            })),
+                                    ),
+                            )
                             .child(
                                 Label::new("注入后物理引擎持续生成对应事件记录；解除后回到阈值自动判定，事件自然结束并回填电能增量。相别事件需选择 A/B/C 相，系统级事件选择“不分相”。")
                                     .text_xs()

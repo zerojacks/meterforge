@@ -95,12 +95,15 @@ fn chart_card(
     theme: &Theme,
 ) -> impl IntoElement {
     // 动态计算刻度间隔，使 x 轴上大约显示 6 个刻度（样本少时显示全部）
-    let tick_margin = if samples.len() <= 6 { 1 } else { (samples.len() + 5) / 6 };
+    let tick_margin = if samples.len() <= 6 {
+        1
+    } else {
+        (samples.len() + 5) / 6
+    };
 
     let mut chart = AreaChart::new(samples)
         .x(|d: &RealtimeSample| time_label(d.time_ms))
         .tick_margin(tick_margin);
-
 
     // 启用交互提示需要为图表设置唯一 id，否则图表保持非交互状态。
     // 使用第一条序列的 id 作为图表 id（调用方保证每个图表序列 id 在页面内唯一）。
@@ -128,19 +131,17 @@ fn chart_card(
                 .items_center()
                 .justify_between()
                 .child(Label::new(title).text_sm().font_semibold())
-                .child(
-                    h_flex().gap_3().children(series.iter().map(|s| {
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(div().size(px(8.)).rounded_full().bg(s.color))
-                            .child(
-                                Label::new(s.name)
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground),
-                            )
-                    })),
-                ),
+                .child(h_flex().gap_3().children(series.iter().map(|s| {
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(div().size(px(8.)).rounded_full().bg(s.color))
+                        .child(
+                            Label::new(s.name)
+                                .text_xs()
+                                .text_color(theme.muted_foreground),
+                        )
+                }))),
         )
         .child(div().flex_1().min_h_0().child(chart))
 }

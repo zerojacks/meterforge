@@ -4,8 +4,7 @@ use gpui_component::{
     clipboard::Clipboard,
     h_flex,
     label::Label,
-    v_flex,
-    ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
+    v_flex, ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
 };
 use meter_core::communication_log::{flatten_value_tree, CommunicationLogEntry};
 use std::sync::{Arc, Mutex};
@@ -95,12 +94,7 @@ impl CommunicationLogPanel {
         }
     }
 
-    fn render_item(
-        &mut self,
-        ix: usize,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_item(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
         let entry = match self.store.0.lock() {
             Ok(entries) => match entries.get(ix) {
@@ -185,11 +179,13 @@ impl CommunicationLogPanel {
             );
         if self.show_parsed {
             if let Some(tree) = &entry.parsed {
-                item = item.child(v_flex().children(
-                    flatten_value_tree(tree)
-                        .into_iter()
-                        .map(|node| render_flat_node(&node, &theme)),
-                ));
+                item = item.child(
+                    v_flex().children(
+                        flatten_value_tree(tree)
+                            .into_iter()
+                            .map(|node| render_flat_node(&node, &theme)),
+                    ),
+                );
             } else if !entry.data.is_empty() {
                 item = item.child(
                     div()

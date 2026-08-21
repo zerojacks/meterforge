@@ -69,10 +69,8 @@ pub fn render(
                 .label("一键同步到所有表")
                 .small()
                 .on_click(cx.listener(MeterDetailView::show_sync_parameters_dialog)),
-            Label::new(
-                "将当前表已生效的协议参数同步到其他所有电表，并写入数据库（重启后保持）。 ",
-            )
-            .text_sm(),
+            Label::new("将当前表已生效的协议参数同步到其他所有电表，并写入数据库（重启后保持）。 ")
+                .text_sm(),
         ))
         .child(card(
             "电表时间设置",

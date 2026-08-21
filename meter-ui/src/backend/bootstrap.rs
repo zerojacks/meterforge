@@ -1,6 +1,6 @@
 use super::AppBackend;
 use crate::{
-    state::{MeterRegistry, MeterState},
+    state::{MeterRegistry, MeterState, UI_TICK_INTERVAL},
     types::MeterSnapshot,
 };
 use gpui::*;
@@ -16,7 +16,7 @@ use meter_core::{
 use parking_lot::RwLock;
 use rand::Rng;
 use sqlx::SqlitePool;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 /// 是否为这次启动打开持久化。
@@ -53,7 +53,14 @@ pub fn initialize(registry: Arc<RwLock<MeterRegistry>>, cx: &mut App) {
 
     let handles = Arc::new(RwLock::new(HashMap::new()));
     cx.set_global(AppBackend::new(connections.clone(), handles.clone()));
-    spawn_demo_meters(registry, core_registry, handles, connections, persistence, cx);
+    spawn_demo_meters(
+        registry,
+        core_registry,
+        handles,
+        connections,
+        persistence,
+        cx,
+    );
 }
 
 fn spawn_demo_meters(
@@ -61,7 +68,10 @@ fn spawn_demo_meters(
     core_registry: Arc<Mutex<CoreMeterRegistry>>,
     handles: Arc<RwLock<HashMap<String, MeterActorHandle>>>,
     connections: ConnectionManager,
-    persistence: Option<(SqlitePool, mpsc::Sender<meter_core::persistence::PersistRequest>)>,
+    persistence: Option<(
+        SqlitePool,
+        mpsc::Sender<meter_core::persistence::PersistRequest>,
+    )>,
     cx: &mut App,
 ) {
     let (tick_tx, _) = broadcast::channel::<TickMsg>(16);
@@ -113,14 +123,18 @@ fn spawn_demo_meters(
                     tracing::info!("[bootstrap] 表 {} 是首次启动，使用默认配置", address);
                 }
                 Err(e) => {
-                    tracing::warn!("[bootstrap] 表 {} 恢复数据库状态失败，使用默认配置: {}", address, e);
+                    tracing::warn!(
+                        "[bootstrap] 表 {} 恢复数据库状态失败，使用默认配置: {}",
+                        address,
+                        e
+                    );
                 }
             }
         }
 
         // 用 restore 之后的 virtual_meter 直接算出一份快照给 entity 做初始值，
         // 不要再用 MeterState::new() 的默认快照——MeterActor 要等到第一次
-        // tick（最长 1 秒后）才会通过 snapshot_tx 推送真实数据，UI 里那些
+        // tick（最长一个 UI_TICK_INTERVAL 后）才会通过 snapshot_tx 推送真实数据，UI 里那些
         // 每次渲染都重新读 registry 的页面（实时数据/参数设置等）能在数据
         // 到达后自动刷新，但"模拟配置"这类只在构造时读一次快照来初始化
         // 表单的组件不会自动刷新，会一直停留在这份默认快照上，直到用户切换
@@ -174,9 +188,9 @@ fn spawn_demo_meters(
 
     connections.spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(UI_TICK_INTERVAL).await;
             let _ = tick_tx.send(TickMsg {
-                wall_elapsed: Duration::from_secs(1),
+                wall_elapsed: UI_TICK_INTERVAL,
                 time_scale: 1.0,
             });
         }

@@ -22,8 +22,8 @@ use std::sync::Arc;
 
 fn main() {
     tracing_subscriber::fmt()
-    .with_max_level(tracing::Level::INFO)
-    .init();
+        .with_max_level(tracing::Level::INFO)
+        .init();
     let app = gpui_platform::application().with_assets(Assets);
 
     app.run(move |cx| {
@@ -76,6 +76,6 @@ fn main() {
         })
         .detach();
     });
-    
+
     tracing::info!("应用已退出");
 }

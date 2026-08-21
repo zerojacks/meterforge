@@ -294,8 +294,7 @@ impl MeterDetailView {
             self.load_profile_history_loading = true;
             let address = self.address.clone();
             let backend = cx.global::<AppBackend>().clone();
-            let task =
-                backend.load_load_profile_history(address, LOAD_PROFILE_HISTORY_LIMIT, cx);
+            let task = backend.load_load_profile_history(address, LOAD_PROFILE_HISTORY_LIMIT, cx);
             cx.spawn(async move |this, cx| {
                 let result = task.await;
                 let _ = this.update(cx, |this, cx| {
@@ -348,13 +347,10 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("设置电表时间")
-                .w(px(500.))
-                .content({
-                    let dialog_entity = dialog_entity.clone();
-                    move |content, _, _| content.child(dialog_entity.clone())
-                })
+            dialog.title("设置电表时间").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
         })
     }
 
@@ -380,13 +376,10 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("修改密码")
-                .w(px(500.))
-                .content({
-                    let dialog_entity = dialog_entity.clone();
-                    move |content, _, _| content.child(dialog_entity.clone())
-                })
+            dialog.title("修改密码").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
         })
     }
 
@@ -409,13 +402,10 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("修改通信速率")
-                .w(px(500.))
-                .content({
-                    let dialog_entity = dialog_entity.clone();
-                    move |content, _, _| content.child(dialog_entity.clone())
-                })
+            dialog.title("修改通信速率").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
         })
     }
 
@@ -516,13 +506,10 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title("参数同步")
-                .w(px(500.))
-                .content({
-                    let dialog_entity = dialog_entity.clone();
-                    move |content, _, _| content.child(dialog_entity.clone())
-                })
+            dialog.title("参数同步").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
         })
     }
 
@@ -544,13 +531,10 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .title(title)
-                .w(px(500.))
-                .content({
-                    let dialog_entity = dialog_entity.clone();
-                    move |content, _, _| content.child(dialog_entity.clone())
-                })
+            dialog.title(title).w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
         })
     }
 
@@ -591,7 +575,12 @@ impl MeterDetailView {
         self.events_items = items;
     }
 
-    fn render_event_item(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_event_item(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(event) = self.events_items.get(ix).cloned() else {
             return div().into_any_element();
@@ -634,7 +623,12 @@ impl MeterDetailView {
         self.freezes_items = filtered;
     }
 
-    fn render_freeze_item(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_freeze_item(
+        &mut self,
+        ix: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().clone();
         let Some(freeze) = self.freezes_items.get(ix).cloned() else {
             return div().into_any_element();
@@ -748,19 +742,26 @@ impl MeterDetailView {
         let loading = self.freeze_history_loading && self.freeze_history.is_none();
         let current_filter = self.freeze_filter;
 
-        let filter_bar = h_flex().gap_2().flex_wrap().children(
-            FreezeFilter::ALL.into_iter().enumerate().map(|(idx, filter)| {
-                let selected = filter == current_filter;
-                let btn = Button::new(("freeze-filter", idx))
-                    .label(filter.label())
-                    .small();
-                let btn = if selected { btn.primary() } else { btn.ghost() };
-                btn.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.freeze_filter = filter;
-                    cx.notify();
-                }))
-            }),
-        );
+        let filter_bar =
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children(
+                    FreezeFilter::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, filter)| {
+                            let selected = filter == current_filter;
+                            let btn = Button::new(("freeze-filter", idx))
+                                .label(filter.label())
+                                .small();
+                            let btn = if selected { btn.primary() } else { btn.ghost() };
+                            btn.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.freeze_filter = filter;
+                                cx.notify();
+                            }))
+                        }),
+                );
 
         let mut col = div()
             .flex()
@@ -848,7 +849,11 @@ impl MeterDetailView {
                     .items_center()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(if loading { "加载中…" } else { "暂无负荷记录采样" }),
+                    .child(if loading {
+                        "加载中…"
+                    } else {
+                        "暂无负荷记录采样"
+                    }),
             )
         } else {
             col.child(

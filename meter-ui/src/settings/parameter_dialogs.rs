@@ -1,11 +1,11 @@
 // 参数设置对话框集合
 // 包含时间设置、密码修改、通信速率、费率时段表等所有配置对话框
 
-use chrono::{Datelike, Local, TimeZone, Timelike, Utc};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::form::{field, v_form};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::*;
@@ -22,6 +22,9 @@ pub struct TimeSettingDialog {
     hour_input: Entity<InputState>,
     minute_input: Entity<InputState>,
     second_input: Entity<InputState>,
+    subscriptions: Vec<Subscription>,
+    follow_current_time_on_confirm: bool,
+    syncing_time_fields: bool,
     on_confirm:
         Option<Box<dyn Fn(chrono::DateTime<Utc>, &mut Window, &mut Context<Self>) + 'static>>,
 }
@@ -40,27 +43,7 @@ impl TimeSettingDialog {
         let minute_input = cx.new(|cx| InputState::new(window, cx).placeholder("分"));
         let second_input = cx.new(|cx| InputState::new(window, cx).placeholder("秒"));
 
-        // 设置初始值
-        year_input.update(cx, |state, cx| {
-            state.set_value(current_time.year().to_string(), window, cx);
-        });
-        month_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", current_time.month()), window, cx);
-        });
-        day_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", current_time.day()), window, cx);
-        });
-        hour_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", current_time.hour()), window, cx);
-        });
-        minute_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", current_time.minute()), window, cx);
-        });
-        second_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", current_time.second()), window, cx);
-        });
-
-        Self {
+        let mut dialog = Self {
             focus_handle,
             year_input,
             month_input,
@@ -68,8 +51,14 @@ impl TimeSettingDialog {
             hour_input,
             minute_input,
             second_input,
+            subscriptions: Vec::new(),
+            follow_current_time_on_confirm: false,
+            syncing_time_fields: false,
             on_confirm: None,
-        }
+        };
+        dialog.set_form_time(current_time, false, window, cx);
+        dialog.subscribe_to_inputs(cx);
+        dialog
     }
 
     pub fn on_confirm<F>(mut self, callback: F) -> Self
@@ -80,41 +69,56 @@ impl TimeSettingDialog {
         self
     }
 
-    fn set_current_time(
-        &mut self,
-        _: &gpui::ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let now = Local::now();
-        self.year_input.update(cx, |state, cx| {
-            state.set_value(now.year().to_string(), window, cx);
-        });
-        self.month_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", now.month()), window, cx);
-        });
-        self.day_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", now.day()), window, cx);
-        });
-        self.hour_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", now.hour()), window, cx);
-        });
-        self.minute_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", now.minute()), window, cx);
-        });
-        self.second_input.update(cx, |state, cx| {
-            state.set_value(format!("{:02}", now.second()), window, cx);
-        });
-        cx.notify();
+    fn subscribe_to_inputs(&mut self, cx: &mut Context<Self>) {
+        for input in [
+            self.year_input.clone(),
+            self.month_input.clone(),
+            self.day_input.clone(),
+            self.hour_input.clone(),
+            self.minute_input.clone(),
+            self.second_input.clone(),
+        ] {
+            self.subscriptions
+                .push(cx.subscribe(&input, |this, _, event, cx| {
+                    if matches!(event, InputEvent::Change) && !this.syncing_time_fields {
+                        this.follow_current_time_on_confirm = false;
+                        cx.notify();
+                    }
+                }));
+        }
     }
 
-    fn handle_confirm(
+    fn set_form_time(
         &mut self,
-        _: &gpui::ClickEvent,
+        time: chrono::DateTime<Utc>,
+        follow_current_time_on_confirm: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // 解析输入的时间
+        self.syncing_time_fields = true;
+        self.year_input.update(cx, |state, cx| {
+            state.set_value(time.year().to_string(), window, cx);
+        });
+        self.month_input.update(cx, |state, cx| {
+            state.set_value(format!("{:02}", time.month()), window, cx);
+        });
+        self.day_input.update(cx, |state, cx| {
+            state.set_value(format!("{:02}", time.day()), window, cx);
+        });
+        self.hour_input.update(cx, |state, cx| {
+            state.set_value(format!("{:02}", time.hour()), window, cx);
+        });
+        self.minute_input.update(cx, |state, cx| {
+            state.set_value(format!("{:02}", time.minute()), window, cx);
+        });
+        self.second_input.update(cx, |state, cx| {
+            state.set_value(format!("{:02}", time.second()), window, cx);
+        });
+        self.syncing_time_fields = false;
+        self.follow_current_time_on_confirm = follow_current_time_on_confirm;
+    }
+
+    fn parse_form_time(&self, cx: &App) -> Option<chrono::DateTime<Utc>> {
         let year = self
             .year_input
             .read(cx)
@@ -157,17 +161,40 @@ impl TimeSettingDialog {
             .unwrap_or(0)
             .clamp(0, 59);
 
-        // 构造时间
-        if let Some(datetime) = Utc
-            .with_ymd_and_hms(year, month, day, hour, minute, second)
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
             .single()
-        {
-            if let Some(callback) = self.on_confirm.take() {
-                callback(datetime, window, cx);
-                self.on_confirm = Some(callback);
+    }
+
+    fn set_current_time(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_form_time(Utc::now(), true, window, cx);
+        cx.notify();
+    }
+
+    fn handle_confirm(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let datetime = if self.follow_current_time_on_confirm {
+            Utc::now()
+        } else {
+            match self.parse_form_time(cx) {
+                Some(datetime) => datetime,
+                None => return,
             }
-            window.close_dialog(cx);
+        };
+
+        if let Some(callback) = self.on_confirm.take() {
+            callback(datetime, window, cx);
+            self.on_confirm = Some(callback);
         }
+        window.close_dialog(cx);
     }
 }
 
@@ -181,7 +208,7 @@ impl Render for TimeSettingDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-         v_flex()
+        v_flex()
             .id("subscription-panel")
             .gap_4()
             .child(
@@ -215,12 +242,21 @@ impl Render for TimeSettingDialog {
                     ),
             )
             .child(
-                div().flex().flex_row().gap_2().child(
-                    Button::new("set-now")
-                        .label("设置为当前时间")
-                        .small()
-                        .on_click(cx.listener(Self::set_current_time)),
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        Button::new("set-now")
+                            .label("设置为当前时间")
+                            .small()
+                            .on_click(cx.listener(Self::set_current_time)),
+                    )
+                    .children(self.follow_current_time_on_confirm.then(|| {
+                        Label::new("已锁定为确认瞬间的当前 UTC 时间；手动修改任一字段后将改为按表单值提交。")
+                            .text_xs()
+                            .text_color(theme.colors.muted_foreground)
+                    })),
             )
             .child(
                 div().flex().flex_row().gap_2().justify_end().mt_4().child(
@@ -1057,17 +1093,11 @@ impl Render for SyncConfirmDialog {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .justify_end()
-                    .mt_4()
-                    .child(
-                        Button::new("confirm-sync")
-                            .label(self.confirm_label.clone())
-                            .on_click(cx.listener(Self::handle_confirm)),
-                    ),
+                div().flex().flex_row().gap_2().justify_end().mt_4().child(
+                    Button::new("confirm-sync")
+                        .label(self.confirm_label.clone())
+                        .on_click(cx.listener(Self::handle_confirm)),
+                ),
             )
     }
 }

@@ -23,4 +23,5 @@ Thumbs.db
 *.log
 .claude/
 .kiro/
+.zcode/
 logs/

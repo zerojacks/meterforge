@@ -170,10 +170,14 @@ pub enum AdminCommand {
     ///
     /// 用于把源表的参数同步到目标表：直接写内存状态并落库
     /// （`comm_baud_json` / `passwords_json` / `tou_config_json["tou"]` /
-    /// 虚拟时间），绕过协议层的逐项写入流程。
+    /// 虚拟时间），绕过协议层的逐项写入流程。为了让批量同步后的
+    /// 虚拟时间与源表保持一致，发送端会携带下发时刻，接收端按
+    /// `接收时刻 - 下发时刻` 补偿传输耗时。
     ApplyProtocolParameters {
         /// 虚拟时间（Unix 毫秒时间戳）
         virtual_time_ms: i64,
+        /// 该命令下发给当前目标表时的本地真实时间（Unix 毫秒时间戳）
+        sent_at_ms: i64,
         /// 通信速率编码（04-00-07-03）
         baudrate: u8,
         /// 10 级密码（04-00-0C-01~0A）
