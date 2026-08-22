@@ -10,7 +10,7 @@ pub use physics_engine::{
     LoadModelConfig, LoadProfile, PhysicsConfig, PhysicsEngine, SimulationConfig,
 };
 pub use state::{
-    EnergyType, FreezeData, FreezeTrigger, FreezeType, MeterState, TimeSlot, TimeSlotTable,
-    TouConfig,
+    local_now_as_utc, EnergyType, FreezeData, FreezeTrigger, FreezeType, MeterState, TimeSlot,
+    TimeSlotTable, TouConfig,
 };
 pub use virtual_meter::{address_to_string, string_to_address, VirtualMeter, VirtualMeterConfig};

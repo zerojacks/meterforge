@@ -1030,31 +1030,34 @@ impl LoadProfileSamplingState {
         }
 
         match self.last_sample_times[class_idx] {
-            // 从未采样过：使用当前对齐点的起始时间作为虚拟的"上次采样时间"
-            // 这样只有当跨越到下一个对齐点时才会触发采样
+            // 从未采样过：以当前对齐点为虚拟的"上次采样时间"，
+            // 只有恰好落在对齐点上才立即采样，其余时刻等到跨越下一个对齐点
             None => {
-                let time_stmp = chrono::DateTime::timestamp(&current_time);
-                if time_stmp % (interval_minutes as i64 * 60) == 0 {
-                    return true;
-                }
-                return false;
+                let time_stmp = chrono::DateTime::timestamp(current_time);
+                time_stmp % (interval_minutes as i64 * 60) == 0
             }
             Some(last_time) => {
                 // 检测时间倒退：如果当前时间早于上次采样时间，说明发生了校时回拨
                 if *current_time < last_time {
                     self.last_sample_times[class_idx] = None;
-                    
+
                     // 时间倒退后不立即采样，等待跨越到下一个对齐点
                     return false;
                 }
-                
-                let time_stmp = chrono::DateTime::timestamp(&current_time);
-                if time_stmp % (interval_minutes as i64 * 60) == 0 {
-                    return true;
-                }
-                return false;
+
+                // 跨入新的对齐点即采样：节拍由对齐点（而非整点秒）判定，
+                // tick 落在对齐点之后（如 12:15:03）同样代表跨过了 12:15
+                // 节拍，不应错过；同一对齐点内（如 12:15:05）不重复采样
+                Self::aligned_slot(current_time, interval_minutes)
+                    > Self::aligned_slot(&last_time, interval_minutes)
             }
         }
+    }
+
+    /// 时间所属的采样对齐点（周期起点，epoch 秒向下取整对齐）
+    fn aligned_slot(t: &DateTime<Utc>, interval_minutes: u16) -> i64 {
+        let interval_secs = interval_minutes as i64 * 60;
+        chrono::DateTime::timestamp(t).div_euclid(interval_secs) * interval_secs
     }
 
     /// 更新某类的采样时间
@@ -1382,6 +1385,17 @@ pub struct MeterState {
     pub simulation_time_scale: f64,
 }
 
+/// 取"现在"作为虚拟时钟值：数字与本地墙钟一致，类型用 UTC 承载。
+///
+/// 虚拟时钟是电表的"表面时间"——DL/T645 读日期/时间（04-00-01-01/02）
+/// 直接把这些数字编成 BCD，UI 也按原数字显示，全链路不做时区换算。
+/// 因此把本地当前时间写入虚拟时钟时，必须保持数字不变、仅贴上 UTC
+/// 标签（naive_local + and_utc），而不是做真正的时区换算——后者会把
+/// 数字拨慢/拨快时区偏移（如 UTC+8 少 8 小时），导致表显与本地钟不一致。
+pub fn local_now_as_utc() -> DateTime<Utc> {
+    chrono::Local::now().naive_local().and_utc()
+}
+
 impl Default for MeterState {
     fn default() -> Self {
         let mut state = Self {
@@ -1422,8 +1436,8 @@ impl Default for MeterState {
             // 派生状态字
             derived_status: DerivedStatusWords::default(),
 
-            // 虚拟时钟
-            virtual_time: Utc::now(),
+            // 虚拟时钟（表面时间：数字与本地墙钟一致，类型用 UTC 承载）
+            virtual_time: local_now_as_utc(),
 
             // 电能寄存器
             energy_registers: HashMap::new(),

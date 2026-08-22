@@ -187,10 +187,19 @@ fn spawn_demo_meters(
     });
 
     connections.spawn(async move {
+        // 发送实测的真实间隔而不是常量 UI_TICK_INTERVAL：sleep 的实际
+        // 耗时不小于设定值（Windows 定时器粒度下偏差更大），常量会让按
+        // elapsed 累加的时钟系统性变慢。虚拟走时已改为墙钟锚定
+        // （VirtualMeter::tick 自行取墙钟推导），这里的 wall_elapsed
+        // 不再参与走时，仅供诊断参考。
+        let mut last_tick_at = std::time::Instant::now();
         loop {
             tokio::time::sleep(UI_TICK_INTERVAL).await;
+            let now = std::time::Instant::now();
+            let wall_elapsed = now - last_tick_at;
+            last_tick_at = now;
             let _ = tick_tx.send(TickMsg {
-                wall_elapsed: UI_TICK_INTERVAL,
+                wall_elapsed,
                 time_scale: 1.0,
             });
         }

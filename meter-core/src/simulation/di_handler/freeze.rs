@@ -30,26 +30,15 @@ impl DIHandler {
         use crate::persistence::worker::PersistenceWorker;
         use crate::simulation::state::FreezeTrigger;
 
+        // 内存（当前数据/环形缓冲）能命中的部分不需要数据库
+        if let Some(data) = self.try_read_freeze_from_memory(di, state)? {
+            return Ok(data);
+        }
+
         let di0 = di[0];
         let di1 = di[1];
-        let di2: u8 = di[2];
-
-        let trigger = FreezeTrigger::from_di2(di2)
-            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di2))?;
-
-        // DI0=00: 当前数据
-        if di0 == 0x00 {
-            return self.read_current_freeze_data(di1, state);
-        }
-
-        let max_memory_index = trigger.max_history_count();
-
-        // DI0 ≤ max_memory_index: 优先从内存读取
-        if di0 <= max_memory_index {
-            if let Some(snapshot) = state.get_freeze_snapshot(trigger, di0) {
-                return self.encode_freeze_data_item(di1, &snapshot.data, &snapshot.snapshot_time);
-            }
-        }
+        let trigger = FreezeTrigger::from_di2(di[2])
+            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di[2]))?;
 
         // 内存中没有数据（或 DI0 > max_memory_index），从数据库查询
         //
@@ -64,13 +53,60 @@ impl DIHandler {
                 .map_err(|e| format!("数据库查询失败: {}", e))?
                 .ok_or_else(|| {
                     format!(
-                        "冻结快照不存在（内存和数据库均无记录）: trigger={:?}, index={:02X}",
+                        "无此冻结快照（内存和数据库均无记录）: trigger={:?}, index={:02X}",
                         trigger, di0
                     )
                 })?;
 
         // 从数据库行解析数据，按 di1 抽取具体类别
         self.encode_freeze_data_from_db_row(di1, &snapshot_row)
+    }
+
+    /// 同步版本：只处理内存可满足的冻结读取
+    ///
+    /// DI0=00（当前数据）或 DI0≤内存容量且环形缓冲命中时直接返回；
+    /// 否则（历史快照存在数据库）返回错误，提示走异步版本。
+    pub(super) fn handle_freeze_data_read_sync(
+        &self,
+        di: [u8; 4],
+        state: &MeterState,
+    ) -> Result<Vec<u8>, String> {
+        match self.try_read_freeze_from_memory(di, state)? {
+            Some(data) => Ok(data),
+            None => Err("冻结数据需要数据库支持，请使用异步版本 handle_read_async()".to_string()),
+        }
+    }
+
+    /// 尝试从内存满足冻结读取
+    ///
+    /// 返回 Ok(Some(data)) 表示内存命中；Ok(None) 表示需要走数据库；
+    /// Err 表示 DI 本身非法（触发类型/数据类别无法解析）。
+    fn try_read_freeze_from_memory(
+        &self,
+        di: [u8; 4],
+        state: &MeterState,
+    ) -> Result<Option<Vec<u8>>, String> {
+        use crate::simulation::state::FreezeTrigger;
+
+        let trigger = FreezeTrigger::from_di2(di[2])
+            .ok_or_else(|| format!("无效的冻结触发类型: DI2={:02X}", di[2]))?;
+
+        // DI0=00: 当前数据
+        if di[0] == 0x00 {
+            return Ok(Some(self.read_current_freeze_data(di[1], state)?));
+        }
+
+        // DI0 ≤ max_memory_index: 从内存环形缓冲读取
+        if di[0] <= trigger.max_history_count() {
+            if let Some(snapshot) = state.get_freeze_snapshot(trigger, di[0]) {
+                return Ok(Some(self.encode_freeze_data_item(
+                    di[1],
+                    &snapshot.data,
+                    &snapshot.snapshot_time,
+                )?));
+            }
+        }
+        Ok(None)
     }
 
     /// 从数据库行编码冻结数据

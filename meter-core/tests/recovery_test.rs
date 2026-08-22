@@ -224,7 +224,7 @@ async fn test_full_lifecycle_with_recovery() {
 
     // 模拟几个tick
     for _ in 0..5 {
-        meter1.tick(std::time::Duration::from_secs(1), 1.0);
+        meter1.tick(1.0);
     }
 
     // 保存状态
@@ -268,7 +268,7 @@ async fn test_full_lifecycle_with_recovery() {
 
     // 继续运行
     for _ in 0..5 {
-        meter2.tick(std::time::Duration::from_secs(1), 1.0);
+        meter2.tick(1.0);
     }
 
     let energy_after = meter2.state().get_energy(EnergyType::ForwardActive, None);

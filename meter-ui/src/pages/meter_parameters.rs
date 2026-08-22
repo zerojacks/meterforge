@@ -1,7 +1,7 @@
 //! 参数设置卡片：展示与触发动作分离，具体命令仍由详情视图统一处理。
 use super::meter_detail::MeterDetailView;
 use crate::types::MeterSnapshot;
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{Datelike, Timelike};
 use gpui::*;
 use gpui_component::{
     badge::Badge,
@@ -42,7 +42,7 @@ pub fn render(
 ) -> impl IntoElement {
     let theme = cx.theme();
     let time = chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
-        .unwrap_or_else(|| Utc::now().into())
+        .unwrap_or_else(|| meter_core::simulation::local_now_as_utc().into())
         .with_timezone(&chrono::Utc);
     div()
         .flex()

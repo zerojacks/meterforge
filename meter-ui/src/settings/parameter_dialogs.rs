@@ -171,7 +171,9 @@ impl TimeSettingDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.set_form_time(Utc::now(), true, window, cx);
+        // 虚拟时钟存"表面时间"：取本地时间的数字、贴 UTC 标签，
+        // 保证表显/协议读数与用户本地钟一致
+        self.set_form_time(meter_core::simulation::local_now_as_utc(), true, window, cx);
         cx.notify();
     }
 
@@ -182,7 +184,7 @@ impl TimeSettingDialog {
         cx: &mut Context<Self>,
     ) {
         let datetime = if self.follow_current_time_on_confirm {
-            Utc::now()
+            meter_core::simulation::local_now_as_utc()
         } else {
             match self.parse_form_time(cx) {
                 Some(datetime) => datetime,
@@ -253,7 +255,7 @@ impl Render for TimeSettingDialog {
                             .on_click(cx.listener(Self::set_current_time)),
                     )
                     .children(self.follow_current_time_on_confirm.then(|| {
-                        Label::new("已锁定为确认瞬间的当前 UTC 时间；手动修改任一字段后将改为按表单值提交。")
+                        Label::new("已锁定为确认瞬间的本地时间（数字与本地时钟一致）；手动修改任一字段后将改为按表单值提交。")
                             .text_xs()
                             .text_color(theme.colors.muted_foreground)
                     })),

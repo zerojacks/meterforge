@@ -96,8 +96,9 @@ impl PhysicsEngine {
     ///
     /// 参数：
     /// - state: 电表状态（读取参数、更新数据）
-    /// - elapsed: 真实流逝时间（由全局 tick 广播传入）
-    /// - time_scale: 时间加速倍率（由全局 tick 广播传入，默认 1.0）
+    /// - elapsed: 流逝时长（VirtualMeter 传入已含倍率的模拟时长并将
+    ///   time_scale 置 1.0；独立驱动时传真实流逝时间配 time_scale）
+    /// - time_scale: 时间加速倍率（默认 1.0）
     ///
     /// 返回值：
     /// - bool: 是否发生了结算日转存

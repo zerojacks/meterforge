@@ -79,6 +79,11 @@ pub struct MeterActor {
     /// Tick 接收器（全局广播订阅）
     tick_rx: broadcast::Receiver<TickMsg>,
 
+    /// tick 广播是否仍然打开。
+    /// 收到 Closed 后置 false，select! 分支前置条件失效、分支被禁用，
+    /// 避免对已关闭的 recv()（每次立即就绪）演变成忙轮询。
+    tick_rx_open: bool,
+
     /// 命令接收器
     cmd_rx: mpsc::Receiver<EngineMsg>,
 
@@ -106,6 +111,7 @@ impl MeterActor {
         Self {
             meter,
             tick_rx,
+            tick_rx_open: true,
             cmd_rx,
             config,
             continuation_cache: HashMap::new(),
@@ -125,9 +131,23 @@ impl MeterActor {
 
         loop {
             tokio::select! {
-                // 处理 tick 广播
-                Ok(tick) = self.tick_rx.recv() => {
-                    self.on_tick(tick).await;
+                // 处理 tick 广播（Closed 后 tick_rx_open=false，本分支被
+                // 禁用，退出统一交给 else）
+                tick = self.tick_rx.recv(), if self.tick_rx_open => {
+                    match tick {
+                        Ok(tick) => self.on_tick(tick).await,
+                        // 积压丢掉的 tick 不影响走时：虚拟时钟按墙钟锚点
+                        // 推导，下一个到达的 tick 会把丢掉的时间段一并结清
+                        Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                            warn!(
+                                "[MeterActor {}] tick 广播积压，跳过 {} 个 tick",
+                                address_str, dropped
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.tick_rx_open = false;
+                        }
+                    }
                 }
 
                 // 处理命令
@@ -164,11 +184,9 @@ impl MeterActor {
     /// 6. 冻结调度检查
     /// 7. 负荷记录采样调度
     async fn on_tick(&mut self, tick: TickMsg) {
-        // VirtualMeter.tick() 已封装了完整的仿真逻辑
-        self.meter.tick(
-            tick.wall_elapsed,
-            tick.time_scale * self.meter.state().simulation_time_scale,
-        );
+        // VirtualMeter 内部按墙钟锚点推导虚拟时间（wall_elapsed 不再
+        // 参与走时计算，避免定时误差逐 tick 累积），这里只透传广播倍率
+        self.meter.tick(tick.time_scale);
 
         // 注意：冻结和电能flush已在 VirtualMeter.tick() 中处理
         // - process_pending_freeze() 处理冻结触发
@@ -729,10 +747,10 @@ impl MeterActor {
                     let mut data = encode_645_datetime(&before);
                     data.extend(encode_645_datetime(&dt));
                     state.add_event_record(0x31, 0x01, before, data);
-
-                    // 设置虚拟时钟
-                    state.virtual_time = dt;
                 }
+
+                // 设置虚拟时钟（统一入口：赋值 + 重钉墙钟锚点）
+                self.meter.set_virtual_time(dt);
             }
             None => {
                 warn!(
@@ -1128,7 +1146,7 @@ impl MeterActor {
                     .single()
                 {
                     Some(dt) => {
-                        self.meter.state_mut().virtual_time = dt;
+                        self.meter.set_virtual_time(dt);
                         Ok(format!(
                             "Virtual time set to: {}",
                             dt.format("%Y-%m-%d %H:%M:%S")
@@ -1485,9 +1503,10 @@ impl MeterActor {
                         None => Err("Invalid compensated virtual_time_ms".to_string()),
                         Some(dt) => {
                             use crate::simulation::state::TimeSlot;
+                            // 对时走统一入口（赋值 + 重钉墙钟锚点）
+                            self.meter.set_virtual_time(dt);
                             {
                                 let state = self.meter.state_mut();
-                                state.virtual_time = dt;
                                 state.baudrate = baudrate;
                                 state.password_config.passwords = passwords;
                                 state.tou_config.day_table_1.slots = time_slots

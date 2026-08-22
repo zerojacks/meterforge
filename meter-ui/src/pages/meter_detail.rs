@@ -323,7 +323,7 @@ impl MeterDetailView {
         cx: &mut Context<Self>,
     ) {
         let initial = chrono::DateTime::from_timestamp_millis(snapshot.virtual_time_ms)
-            .unwrap_or_else(|| Utc::now().into())
+            .unwrap_or_else(|| meter_core::simulation::local_now_as_utc().into())
             .with_timezone(&chrono::Utc);
         let address = self.address.clone();
 

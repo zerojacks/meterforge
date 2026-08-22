@@ -192,6 +192,7 @@ impl DIHandler {
                 Ok(state.derived_status.meter_status.to_le_bytes().to_vec())
             }
             [0xFF, 0x05, 0x00, 0x04] => {
+                // 数据块 = 运行状态字1~7（各2字节）+ 密钥状态字（4字节）
                 let mut data = state.derived_status.status_word_1.to_le_bytes().to_vec();
                 data.extend(state.derived_status.status_word_2.to_le_bytes());
                 data.extend(state.derived_status.status_word_3.to_le_bytes());

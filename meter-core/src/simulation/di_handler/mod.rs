@@ -443,10 +443,9 @@ impl DIHandler {
             di if di[3] == 0x06 && di[2] == 0x10 => {
                 Err("负荷记录需要数据库查询，请使用异步版本 handle_read_async()".to_string())
             }
-            // 冻结数据 (05-xx-xx-xx) 需要数据库支持，走异步版本
-            di if di[3] == 0x05 => {
-                Err("冻结数据需要数据库支持，请使用异步版本 handle_read_async()".to_string())
-            }
+            // 冻结数据 (05-xx-xx-xx)：内存（当前数据/环形缓冲）可满足的
+            // 同步返回；历史快照存数据库，走异步版本
+            di if di[3] == 0x05 => self.handle_freeze_data_read_sync(di, state),
             _ => Err(format!(
                 "未支持的 DI: {:02X}{:02X}{:02X}{:02X}",
                 di[3], di[2], di[1], di[0]
@@ -534,7 +533,7 @@ use super::encoding::encode_bcd_current;
         let result = handler
             .handle_read([0x01, 0x00, 0x01, 0x01], &state)
             .unwrap();
-        assert_eq!(result.len(), 9); // 需量3字节 + 时间6字节
+        assert_eq!(result.len(), 8); // 需量3字节(XX.XXXX) + 发生时间5字节(YYMMDDhhmm)
 
         // 未跨结算日时不转存：再次调用不会清掉上1结算日数据
         state.set_energy(EnergyType::ForwardActive, None, 200.0);
@@ -719,13 +718,13 @@ use super::encoding::encode_bcd_current;
         assert!(handler
             .handle_read([0x03, 0x07, 0x00, 0x04], &state)
             .is_ok());
-        // 040005FF 状态字数据块 (3×2字节)
+        // 040005FF 状态字数据块 = 运行状态字1~7（7×2字节）+ 密钥状态字（4字节）
         assert_eq!(
             handler
                 .handle_read([0xFF, 0x05, 0x00, 0x04], &state)
                 .unwrap()
                 .len(),
-            6
+            18
         );
         // 04000901 负荷记录模式字 / 04000A02 第1类间隔
         assert!(handler

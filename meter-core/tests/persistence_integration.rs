@@ -155,12 +155,13 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
     }
 
     // 生成更多快照（超过内存容量12，写入数据库）
-    // 注意：定时冻结的 occurrence_idx 从 1 开始，到达13时应该使用 0x0D
+    // 注意：数据库每次冻结只落一行完整摘要（category=0xFF），异步读取时
+    // 也按 category=0xFF 查询后再按 DI1 现场抽取
     for i in 4..=15 {
         let snapshot_row = FreezeSnapshotRow {
             meter_address: address.to_string(),
             trigger_type: trigger.to_di2(), // 使用协议值（DI2）
-            category: 0x01, // DI1=01 正向有功总电能（与测试查询匹配）
+            category: 0xFF, // 完整快照摘要行（与 write_freeze_snapshot 一致）
             occurrence_idx: i,
             snapshot_time: chrono::Utc::now(),
             payload: serde_json::json!({
@@ -195,16 +196,18 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
     let result_memory = handler.handle_read(di_memory, &state);
     assert!(result_memory.is_ok(), "内存读取应该成功");
 
-    // 测试2: 尝试读取数据库中的快照（DI0=0D，超过内存容量12）
-    let di_database = [0x0D, 0x01, 0x00, 0x05]; // DI0=0D(13), DI1=01, DI2=00, DI3=05
+    // 测试2: 内存环形缓冲中只有3条快照，DI0=05 未命中内存
+    // （数据库侧 write_freeze_snapshot 按"最新=1、整体挪号、容量12封顶"
+    // 存储，因此同步读取内存未命中的快照应该返回错误）
+    let di_database = [0x05, 0x01, 0x00, 0x05]; // DI0=05, DI1=01(正向有功), DI2=00(定时), DI3=05
     let result_db_sync = handler.handle_read(di_database, &state);
-    assert!(result_db_sync.is_err(), "同步方法读取DI0>0C应该返回错误");
+    assert!(result_db_sync.is_err(), "同步方法读取内存未命中的快照应该返回错误");
     assert!(
         result_db_sync.unwrap_err().contains("数据库支持"),
         "错误消息应提示使用异步版本"
     );
 
-    // 测试3: 使用异步方法读取数据库
+    // 测试3: 使用异步方法（内存未命中 → 数据库查询）读取
     let result_db_async = handler
         .handle_freeze_data_read_async(di_database, &state, address, &pool)
         .await;

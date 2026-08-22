@@ -40,6 +40,43 @@ pub struct VirtualMeter {
 
     /// 上次 flush 时的电能值（用于检测增量）
     last_flushed_energy: f64,
+
+    /// 虚拟时钟的墙钟锚点（见 [`TimeAnchor`]）
+    time_anchor: TimeAnchor,
+}
+
+/// 虚拟时钟的墙钟锚点。
+///
+/// 虚拟时间不按 tick 累加，而是从锚点推导：
+/// `virtual(now) = virtual_ms + (now - real_ms) × scale`。
+/// 每个 tick 结束都把锚点重钉到当前时刻，所以单次 tick 的定时误差
+/// （sleep 唤醒延迟、广播积压丢 tick、毫秒取整）不会跨 tick 累积——
+/// 这正是旧实现"虚拟表越走越慢"的根因。
+#[derive(Debug, Clone)]
+struct TimeAnchor {
+    /// 锚定的真实墙钟（UTC 毫秒）
+    real_ms: i64,
+    /// 锚定时刻的虚拟时间（UTC 毫秒）
+    virtual_ms: i64,
+    /// 锚定时刻生效的时间倍率（广播倍率 × 表内 simulation_time_scale）
+    scale: f64,
+}
+
+impl TimeAnchor {
+    /// 以当前真实墙钟为 real_ms 建锚
+    fn capture(virtual_ms: i64, scale: f64) -> Self {
+        Self {
+            real_ms: chrono::Utc::now().timestamp_millis(),
+            virtual_ms,
+            scale,
+        }
+    }
+
+    /// 推导 now_ms 时刻的虚拟时间（毫秒）；墙钟回拨按 0 差处理，不倒退
+    fn virtual_ms_at(&self, now_ms: i64) -> i64 {
+        let real_delta_ms = now_ms.saturating_sub(self.real_ms).max(0);
+        self.virtual_ms + (real_delta_ms as f64 * self.scale).round() as i64
+    }
 }
 
 impl VirtualMeter {
@@ -51,6 +88,11 @@ impl VirtualMeter {
         let physics = PhysicsEngine::new(config.physics_config.load_model.clone());
         let handler = DIHandler::new();
 
+        let time_anchor = TimeAnchor::capture(
+            state.virtual_time.timestamp_millis(),
+            state.simulation_time_scale,
+        );
+
         Self {
             state,
             physics,
@@ -59,6 +101,7 @@ impl VirtualMeter {
             persist_tx: None,
             last_energy_flush: std::time::Instant::now(),
             last_flushed_energy: 0.0,
+            time_anchor,
         }
     }
 
@@ -246,6 +289,9 @@ impl VirtualMeter {
                 eprintln!("Warning: Failed to restore last sample times: {}", e);
             }
         }
+
+        // 恢复/补时改写了虚拟时钟，重钉墙钟锚点，此后由 tick 按真实流逝推进
+        self.rebase_time_anchor();
 
         Ok(true)
     }
@@ -760,6 +806,23 @@ impl VirtualMeter {
         &mut self.state
     }
 
+    /// 设置虚拟时钟（广播校时 / UI 对时 / 参数同步的统一入口）。
+    ///
+    /// 除赋值外还重钉墙钟锚点：不重锚的话，下一个 tick 会按旧锚点
+    /// 推导时间，把刚设置的时钟直接冲掉。
+    pub fn set_virtual_time(&mut self, dt: chrono::DateTime<chrono::Utc>) {
+        self.state.virtual_time = dt;
+        self.rebase_time_anchor();
+    }
+
+    /// 用当前墙钟与当前虚拟时钟重钉锚点（虚拟时间被设置/恢复后调用）
+    fn rebase_time_anchor(&mut self) {
+        self.time_anchor = TimeAnchor::capture(
+            self.state.virtual_time.timestamp_millis(),
+            self.state.simulation_time_scale,
+        );
+    }
+
     /// Applies the inputs used by the instantaneous power calculation.
     pub fn set_load_model(
         &mut self,
@@ -821,18 +884,66 @@ impl VirtualMeter {
     /// 推进仿真（供外部定时调用，模拟 tick）
     ///
     /// 设计说明：
-    /// - VirtualMeter 不创建 tick，只接收外部传入的 elapsed
+    /// - VirtualMeter 不创建 tick，只由外部定时触发
     /// - 实际使用时，由全局 broadcast channel 统一产出 tick
     /// - 所有 VirtualMeter/MeterActor 订阅同一个广播通道
     ///
+    /// 虚拟时钟采用墙钟锚定式推进（见 [`TimeAnchor`]）：
+    /// - 不使用上游传入的 wall_elapsed——sleep 唤醒延迟、通道积压丢 tick
+    ///   都会让"每 tick 累加固定值"的时钟系统性变慢（误差单调累积），
+    ///   改为用本表自己的墙钟与锚点的差值推导，误差不跨 tick 累积
+    /// - 丢掉的 tick 无需补偿：下一个到达的 tick 会按墙钟差把丢掉的
+    ///   时间段一并结清
+    /// - 推导出的模拟时长（已含倍率）交给物理引擎，以 time_scale=1.0
+    ///   传入，保持物理引擎 "elapsed × time_scale" 的接口语义
+    ///
     /// 工作流程：
-    /// 1. PhysicsEngine 更新 MeterState（包括冻结检测）
-    /// 2. 检查 pending_freeze_triggers 列表
-    /// 3. 如果有待处理的冻结，异步生成快照
-    /// 4. 检查电能寄存器是否需要 flush
-    pub fn tick(&mut self, elapsed: std::time::Duration, time_scale: f64) {
-        // PhysicsEngine 更新 MeterState（返回是否发生了结算日转存）
-        let settlement_rolled_over = self.physics.tick(&mut self.state, elapsed, time_scale);
+    /// 1. 由锚点推导虚拟时钟并推进
+    /// 2. PhysicsEngine 更新 MeterState（包括冻结检测）
+    /// 3. 检查 pending_freeze_triggers 列表
+    /// 4. 如果有待处理的冻结，生成快照
+    /// 5. 检查电能寄存器是否需要 flush
+    pub fn tick(&mut self, broadcast_scale: f64) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.tick_at(now_ms, broadcast_scale);
+    }
+
+    /// tick 的核心逻辑，显式传入"当前墙钟毫秒"（便于确定性测试）
+    fn tick_at(&mut self, now_ms: i64, broadcast_scale: f64) {
+        let scale = broadcast_scale * self.state.simulation_time_scale;
+
+        // 自愈：state.virtual_time 被外部直写（写参数 04-00-01-01/02 等
+        // 只拿得到 &mut MeterState 的路径）时，会与锚点脱钩——以直写后的
+        // 值重建锚点，本 tick 不再推进：刚校过的时刻就是"现在"。
+        let state_virtual_ms = self.state.virtual_time.timestamp_millis();
+        if state_virtual_ms != self.time_anchor.virtual_ms {
+            self.time_anchor = TimeAnchor {
+                real_ms: now_ms,
+                virtual_ms: state_virtual_ms,
+                scale,
+            };
+            return;
+        }
+
+        // 用锚点倍率结清自上次重锚以来的真实流逝（倍率中途被改时，
+        // 这段时间仍按旧倍率结算，重锚后才生效），随后重钉锚点。
+        // sim_delta_ms 恒 >= 0：墙钟回拨按 0 差结算并把锚点重钉到当前
+        // 时刻，虚拟时钟既不倒退也不停走
+        let sim_delta_ms = self.time_anchor.virtual_ms_at(now_ms) - self.time_anchor.virtual_ms;
+        self.time_anchor = TimeAnchor {
+            real_ms: now_ms,
+            virtual_ms: self.time_anchor.virtual_ms + sim_delta_ms,
+            scale,
+        };
+
+        // PhysicsEngine 更新 MeterState（返回是否发生了结算日转存）。
+        // 同一毫秒内的重复 tick sim_delta 为 0，也要以 0 时长跑一遍：
+        // 瞬时量更新等"每 tick 必做"的逻辑不依赖时长
+        let settlement_rolled_over = self.physics.tick(
+            &mut self.state,
+            std::time::Duration::from_millis(sim_delta_ms as u64),
+            1.0,
+        );
 
         // 检查结算日转存并持久化
         if settlement_rolled_over {
@@ -1296,7 +1407,7 @@ mod tests {
             time_scale: 4.0,
         };
         meter.apply_simulation_config(config.clone()).unwrap();
-        meter.tick(std::time::Duration::from_secs(1), config.time_scale);
+        meter.tick(1.0);
         assert_eq!(meter.state().rated_voltage, 230_000);
         assert_eq!(meter.state().rated_current, 20_000);
         assert!((meter.state().voltage_a - 230.0).abs() < f64::EPSILON);
@@ -1321,5 +1432,86 @@ mod tests {
         assert_eq!(after.rated_voltage, before.rated_voltage);
         assert_eq!(after.rated_current, before.rated_current);
         assert_eq!(after.time_scale, before.time_scale);
+    }
+
+    #[test]
+    fn time_anchor_derives_virtual_time_from_wall_clock() {
+        let anchor = TimeAnchor {
+            real_ms: 1_000,
+            virtual_ms: 10_000,
+            scale: 1.0,
+        };
+        // 虚拟时间只由墙钟差决定，与 tick 到达的次数/节奏无关
+        assert_eq!(anchor.virtual_ms_at(1_000), 10_000);
+        assert_eq!(anchor.virtual_ms_at(1_250), 10_250);
+        // 墙钟回拨按 0 差处理，不倒退
+        assert_eq!(anchor.virtual_ms_at(500), 10_000);
+    }
+
+    #[test]
+    fn time_anchor_applies_scale() {
+        let anchor = TimeAnchor {
+            real_ms: 0,
+            virtual_ms: 0,
+            scale: 3.0,
+        };
+        assert_eq!(anchor.virtual_ms_at(1_000), 3_000);
+    }
+
+    #[test]
+    fn tick_error_does_not_accumulate_across_ticks() {
+        let mut meter = VirtualMeter::default();
+        let v0_ms = meter.state().virtual_time.timestamp_millis();
+        let t0_ms = chrono::Utc::now().timestamp_millis();
+
+        // 模拟两轮"定时器走得又慢又不准"的 tick：总推进量必须精确等于
+        // 墙钟差（v0 与锚点间有微小的构造耗时，用宽松下界排除）
+        meter.tick_at(t0_ms + 150, 1.0);
+        meter.tick_at(t0_ms + 1_000, 1.0);
+        let advanced = meter.state().virtual_time.timestamp_millis() - v0_ms;
+        assert!(advanced > 0 && advanced <= 1_000, "advanced={}ms", advanced);
+
+        meter.tick_at(t0_ms + 2_000, 1.0);
+        let total = meter.state().virtual_time.timestamp_millis() - v0_ms;
+        assert!(total > 1_000 && total <= 2_000, "total={}ms", total);
+    }
+
+    #[test]
+    fn external_virtual_time_write_is_adopted_not_clobbered() {
+        let mut meter = VirtualMeter::default();
+        let external = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        // 模拟 di_handler 直写 state.virtual_time（写参数 04-00-01-01/02）
+        meter.state_mut().virtual_time = external;
+
+        // 直写后到达的 tick 不得按旧锚点把时钟冲掉
+        let now_ms = chrono::Utc::now().timestamp_millis() + 500;
+        meter.tick_at(now_ms, 1.0);
+        assert_eq!(meter.state().virtual_time, external);
+
+        // 之后从直写值起按真实流逝推进
+        meter.tick_at(now_ms + 1_000, 1.0);
+        assert_eq!(
+            meter.state().virtual_time.timestamp_millis(),
+            1_700_000_001_000
+        );
+    }
+
+    #[test]
+    fn set_virtual_time_rebases_anchor() {
+        use chrono::TimeZone;
+        let mut meter = VirtualMeter::default();
+        let dt = chrono::Utc
+            .with_ymd_and_hms(2026, 8, 22, 10, 0, 0)
+            .single()
+            .unwrap();
+        meter.set_virtual_time(dt);
+        assert_eq!(meter.state().virtual_time, dt);
+
+        // 设置后第一个 tick 从新时刻起推进，不会被旧锚点覆盖；
+        // set_virtual_time 与取 now 之间的构造耗时允许少量偏差
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        meter.tick_at(now_ms + 10_000, 1.0);
+        let delta = meter.state().virtual_time.timestamp_millis() - dt.timestamp_millis();
+        assert!(delta > 9_000 && delta <= 10_000, "delta={}ms", delta);
     }
 }
