@@ -1936,6 +1936,20 @@ impl MeterState {
         }
     }
 
+    /// 清空全部触发类型的冻结快照（内存环形缓冲），供"清除历史数据"使用。
+    /// 只清历史快照，不影响冻结相关配置（触发模式/结算日等）。
+    pub fn clear_all_freeze_snapshots(&mut self) {
+        for buffer in self.freeze_snapshots.values_mut() {
+            buffer.clear();
+        }
+    }
+
+    /// 清空负荷记录内存缓冲（跨全部类别），供"清除历史数据"使用。
+    /// 只清已产生的采样历史，不影响负荷记录配置（模式字/起始时间/间隔）。
+    pub fn clear_load_records(&mut self) {
+        self.recent_load_records.clear();
+    }
+
     /// 添加事件记录
     ///
     /// 参数：

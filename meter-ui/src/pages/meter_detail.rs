@@ -26,6 +26,8 @@ use crate::settings::parameter_dialogs::{
 };
 use crate::settings::SimulationConfigPanel;
 use gpui_component::notification::Notification;
+use meter_core::communication_log::BROADCAST_ADDRESS;
+use meter_core::protocol::format::parse_address;
 use meter_core::snapshot::{EventSnapshot, FreezeSnapshotSummary, LoadRecordSnapshot};
 
 /// "负荷记录"标签页每次最多拉取的采样条数（跨全部数据类型/通道）。
@@ -98,24 +100,38 @@ pub struct MeterDetailView {
 impl MeterDetailView {
     pub fn new(address: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backend = cx.global::<AppBackend>().clone();
-        let log_panel = cx.new(|cx| {
-            CommunicationLogPanel::new(backend.connections.communication_logs(), window, cx)
-        });
-        let mut receiver = backend.connections.subscribe_communication_logs();
-        let panel = log_panel.clone();
-        cx.spawn(async move |this, cx| {
-            while let Ok(entry) = receiver.recv().await {
-                if this
-                    .update(cx, |_, cx| {
-                        panel.update(cx, |panel, cx| panel.append(entry, cx));
-                    })
-                    .is_err()
-                {
-                    break;
+        // 通信日志按地址过滤：总线上可能同时挂着上千台虚拟表，这台表的
+        // 日志面板只应该看到发给它/它发出的报文，以及广播帧——而不是
+        // 整条总线的全部流量（那样量级会随虚拟表数量线性放大，UI 卡顿）。
+        let addr_bytes = parse_address(&address).ok();
+        let initial = addr_bytes
+            .map(|addr| backend.connections.communication_logs_for(addr))
+            .unwrap_or_default();
+        let log_panel = cx.new(|cx| CommunicationLogPanel::new(initial, window, cx));
+        if let Some(addr_bytes) = addr_bytes {
+            let mut receiver = backend.connections.subscribe_communication_logs();
+            let panel = log_panel.clone();
+            cx.spawn(async move |this, cx| {
+                while let Ok(entry) = receiver.recv().await {
+                    let for_this_meter = matches!(
+                        entry.address,
+                        Some(addr) if addr == addr_bytes || addr == BROADCAST_ADDRESS
+                    );
+                    if !for_this_meter {
+                        continue;
+                    }
+                    if this
+                        .update(cx, |_, cx| {
+                            panel.update(cx, |panel, cx| panel.append(entry, cx));
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
         let simulation = cx
             .global::<GlobalMeterRegistry>()
             .0
@@ -253,6 +269,23 @@ impl MeterDetailView {
 
     pub fn address(&self) -> &str {
         &self.address
+    }
+
+    /// 清空冻结历史的本地缓存（不重新触发 DB 查询，直接落回快照里的当前值——
+    /// 快照本身已经在被清除的电表 actor 里变空，所以这里显示的就是清除后的
+    /// 结果）。供"电表列表面板"批量清除全部表后刷新当前展示的详情视图使用，
+    /// 与单表清除按钮（`show_clear_freeze_history_dialog`）清空缓存的方式一致。
+    pub(crate) fn reset_freeze_history_cache(&mut self, cx: &mut Context<Self>) {
+        self.freeze_history = Some(Vec::new());
+        self.freeze_history_loading = false;
+        cx.notify();
+    }
+
+    /// 同 `reset_freeze_history_cache`，针对负荷记录。
+    pub(crate) fn reset_load_profile_history_cache(&mut self, cx: &mut Context<Self>) {
+        self.load_profile_history = Some(Vec::new());
+        self.load_profile_history_loading = false;
+        cx.notify();
     }
 
     fn select_tab(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {
@@ -507,6 +540,97 @@ impl MeterDetailView {
 
         window.open_dialog(cx, move |dialog, _, _| {
             dialog.title("参数同步").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
+        })
+    }
+
+    /// "冻结数据"tab 的"清除历史数据"入口：确认后清空当前表的冻结历史
+    /// （内存环形缓冲 + 数据库），保留冻结相关配置。
+    pub(crate) fn show_clear_freeze_history_dialog(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address = self.address.clone();
+        let view = cx.entity().downgrade();
+
+        let dialog_entity = cx.new(|_| {
+            SyncConfirmDialog::new(
+                "清除冻结历史数据",
+                "将清空当前表的全部冻结历史快照（内存与数据库），冻结相关配置不受影响。此操作不可撤销。",
+                "清除历史数据",
+            )
+            .on_confirm(move |_, cx| {
+                let backend = cx.global::<AppBackend>().clone();
+                let task = backend.clear_freeze_history(address.clone(), cx);
+                let view = view.clone();
+                cx.spawn(async move |_, cx| {
+                    let result = match task.await {
+                        Ok(message) => (true, format!("冻结历史已清除：{message}")),
+                        Err(error) => (false, format!("冻结历史清除失败：{error}")),
+                    };
+                    let _ = view.update(cx, |view, cx| {
+                        // 清空本地缓存的历史与列表，避免残留旧数据直到下次切 tab 才刷新。
+                        view.freeze_history = Some(Vec::new());
+                        view.freeze_history_loading = false;
+                        view.pending_notification = Some(result);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("清除历史数据").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
+        })
+    }
+
+    /// "负荷记录"tab 的"清除历史数据"入口：确认后清空当前表的负荷记录历史
+    /// （内存缓冲 + 数据库），保留负荷记录配置。
+    pub(crate) fn show_clear_load_profile_history_dialog(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address = self.address.clone();
+        let view = cx.entity().downgrade();
+
+        let dialog_entity = cx.new(|_| {
+            SyncConfirmDialog::new(
+                "清除负荷记录数据",
+                "将清空当前表的全部负荷记录历史采样（内存与数据库），负荷记录配置不受影响。此操作不可撤销。",
+                "清除历史数据",
+            )
+            .on_confirm(move |_, cx| {
+                let backend = cx.global::<AppBackend>().clone();
+                let task = backend.clear_load_profile_history(address.clone(), cx);
+                let view = view.clone();
+                cx.spawn(async move |_, cx| {
+                    let result = match task.await {
+                        Ok(message) => (true, format!("负荷记录已清除：{message}")),
+                        Err(error) => (false, format!("负荷记录清除失败：{error}")),
+                    };
+                    let _ = view.update(cx, |view, cx| {
+                        view.load_profile_history = Some(Vec::new());
+                        view.load_profile_history_loading = false;
+                        view.pending_notification = Some(result);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("清除历史数据").w(px(500.)).content({
                 let dialog_entity = dialog_entity.clone();
                 move |content, _, _| content.child(dialog_entity.clone())
             })
@@ -768,7 +892,19 @@ impl MeterDetailView {
             .flex_col()
             .size_full()
             .gap_3()
-            .child(Label::new("冻结数据").text_2xl().font_semibold())
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(Label::new("冻结数据").text_2xl().font_semibold())
+                    .child(
+                        Button::new("clear-freeze-history")
+                            .label("清除历史数据")
+                            .small()
+                            .danger()
+                            .on_click(cx.listener(Self::show_clear_freeze_history_dialog)),
+                    ),
+            )
             .child(
                 Label::new(if loading {
                     "正在从数据库加载历史冻结数据…".to_string()
@@ -828,7 +964,19 @@ impl MeterDetailView {
             .flex_col()
             .size_full()
             .gap_3()
-            .child(Label::new("负荷记录").text_2xl().font_semibold())
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(Label::new("负荷记录").text_2xl().font_semibold())
+                    .child(
+                        Button::new("clear-load-profile-history")
+                            .label("清除历史数据")
+                            .small()
+                            .danger()
+                            .on_click(cx.listener(Self::show_clear_load_profile_history_dialog)),
+                    ),
+            )
             .child(
                 Label::new(if loading {
                     "正在从数据库加载负荷记录…".to_string()
@@ -978,8 +1126,8 @@ impl Render for MeterDetailView {
                         }))
                         .child(
                             resizable_panel()
-                                .size(px(180.))
-                                .size_range(px(120.)..px(480.))
+                                .size(px(240.))
+                                .size_range(px(120.)..px(560.))
                                 .child(
                                     div()
                                         .size_full()

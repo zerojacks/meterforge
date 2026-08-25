@@ -827,6 +827,19 @@ impl PersistenceWorker {
         Ok(result)
     }
 
+    /// 删除某地址全部冻结历史快照（`freeze_snapshots` 表），供"清除历史数据"使用。
+    /// 跨全部触发类型/序号一次性清空；返回实际删除的行数。
+    pub async fn delete_freeze_history(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM freeze_snapshots WHERE address = ?")
+            .bind(address)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     // ═════════════════════════════════════════════════════════════════════════
     // 负荷记录查询（load_profile_records 表，JSON payload）
     // ═════════════════════════════════════════════════════════════════════════
@@ -903,6 +916,16 @@ impl PersistenceWorker {
         .await?;
 
         Self::parse_load_record_rows(address, rows)
+    }
+
+    /// 删除某地址全部负荷记录历史（`load_profile_records` 表），供"清除历史数据"使用。
+    /// 跨全部类别一次性清空；返回实际删除的行数。
+    pub async fn delete_load_records(pool: &SqlitePool, address: &str) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM load_profile_records WHERE address = ?")
+            .bind(address)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// 查询每个类别的最后一次采样时间（用于重启后恢复采样状态）

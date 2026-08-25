@@ -40,3 +40,7 @@ smol = "2.0"
 anyhow = "1.0"
 
 sqlx.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+# 仅 Windows 需要：把 assets/icon/app.ico 嵌入到可执行文件资源中
+winres = "0.1"

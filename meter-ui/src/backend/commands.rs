@@ -303,6 +303,68 @@ impl AppBackend {
         })
     }
 
+    /// 清除某块表的冻结历史数据（内存环形缓冲 + 数据库 `freeze_snapshots` 表），
+    /// 保留冻结相关配置。返回 actor 侧的结果文案（成功时含删除行数），供 UI 弹通知。
+    pub fn clear_freeze_history(&self, address: String, cx: &App) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::ClearFreezeHistory)
+                .await
+        })
+    }
+
+    /// 清除某块表的负荷记录历史数据（内存缓冲 + 数据库 `load_profile_records` 表），
+    /// 保留负荷记录配置。返回 actor 侧的结果文案，供 UI 弹通知。
+    pub fn clear_load_profile_history(
+        &self,
+        address: String,
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::ClearLoadProfileHistory)
+                .await
+        })
+    }
+
+    /// 批量清除所有表的冻结历史数据（电表列表面板顶部"清除历史数据"入口）。
+    /// 与 `dispatch_all` 一样对每块表 fire 一条命令，但这里需要等待全部完成
+    /// 才能统计成功数，供确认弹窗关闭后的通知使用，因此返回 `Task<(成功数, 总数)>`。
+    pub fn clear_freeze_history_all(&self, cx: &App) -> Task<(usize, usize)> {
+        let targets: Vec<MeterActorHandle> = self.meters.read().values().cloned().collect();
+        let total = targets.len();
+        cx.background_executor().spawn(async move {
+            let results = futures::future::join_all(
+                targets
+                    .iter()
+                    .map(|handle| handle.send_admin_command(AdminCommand::ClearFreezeHistory)),
+            )
+            .await;
+            let success = results.iter().filter(|r| r.is_ok()).count();
+            (success, total)
+        })
+    }
+
+    /// 批量清除所有表的负荷记录历史数据（电表列表面板顶部"清除负荷记录数据"入口）。
+    pub fn clear_load_profile_history_all(&self, cx: &App) -> Task<(usize, usize)> {
+        let targets: Vec<MeterActorHandle> = self.meters.read().values().cloned().collect();
+        let total = targets.len();
+        cx.background_executor().spawn(async move {
+            let results = futures::future::join_all(targets.iter().map(|handle| {
+                handle.send_admin_command(AdminCommand::ClearLoadProfileHistory)
+            }))
+            .await;
+            let success = results.iter().filter(|r| r.is_ok()).count();
+            (success, total)
+        })
+    }
+
     /// Gracefully shutdown all meters (save virtual time and energy registers)
     ///
     /// This should be called before the application exits to ensure all

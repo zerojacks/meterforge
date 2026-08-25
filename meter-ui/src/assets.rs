@@ -4,10 +4,15 @@ use gpui::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
 /// 内置的自定义图标,路径需以 `icons/` 开头供 `Icon::path` 使用。
-const LOCAL_ASSETS: &[(&str, &[u8])] = &[(
-    "icons/refresh-cw.svg",
-    include_bytes!("../assets/icons/refresh-cw.svg"),
-)];
+const LOCAL_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "icons/refresh-cw.svg",
+        include_bytes!("../assets/icons/refresh-cw.svg"),
+    ),
+    // 软件图标，同一份资源也用于 Windows 可执行文件图标（见 build.rs）
+    // 及 Linux 应用图标（见 packaging/linux）。
+    ("icon/app.png", include_bytes!("../assets/icon/app.png")),
+];
 
 #[derive(Default)]
 pub struct Assets;

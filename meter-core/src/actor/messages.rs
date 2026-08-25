@@ -86,6 +86,14 @@ pub enum AdminCommand {
     /// 电表清零（重置电能/需量，保留事件/冻结/参数）
     ClearMeter,
 
+    /// 清除冻结历史数据（内存环形缓冲 + 数据库 `freeze_snapshots` 表），
+    /// 保留冻结相关配置（触发模式/结算日等），仅清空已产生的历史快照。
+    ClearFreezeHistory,
+
+    /// 清除负荷记录历史数据（内存缓冲 + 数据库 `load_profile_records` 表），
+    /// 保留负荷记录配置（模式字/起始时间/各类间隔），仅清空已产生的历史采样。
+    ClearLoadProfileHistory,
+
     /// 设置费率时段表（时段列表：起始时/起始分/费率号）
     SetTouConfig { time_slots: Vec<(u8, u8, u8)> },
 

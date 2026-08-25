@@ -10,4 +10,24 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rustc-link-arg=/STACK:16777216");
     }
+
+    embed_windows_icon();
 }
+
+// `winres` 只作为 `cfg(windows)` 的 build-dependency 引入（见 Cargo.toml），
+// 所以这里也必须用 `#[cfg(windows)]` 而不是运行时判断，
+// 否则在非 Windows 主机上编译 build.rs 本身就会因为找不到 `winres` crate 而失败。
+#[cfg(windows)]
+fn embed_windows_icon() {
+    // 把软件图标(assets/icon/app.ico)嵌入到 Windows 可执行文件中，
+    // 这样任务栏、Explorer 文件图标、Alt-Tab 切换器等系统层面显示的
+    // 都是这个图标，而不是 Rust 默认的图标。
+    let mut res = winres::WindowsResource::new();
+    res.set_icon("assets/icon/app.ico");
+    if let Err(err) = res.compile() {
+        println!("cargo:warning=未能嵌入应用图标: {err}");
+    }
+}
+
+#[cfg(not(windows))]
+fn embed_windows_icon() {}

@@ -925,5 +925,11 @@ impl Render for ConnectionConfigView {
                         ))),
                 ),
             )
+            // `window.push_notification` 只是把通知放进 Root 的状态里，真正把它画出来
+            // 还得靠这一层——之前这个设置窗口的 Render 里没有它，所以连接失败之类的
+            // Notification::error 调用了却什么都不出现，是被静音了，不是没触发。
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }

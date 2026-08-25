@@ -165,8 +165,10 @@ impl ConnectionManager {
         self.communication_log.subscribe()
     }
 
-    pub fn communication_logs(&self) -> Vec<CommunicationLogEntry> {
-        self.communication_log.entries()
+    /// 某台电表的通信日志历史（含发给它的广播帧）。按地址过滤，不是
+    /// 整条总线的全部流量——总线上可能同时挂着上千台虚拟表。
+    pub fn communication_logs_for(&self, address: [u8; 6]) -> Vec<CommunicationLogEntry> {
+        self.communication_log.entries_for(address)
     }
 
     pub fn status(&self) -> ConnectionStatus {

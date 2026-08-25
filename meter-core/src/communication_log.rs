@@ -1,7 +1,7 @@
 use chrono::Local;
 use dlt645_2007::{decode_message, FieldValue};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::OpenOptions,
     io::Write,
     path::PathBuf,
@@ -15,6 +15,20 @@ pub const PARSE_PROTOCOL_ID: &str = "dlt645-2007";
 /// 数据项内容解析采用的区域规范
 pub const PARSE_REGION: &str = "南网";
 
+/// DL/T 645 广播地址：所有电表都会响应（如广播校时），
+/// 因此广播帧要出现在每一台电表各自的通信日志里。
+pub const BROADCAST_ADDRESS: [u8; 6] = [0x99; 6];
+
+/// 单台电表的日志环形缓冲上限。
+///
+/// 总线场景下最多可能有 2000 台虚拟表共享同一个物理通道，如果只按
+/// "全局最近 N 条" 缓存，其他表的高频报文会在几百毫秒内把某一台表
+/// 仅有的几条历史记录全部挤出窗口——UI 打开这台表的日志时看到的其实
+/// 是别的表的数据。因此这里按地址分桶，每台表独立计数、独立环形。
+const PER_METER_CAP: usize = 300;
+/// 广播帧独立分桶（不属于任何单一地址），同样做上限截断。
+const BROADCAST_CAP: usize = 300;
+
 #[derive(Debug, Clone)]
 pub struct CommunicationLogEntry {
     pub timestamp_ms: i64,
@@ -24,6 +38,25 @@ pub struct CommunicationLogEntry {
     /// 完整帧解析结果（链路层 + 应用层 + 数据项内容）。
     /// None 表示该段数据不是一条可完整解析的 645 帧（噪声/半截帧/校验失败）。
     pub parsed: Option<FieldValue>,
+    /// 一句话摘要（"读数据 · (当前)组合有功总电能"），由结构化的
+    /// `Message` 在解析时提取，供日志列表直接展示，无需再遍历解析树。
+    /// 未解析帧为空字符串。
+    pub summary: String,
+    /// 帧地址域（原始 6 字节 BCD），直接从原始字节摘取，不要求整帧能
+    /// 完整解析成功——总线上偶发的半截帧/校验错误也可能是"发给这台表"
+    /// 的，按地址过滤时仍需要保留。取不到（数据太短或没有 68H 帧头）
+    /// 时为 None。
+    pub address: Option<[u8; 6]>,
+}
+
+/// 直接从原始字节摘取地址域（68H + 6 字节地址），不依赖 [`parse_frame`]
+/// 的完整解码结果。
+fn extract_address(data: &[u8]) -> Option<[u8; 6]> {
+    if data.len() >= 7 && data[0] == 0x68 {
+        data[1..7].try_into().ok()
+    } else {
+        None
+    }
 }
 
 /// 把 `FieldValue` 树展平成带缩进深度的行，UI 详情表格与日志文件共用同一份结果。
@@ -37,9 +70,10 @@ pub struct FlatNode {
 
 /// 完整解析一条 DL/T 645-2007 帧。
 ///
-/// 仅当整段数据恰好是一条帧（允许前导 FE 字节）时才返回解析树，
-/// 避免把带残留噪声的缓冲渲染成看似正确的字段。
-fn parse_frame(data: &[u8]) -> Option<FieldValue> {
+/// 仅当整段数据恰好是一条帧（允许前导 FE 字节）时才返回（解析树, 摘要），
+/// 避免把带残留噪声的缓冲渲染成看似正确的字段。摘要由结构化的
+/// `Message` 提取（功能码 + 数据项名称），与展示树解耦。
+fn parse_frame(data: &[u8]) -> Option<(FieldValue, String)> {
     if data.is_empty() {
         return None;
     }
@@ -47,7 +81,9 @@ fn parse_frame(data: &[u8]) -> Option<FieldValue> {
     if consumed != data.len() {
         return None;
     }
-    msg.to_value_tree(PARSE_PROTOCOL_ID, PARSE_REGION).ok()
+    let summary = msg.summary(PARSE_PROTOCOL_ID, PARSE_REGION);
+    let tree = msg.to_value_tree(PARSE_PROTOCOL_ID, PARSE_REGION).ok()?;
+    Some((tree, summary))
 }
 
 /// 展平解析树：根节点是整条报文的汇总行，直接展开其子字段。
@@ -159,15 +195,22 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct CommunicationLogService {
-    entries: Arc<Mutex<VecDeque<CommunicationLogEntry>>>,
+    /// 按电表地址分桶的日志环形缓冲，key 为 6 字节 BCD 地址。
+    per_address: Arc<Mutex<HashMap<[u8; 6], VecDeque<CommunicationLogEntry>>>>,
+    /// 广播帧单独分桶（不对应任何单一地址）。
+    broadcast_entries: Arc<Mutex<VecDeque<CommunicationLogEntry>>>,
     events: broadcast::Sender<CommunicationLogEntry>,
     file_tx: mpsc::Sender<CommunicationLogEntry>,
 }
 
 impl CommunicationLogService {
     pub fn new(path: PathBuf) -> Self {
-        let entries = Arc::new(Mutex::new(VecDeque::with_capacity(1_000)));
-        let (events, _) = broadcast::channel(1_000);
+        let per_address = Arc::new(Mutex::new(HashMap::new()));
+        let broadcast_entries = Arc::new(Mutex::new(VecDeque::with_capacity(BROADCAST_CAP)));
+        // 总线上可能同时有大量虚拟表在收发，缓冲适当放大，避免 UI 侧
+        // 订阅者一时处理不过来（比如页面刚打开还在建 LogRecord）时被
+        // broadcast channel 直接丢弃事件。
+        let (events, _) = broadcast::channel(2_000);
         let (file_tx, file_rx) = mpsc::channel::<CommunicationLogEntry>();
         thread::spawn(move || {
             if let Some(parent) = path.parent() {
@@ -199,37 +242,79 @@ impl CommunicationLogService {
             }
         });
         Self {
-            entries,
+            per_address,
+            broadcast_entries,
             events,
             file_tx,
         }
     }
 
+    /// 记录一条报文。磁盘文件仍然记录总线上的全部原始流量（不分地址），
+    /// 内存里的环形缓冲则按地址分桶，供 UI 按"这台表"过滤查询/订阅。
+    /// 摘不到地址（噪声/半截帧）的报文只落盘，不进内存缓冲——它不属于
+    /// 任何一台表，留在内存里也无法按地址检索。
     pub fn record(&self, direction: &'static str, channel: impl Into<String>, data: &[u8]) {
+        let (parsed, summary) = match parse_frame(data) {
+            Some((tree, summary)) => (Some(tree), summary),
+            None => (None, String::new()),
+        };
         let entry = CommunicationLogEntry {
             timestamp_ms: Local::now().timestamp_millis(),
             direction,
             channel: channel.into(),
             data: data.to_vec(),
-            parsed: parse_frame(data),
+            parsed,
+            summary,
+            address: extract_address(data),
         };
-        if let Ok(mut entries) = self.entries.lock() {
-            if entries.len() == 1_000 {
-                entries.pop_front();
+        match entry.address {
+            Some(BROADCAST_ADDRESS) => {
+                if let Ok(mut buf) = self.broadcast_entries.lock() {
+                    if buf.len() == BROADCAST_CAP {
+                        buf.pop_front();
+                    }
+                    buf.push_back(entry.clone());
+                }
             }
-            entries.push_back(entry.clone());
+            Some(addr) => {
+                if let Ok(mut map) = self.per_address.lock() {
+                    let buf = map
+                        .entry(addr)
+                        .or_insert_with(|| VecDeque::with_capacity(PER_METER_CAP));
+                    if buf.len() == PER_METER_CAP {
+                        buf.pop_front();
+                    }
+                    buf.push_back(entry.clone());
+                }
+            }
+            None => {}
         }
         let _ = self.file_tx.send(entry.clone());
         let _ = self.events.send(entry);
     }
+
     pub fn subscribe(&self) -> broadcast::Receiver<CommunicationLogEntry> {
         self.events.subscribe()
     }
-    pub fn entries(&self) -> Vec<CommunicationLogEntry> {
-        self.entries
-            .lock()
-            .map(|items| items.iter().cloned().collect())
-            .unwrap_or_default()
+
+    /// 某台电表的历史报文（含发给它的广播帧），按时间升序合并、
+    /// 截断到最近 [`PER_METER_CAP`] 条。
+    pub fn entries_for(&self, address: [u8; 6]) -> Vec<CommunicationLogEntry> {
+        let mut merged: Vec<CommunicationLogEntry> = Vec::new();
+        if let Ok(map) = self.per_address.lock() {
+            if let Some(buf) = map.get(&address) {
+                merged.extend(buf.iter().cloned());
+            }
+        }
+        if let Ok(buf) = self.broadcast_entries.lock() {
+            merged.extend(buf.iter().cloned());
+        }
+        merged.sort_by_key(|e| e.timestamp_ms);
+        if merged.len() > PER_METER_CAP {
+            let drop_count = merged.len() - PER_METER_CAP;
+            merged.drain(0..drop_count);
+        }
+        merged
     }
 }
 
@@ -253,7 +338,7 @@ mod tests {
 
     #[test]
     fn parses_read_request_into_flat_rows() {
-        let tree = parse_frame(&read_request_frame()).expect("合法帧应解析成功");
+        let (tree, summary) = parse_frame(&read_request_frame()).expect("合法帧应解析成功");
         let rows = flatten_value_tree(&tree);
         assert!(!rows.is_empty());
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
@@ -269,6 +354,8 @@ mod tests {
         assert!(rows
             .iter()
             .any(|r| r.depth > 0 && r.name.contains("功能码") && r.value.contains("读数据")));
+        // 摘要从结构化 Message 提取：功能码 + 数据项
+        assert!(summary.contains("读数据"), "摘要应包含功能码: {summary}");
     }
 
     /// 读数据应答帧：地址 123456789012，DI=00010000，数据 123.45（BCD 45 23 01 00，低位在前）
@@ -289,8 +376,9 @@ mod tests {
 
     #[test]
     fn parses_read_response_with_data_items() {
-        let tree = parse_frame(&read_response_frame()).expect("应答帧应解析成功");
+        let (tree, summary) = parse_frame(&read_response_frame()).expect("应答帧应解析成功");
         let rows = flatten_value_tree(&tree);
+        assert!(summary.contains("读数据"), "应答摘要应包含功能码: {summary}");
         // 控制码 91H：从站→主站、正常应答、读数据
         assert!(rows
             .iter()
@@ -318,8 +406,9 @@ mod tests {
 
     #[test]
     fn parses_block_response_with_sub_item_values() {
-        let tree = parse_frame(&block_response_frame()).expect("数据块帧应解析成功");
+        let (tree, summary) = parse_frame(&block_response_frame()).expect("数据块帧应解析成功");
         let rows = flatten_value_tree(&tree);
+        assert!(summary.contains("读数据"), "数据块摘要应包含功能码: {summary}");
         // 数据块节点本身是分组行，raw 为 20 字节数据块
         let block = rows
             .iter()

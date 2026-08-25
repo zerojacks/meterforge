@@ -1253,6 +1253,57 @@ impl MeterActor {
                 Ok("Meter cleared".to_string())
             }
 
+            AdminCommand::ClearFreezeHistory => {
+                self.meter.state_mut().clear_all_freeze_snapshots();
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    match crate::persistence::PersistenceWorker::delete_freeze_history(
+                        pool, &addr,
+                    )
+                    .await
+                    {
+                        Ok(count) => {
+                            Ok(format!("Freeze history cleared ({count} rows removed)"))
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[MeterActor {}] Failed to delete freeze history from DB: {}",
+                                addr, e
+                            );
+                            Err(format!("内存已清空，但数据库清除失败: {e}"))
+                        }
+                    }
+                } else {
+                    Ok("Freeze history cleared (memory only, persistence disabled)".to_string())
+                }
+            }
+
+            AdminCommand::ClearLoadProfileHistory => {
+                self.meter.state_mut().clear_load_records();
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    match crate::persistence::PersistenceWorker::delete_load_records(pool, &addr)
+                        .await
+                    {
+                        Ok(count) => {
+                            Ok(format!("Load profile history cleared ({count} rows removed)"))
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[MeterActor {}] Failed to delete load records from DB: {}",
+                                addr, e
+                            );
+                            Err(format!("内存已清空，但数据库清除失败: {e}"))
+                        }
+                    }
+                } else {
+                    Ok(
+                        "Load profile history cleared (memory only, persistence disabled)"
+                            .to_string(),
+                    )
+                }
+            }
+
             AdminCommand::SetTouConfig { time_slots } => {
                 use crate::simulation::state::TimeSlot;
                 if time_slots.len() > 14 {

@@ -172,7 +172,12 @@ impl RenderOnce for AppTitleBar {
                     .min_w_0()
                     .gap_3()
                     .items_center()
-                    .child(Icon::new(IconName::Sun).size_4().text_color(theme.primary))
+                    .child(
+                        img("icon/app.png")
+                            .size(px(24.))
+                            .rounded_sm()
+                            .flex_shrink_0(),
+                    )
                     .child(
                         h_flex()
                             .min_w_0()
