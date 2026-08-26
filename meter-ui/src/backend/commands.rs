@@ -1,10 +1,13 @@
 use gpui::*;
-use meter_core::actor::{AdminCommand, MeterActorHandle};
+use meter_core::actor::{string_to_address, AdminCommand, MeterActorHandle};
+use meter_core::persistence::{PersistRequest, PersistenceWorker};
 use meter_core::simulation::SimulationConfig;
 use meter_core::snapshot::FreezeSnapshotSummary;
 use meter_core::ConnectionManager;
 use parking_lot::RwLock;
+use sqlx::SqlitePool;
 use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
 
 /// A presentation-level intent.  It deliberately contains no GPUI types and
 /// lets views stay independent from the actor protocol.
@@ -156,16 +159,23 @@ pub struct ProtocolParameters {
 pub struct AppBackend {
     pub connections: ConnectionManager,
     meters: Arc<RwLock<HashMap<String, MeterActorHandle>>>,
+    /// 持久化句柄（`ENABLE_PERSISTENCE = false` 时为 None）：删除电表时
+    /// 用于排空批量写队列并清理数据库。
+    db_pool: Option<SqlitePool>,
+    persist_tx: Option<mpsc::Sender<PersistRequest>>,
 }
 
 impl AppBackend {
     pub fn new(
         connections: ConnectionManager,
         meters: Arc<RwLock<HashMap<String, MeterActorHandle>>>,
+        persistence: Option<(SqlitePool, mpsc::Sender<PersistRequest>)>,
     ) -> Self {
         Self {
             connections,
             meters,
+            db_pool: persistence.as_ref().map(|(pool, _)| pool.clone()),
+            persist_tx: persistence.map(|(_, tx)| tx),
         }
     }
 
@@ -362,6 +372,54 @@ impl AppBackend {
             .await;
             let success = results.iter().filter(|r| r.is_ok()).count();
             (success, total)
+        })
+    }
+
+    /// 删除一块表（电表列表"删除"入口）：
+    /// 1. 从路由注册表与 actor 句柄表摘除，之后的协议帧/admin 命令都不再命中它；
+    /// 2. 优雅关闭 actor（它会把最终数据塞进持久化队列后停止）；
+    /// 3. 等持久化队列排空（Barrier ack 时这批写入已提交）；
+    /// 4. 清除该表在数据库的全部行——下次启动按 `meters` 表恢复存量表时，
+    ///    被删除的表不会再被建回来。
+    ///
+    /// 步骤 3/4 涉及 sqlx 与 oneshot 等待，必须跑在 ConnectionManager 的专属
+    /// tokio Runtime 上（GPUI 的 smol executor 缺 tokio 上下文会 panic）。
+    pub fn remove_meter(&self, address: &str, cx: &App) -> Task<Result<(), String>> {
+        let Some(handle) = self.meters.write().remove(address) else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        let core_registry = self.connections.registry();
+        let runtime = self.connections.runtime_handle();
+        let db_pool = self.db_pool.clone();
+        let persist_tx = self.persist_tx.clone();
+        let address = address.to_owned();
+
+        cx.background_executor().spawn(async move {
+            if let Ok(bytes) = string_to_address(&address) {
+                core_registry.lock().await.unregister(&bytes);
+            }
+            if let Err(error) = handle.send_admin_command(AdminCommand::Shutdown).await {
+                // actor 已退出时通道已关闭；数据库清理照常进行
+                tracing::warn!(%address, %error, "删除电表时关闭 actor 失败，继续清理数据");
+            }
+            let join = runtime.spawn(async move {
+                if let Some(tx) = persist_tx {
+                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                    if tx.send(PersistRequest::Barrier { ack: ack_tx })
+                        .await
+                        .is_ok()
+                    {
+                        let _ = ack_rx.await;
+                    }
+                }
+                if let Some(pool) = db_pool {
+                    PersistenceWorker::delete_meter_data(&pool, &address)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<(), String>(())
+            });
+            join.await.map_err(|error| error.to_string())?
         })
     }
 

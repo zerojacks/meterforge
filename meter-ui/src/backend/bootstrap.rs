@@ -6,9 +6,10 @@ use crate::{
 use gpui::*;
 use meter_core::{
     actor::{
-        MeterActor, MeterActorConfig, MeterActorHandle, MeterRegistry as CoreMeterRegistry, TickMsg,
+        string_to_address, MeterActor, MeterActorConfig, MeterActorHandle,
+        MeterRegistry as CoreMeterRegistry, TickMsg,
     },
-    persistence::PersistenceConfig,
+    persistence::{PersistenceConfig, PersistenceWorker},
     router::RouterConfig,
     simulation::{LoadProfile, VirtualMeter, VirtualMeterConfig},
     ConnectionManager,
@@ -52,7 +53,11 @@ pub fn initialize(registry: Arc<RwLock<MeterRegistry>>, cx: &mut App) {
     };
 
     let handles = Arc::new(RwLock::new(HashMap::new()));
-    cx.set_global(AppBackend::new(connections.clone(), handles.clone()));
+    cx.set_global(AppBackend::new(
+        connections.clone(),
+        handles.clone(),
+        persistence.clone(),
+    ));
     spawn_demo_meters(
         registry,
         core_registry,
@@ -78,8 +83,31 @@ fn spawn_demo_meters(
     let mut registrations = Vec::new();
     let mut rng = rand::thread_rng();
 
-    for number in 1..=10 {
-        let address_bytes = [number as u8, 0, 0, 0, 0, 0];
+    // 启动时先看数据库里已经登记了哪些表（`meters` 表按地址一行）。为空
+    // 说明是首次启动，创建 10 块演示表；否则按库里的地址逐块恢复——运行
+    // 期间删除过的表（数据行已随删除清理）重启后不会再出现。
+    // 未开持久化时每次都按首次启动处理（每次运行都是全新的一批演示表）。
+    let existing_addresses: Vec<String> = match &persistence {
+        Some((pool, _)) => connections
+            .runtime_handle()
+            .block_on(PersistenceWorker::list_meter_addresses(pool))
+            .unwrap_or_else(|error| {
+                tracing::warn!("[bootstrap] 读取数据库表列表失败，按首次启动处理: {}", error);
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    let first_launch = existing_addresses.is_empty();
+    let meter_addresses: Vec<[u8; 6]> = if first_launch {
+        (1..=10u8).map(|number| [number, 0, 0, 0, 0, 0]).collect()
+    } else {
+        existing_addresses
+            .iter()
+            .filter_map(|address| string_to_address(address).ok())
+            .collect()
+    };
+
+    for address_bytes in meter_addresses {
         // 使用统一的地址格式化函数，确保与 VirtualMeter 内部使用的格式一致
         let address = meter_core::protocol::format::format_address(&address_bytes);
         let mut config = VirtualMeterConfig::default();
@@ -128,6 +156,26 @@ fn spawn_demo_meters(
                         address,
                         e
                     );
+                }
+            }
+
+            // 首次启动：restore 刚确认库里没有这块表，这里立刻把当前虚拟时间
+            // 和落盘锚点写进 `meters` 表完成登记——否则要等运行期间某次落库
+            // 或退出时的保存，其间重启会被再次当成首次启动、重复创建演示表。
+            if first_launch {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let virtual_time = virtual_meter.state().virtual_time;
+                let time_scale = virtual_meter.state().simulation_time_scale;
+                if let Err(error) = connections.runtime_handle().block_on(
+                    PersistenceWorker::save_virtual_time(
+                        pool,
+                        &address,
+                        virtual_time,
+                        now_ms,
+                        time_scale,
+                    ),
+                ) {
+                    tracing::warn!("[bootstrap] 表 {} 写入初始登记失败: {}", address, error);
                 }
             }
         }

@@ -233,11 +233,20 @@ impl PersistenceWorker {
         // 提取所有请求到临时向量，避免借用冲突
         let requests: Vec<_> = self.buffer.drain(..).collect();
 
+        // Barrier 不产生 SQL，只收集起来，等事务提交后再 ack——保证 ack 时
+        // 排在屏障之前的写入已经真正落库
+        let mut barriers: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+
         // 逐个执行写入
         for req in requests {
-            if let Err(e) = self.execute_request(&mut tx, req).await {
-                error!("Failed to execute persist request: {}", e);
-                // 继续处理其他请求，不中断事务
+            match req {
+                PersistRequest::Barrier { ack } => barriers.push(ack),
+                req => {
+                    if let Err(e) = self.execute_request(&mut tx, req).await {
+                        error!("Failed to execute persist request: {}", e);
+                        // 继续处理其他请求，不中断事务
+                    }
+                }
             }
         }
 
@@ -249,6 +258,12 @@ impl PersistenceWorker {
             Err(e) => {
                 error!("Failed to commit transaction: {}", e);
             }
+        }
+
+        // 提交（或失败）之后才放行屏障等待方；即使提交失败，这批请求也已
+        // 从缓冲区取走、不会重试，等待方可以安全地继续后续清理
+        for ack in barriers {
+            let _ = ack.send(());
         }
     }
 
@@ -296,6 +311,10 @@ impl PersistenceWorker {
                 )
                 .await
             }
+
+            // Barrier 在 flush_batch 里已被单独拦截（收集后于事务提交时 ack），
+            // 不会进入 execute_request
+            PersistRequest::Barrier { .. } => unreachable!("Barrier intercepted by flush_batch"),
         }
     }
 
@@ -1287,6 +1306,46 @@ impl PersistenceWorker {
         } else {
             Ok(None)
         }
+    }
+
+    /// 列出数据库中已登记的全部表地址（`meters` 表主键）。
+    ///
+    /// 启动流程据此决定恢复哪些表：结果为空视为首次启动，才去创建演示表；
+    /// 之后被删除的表（`delete_meter_data` 已清行）重启后不会再出现。
+    pub async fn list_meter_addresses(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
+        let rows = sqlx::query("SELECT address FROM meters")
+            .fetch_all(pool)
+            .await?;
+        Ok(rows.into_iter().map(|row| row.get("address")).collect())
+    }
+
+    /// 删除一块表的全部持久化数据：`meters` 配置行、电能寄存器（含结算日
+    /// 历史）、冻结快照、事件记录/汇总、负荷记录，全部在一个事务里完成。
+    ///
+    /// 调用方（删除电表入口）必须先等持久化队列排空（发一个
+    /// [`PersistRequest::Barrier`] 并等待 ack），否则 Shutdown 产生的最终
+    /// flush 可能在本函数之后落库，把刚删掉的行复活。
+    pub async fn delete_meter_data(pool: &SqlitePool, address: &str) -> Result<(), sqlx::Error> {
+        const PER_ADDRESS_TABLES: [&str; 6] = [
+            "meters",
+            "energy_registers",
+            "freeze_snapshots",
+            "event_records",
+            "event_summary",
+            "load_profile_records",
+        ];
+
+        let mut tx = pool.begin().await?;
+        for table in PER_ADDRESS_TABLES {
+            sqlx::query(&format!("DELETE FROM {table} WHERE address = ?"))
+                .bind(address)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        info!("已删除电表 {} 的全部持久化数据", address);
+        Ok(())
     }
 
     /// 保存虚拟时间和时间倍率

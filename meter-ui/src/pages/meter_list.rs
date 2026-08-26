@@ -186,6 +186,74 @@ impl MeterListView {
         self.show_clear_all_dialog(ClearAllKind::LoadProfileHistory, event, window, cx);
     }
 
+    /// 删除单表入口的确认弹窗：确认后调用 `AppBackend::remove_meter`（从
+    /// 路由/句柄表摘除、优雅关闭 actor，并在排空持久化队列后清除该表的
+    /// 全部数据库记录），成功后再清理 UI 侧状态并弹通知。
+    fn show_delete_meter_dialog(
+        &mut self,
+        address: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.entity().downgrade();
+        let title: SharedString = format!("删除电表 {address}").into();
+        let warning: SharedString = format!(
+            "将停止电表 {address} 的仿真、从列表移除，并清除该表的全部数据\
+             （配置、电能、冻结历史、负荷记录），重启后不会恢复。此操作不可撤销。"
+        )
+        .into();
+
+        let dialog_entity = cx.new(|_| {
+            SyncConfirmDialog::new(title, warning, "删除").on_confirm({
+                let view = view.clone();
+                let address = address.clone();
+                move |_, cx| {
+                    let backend = cx.global::<AppBackend>().clone();
+                    let task = backend.remove_meter(&address, cx);
+                    let view = view.clone();
+                    let address = address.clone();
+                    cx.spawn(async move |_, cx| {
+                        let result = task.await;
+                        let _ = view.update(cx, |view, cx| {
+                            match result {
+                                Ok(()) => view.remove_deleted_meter(&address, cx),
+                                Err(error) => {
+                                    view.pending_notification = Some((
+                                        false,
+                                        format!("删除电表 {address} 失败：{error}"),
+                                    ))
+                                }
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("删除电表").w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
+        })
+    }
+
+    /// 后端删除成功后清理 UI 侧状态：从全局注册表移除 entity、重建本地列表
+    /// 与订阅；若删的是当前选中的表，回退到剩余的第一块（无剩余则显示占位）。
+    fn remove_deleted_meter(&mut self, address: &str, cx: &mut Context<Self>) {
+        cx.global::<GlobalMeterRegistry>().0.write().remove(address);
+        self.all_addresses = cx.global::<GlobalMeterRegistry>().0.read().all_addresses();
+        if self.selected_address.as_deref() == Some(address) {
+            self.selected_address = self.all_addresses.first().cloned();
+            self.detail_view = None;
+        }
+        self.subscriptions.clear();
+        self.subscribe_to_meters(cx);
+        self.pending_notification = Some((true, format!("电表 {address} 已删除")));
+    }
+
     /// 每次渲染前刷新过滤结果与 ListState 条目数（数量没变则不动，避免每帧
     /// 重建列表丢滚动位置）；搜索过滤导致数量变化时 reset 会回到顶部。
     fn sync_meter_list(&mut self, cx: &App) {
@@ -197,6 +265,7 @@ impl MeterListView {
     }
 
     /// 单个表项：从注册表取最新快照渲染 MeterCard，只渲染可见范围内的行。
+    /// 卡片右侧附带删除按钮，按下时先拦截冒泡，避免同时触发行选中。
     fn render_meter_item(
         &mut self,
         ix: usize,
@@ -216,6 +285,21 @@ impl MeterListView {
         let Some(snapshot) = snapshot else {
             return div().into_any_element();
         };
+        let delete_button = div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(("meter-delete", ix))
+                    .icon(IconName::CircleX)
+                    .tooltip("删除电表")
+                    .ghost()
+                    .small()
+                    .on_click({
+                        let address = address.clone();
+                        cx.listener(move |view, _, window, cx| {
+                            view.show_delete_meter_dialog(address.clone(), window, cx);
+                        })
+                    }),
+            );
         div()
             .id(("meter-list-item", ix))
             .w_full()
@@ -226,7 +310,11 @@ impl MeterListView {
                     view.select_meter(address.clone(), window, cx)
                 }),
             )
-            .child(MeterCard::new(snapshot).selected(selected))
+            .child(
+                MeterCard::new(snapshot)
+                    .selected(selected)
+                    .trailing(delete_button),
+            )
             .into_any_element()
     }
 

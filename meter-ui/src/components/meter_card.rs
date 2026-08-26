@@ -9,6 +9,8 @@ use gpui_component::*;
 pub struct MeterCard {
     snapshot: MeterSnapshot,
     selected: bool,
+    /// 卡片右侧（状态点旁）的附加内容，比如列表项上的删除按钮。
+    trailing: Option<AnyElement>,
 }
 
 impl MeterCard {
@@ -16,10 +18,15 @@ impl MeterCard {
         Self {
             snapshot,
             selected: false,
+            trailing: None,
         }
     }
     pub fn selected(mut self, selected: bool) -> Self {
         self.selected = selected;
+        self
+    }
+    pub fn trailing(mut self, trailing: impl IntoElement) -> Self {
+        self.trailing = Some(trailing.into_any_element());
         self
     }
 }
@@ -78,7 +85,13 @@ impl RenderOnce for MeterCard {
                                 .text_color(theme.muted_foreground),
                             ),
                     )
-                    .child(div().mt_1().size(px(7.0)).rounded_full().bg(accent)),
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().mt_1().size(px(7.0)).rounded_full().bg(accent))
+                            .children(self.trailing),
+                    ),
             )
     }
 }

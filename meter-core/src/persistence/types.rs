@@ -43,8 +43,8 @@ pub struct RestoredVirtualTime {
     pub synced_at_ms: Option<i64>,
 }
 
-/// 持久化请求枚举
-#[derive(Debug, Clone)]
+/// 持久化请求枚举（`Barrier` 携带一次性的 oneshot ack，不可克隆）
+#[derive(Debug)]
 pub enum PersistRequest {
     /// 写入冻结快照
     WriteFreezeSnapshot(FreezeSnapshotRow),
@@ -75,6 +75,13 @@ pub enum PersistRequest {
         synced_at_ms: i64,
         time_scale: f64,
         simulation_config: SimulationConfig,
+    },
+
+    /// 排空屏障：本身不写任何数据，只用于确认排在它之前的请求都已经落库
+    /// （worker 在批量事务提交之后才 ack）。删除电表时先用它等掉 Shutdown
+    /// 产生的最终 flush，再清理数据库，避免迟到的批量写入把刚删掉的行复活。
+    Barrier {
+        ack: tokio::sync::oneshot::Sender<()>,
     },
 }
 

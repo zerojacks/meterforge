@@ -128,6 +128,12 @@ impl MeterRegistry {
         self.meters.get(address)
     }
 
+    /// 移除一块表（删除电表入口用）。返回被移除的 entity，调用方丢弃它即可：
+    /// 其后台更新循环持有的 snapshot 通道会随 actor 关闭而断开，entity 释放后循环自行退出。
+    pub fn remove(&mut self, address: &str) -> Option<Entity<MeterState>> {
+        self.meters.remove(address)
+    }
+
     pub fn all_addresses(&self) -> Vec<String> {
         let mut addresses: Vec<_> = self.meters.keys().cloned().collect();
         addresses.sort();
