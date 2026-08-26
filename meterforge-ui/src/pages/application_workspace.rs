@@ -57,6 +57,7 @@ impl ApplicationWorkspace {
             ..Default::default()
         };
         cx.open_window(options, |window, cx| {
+            window.set_window_title("MeterForgeSettings");
             let view = cx.new(|cx| ConnectionConfigView::new(window, cx));
             view.update(cx, |view, cx| view.refresh_serial_ports(cx));
             cx.new(|cx| Root::new(view, window, cx))

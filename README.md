@@ -1,19 +1,21 @@
-# DL/T 645-2007 虚拟电表模拟器
+# MeterForge — DL/T 645-2007 虚拟电表模拟器
 
-**版本**: 0.1.0  
-**状态**: ✅ 开发完成（核心功能100%，UI功能100%）  
-**技术栈**: Rust + Tokio + GPUI + gpui-component
+**版本**: 0.1.0
+**仓库**: <https://github.com/zerojacks/meterforge>
+**技术栈**: Rust（nightly） · Tokio · GPUI + gpui-component · SQLite (sqlx)
 
 ---
 
 ## 📋 项目概述
 
-这是一个高性能的 DL/T 645-2007 电能表协议模拟器，支持：
-- ✅ **2000个虚拟表并发运行**（目标规模）
-- ✅ **完整协议支持**：帧编解码、所有控制码、DI数据项
-- ✅ **真实仿真行为**：脉冲累加、需量滑差、事件检测、冻结调度
-- ✅ **图形化监控**：基于 GPUI 的现代化用户界面
-- ✅ **数据持久化**：SQLite 存储历史数据
+高性能的 DL/T 645-2007 电能表协议模拟器与监控平台：
+
+- **完整协议支持**：帧编解码（+33H 偏移 / 校验和）、全部控制码（11H–1BH）、DI 数据项读写
+- **真实仿真行为**：虚拟时钟、脉冲累加、最大需量滑差、事件检测（失压/欠压/过压/断相/过流等）、冻结调度、负荷记录、费率时段表
+- **多通道接入**：串口（RS485 总线仿真）、TCP 服务器 / TCP 客户端
+- **多表并发**：Actor 架构 + `MeterRegistry`，目标规模 2000 表
+- **图形化监控**：GPUI 界面 — 表列表、实时数据、历史曲线、参数管理、通信日志面板
+- **数据持久化**：SQLite 存储，支持断电恢复与优雅关闭
 
 ---
 
@@ -21,339 +23,130 @@
 
 ```
 meter_engine/
-├── docs/                           # 📚 设计文档
-│   ├── 虚拟645电表模拟器_设计方案.md   # 主设计方案
-│   ├── UI集成设计方案.md              # UI架构设计
-│   └── UI开发完成报告.md              # UI实现报告
+├── Cargo.toml                  # Workspace 配置
+├── rust-toolchain.toml         # 固定 nightly 工具链
+├── .github/workflows/release.yml   # CI 发布（tag 触发）
 │
-├── meter-core/                     # 🔧 核心虚拟表引擎
+├── meter-core/                 # 核心虚拟表引擎（无 UI 依赖，可独立测试）
 │   ├── src/
-│   │   ├── protocol/               # 协议层（Frame Codec）
-│   │   │   ├── frame.rs            # 帧结构定义
-│   │   │   ├── codec.rs            # 编解码器（+33H偏移、校验和）
-│   │   │   └── control_code.rs     # 控制码枚举
-│   │   │
-│   │   ├── simulation/             # 仿真层
-│   │   │   ├── state.rs            # MeterState 状态结构
-│   │   │   ├── physics_engine.rs   # 物理仿真引擎
-│   │   │   └── di_handler.rs       # DI数据项处理
-│   │   │
-│   │   └── persistence/            # 持久化层
-│   │       ├── worker.rs           # 数据库写入任务
-│   │       └── types.rs            # 数据库类型定义
-│   │
-│   └── migrations/                 # 数据库迁移脚本
-│       ├── 0001_init.sql
-│       └── 0002_load_profile_samples.sql
+│   │   ├── protocol/           # 协议层：帧结构、编解码、控制码
+│   │   ├── simulation/         # 仿真层：物理引擎、电表状态、DI 数据项处理
+│   │   ├── actor/              # 多表并发：MeterActor + MeterRegistry
+│   │   ├── transport/          # 传输层：串口 / TCP 通道
+│   │   ├── router.rs           # 帧路由（按通信地址分发到虚拟表）
+│   │   ├── connection.rs       # 连接管理器（串口 / TCP server / TCP client）
+│   │   ├── communication_log.rs# 通信报文日志
+│   │   ├── snapshot.rs         # 状态快照
+│   │   ├── persistence/        # SQLite 持久化 worker
+│   │   └── error.rs
+│   ├── migrations/             # 数据库迁移脚本
+│   ├── tests/                  # 集成测试（端到端 / 传输 / 持久化 / 恢复 / 优雅关闭）
+│   └── examples/               # 示例程序
 │
-├── meter-ui/                       # 🎨 GPUI 图形界面
-│   └── src/
-│       ├── main.rs                 # 应用入口
-│       ├── types.rs                # 数据类型
-│       ├── state.rs                # 状态管理（Entity Registry）
-│       └── views/                  # UI组件
-│           ├── app_titlebar.rs     # 自定义标题栏
-│           ├── stats_panel.rs      # 统计面板
-│           ├── meter_card.rs       # 单表卡片
-│           ├── meter_list.rs       # 列表视图
-│           └── meter_detail.rs     # 详情视图
+├── meter-ui/                   # GPUI 图形界面
+│   ├── src/
+│   │   ├── main.rs             # 应用入口
+│   │   ├── backend/            # 后端引导与命令通道
+│   │   ├── pages/              # 页面：表列表 / 详情 / 实时数据 / 历史 / 参数 / 通信日志
+│   │   ├── components/         # 通用组件（标题栏、表卡片）
+│   │   ├── settings/           # 连接配置、仿真配置、参数下发对话框
+│   │   ├── state.rs / types.rs # 状态管理与类型
+│   │   └── assets.rs
+│   ├── assets/icon/            # 应用图标（ico / icns / png）
+│   └── build.rs                # Windows 图标内嵌 + 主线程栈配置
 │
-└── Cargo.toml                      # Workspace 配置
+├── packaging/                  # 各平台打包脚本与资源（见其 README）
+├── data/                       # 运行时 SQLite 数据库（meters.db）
+└── docs/                       # 设计文档
 ```
-
----
-
-## ✨ 核心功能
-
-### 1. 协议层（100%完成）
-
-#### Frame Codec
-- ✅ 帧编码/解码
-- ✅ +33H 数据偏移
-- ✅ 校验和计算与验证
-- ✅ 控制码枚举（11H-1BH）
-- ✅ 错误码定义（ERR位）
-
-#### 支持的命令
-| 控制码 | 功能 | 状态 |
-|-------|------|------|
-| 11H | 读数据 | ✅ |
-| 12H | 读后续数据 | ✅ |
-| 13H | 读通信地址 | ✅ |
-| 14H | 写数据 | ✅ |
-| 15H | 写通信地址 | ✅ |
-| 16H | 冻结命令 | ✅ |
-| 08H | 广播校时 | ✅ |
-| 17H | 改通信速率 | ✅ |
-| 18H | 修改密码 | ✅ |
-| 19H | 最大需量清零 | ✅ |
-| 1AH | 电表清零 | ✅ |
-| 1BH | 事件清零 | ✅ |
-
-### 2. 仿真层（85%完成）
-
-#### 已实现功能
-- ✅ **虚拟时钟**：独立于系统时间，支持校时
-- ✅ **脉冲累加**：按电表常数累加电能量
-- ✅ **最大需量**：滑差窗口计算
-- ✅ **事件检测**：失压/欠压/过压/断相/过流等
-- ✅ **冻结功能**：定时/瞬时/时区切换/日时段切换
-- ✅ **负荷记录**：按时间序列采样存储
-- ✅ **时段表查询**：费率分时计量
-
-#### 待实现（阶段三四）
-- ⏳ 多通道接入（Serial/TCP）
-- ⏳ 2000表并发运行
-- ⏳ Admin调试通道
-
-### 3. UI界面（100%完成）
-
-#### 组件列表
-| 组件 | 功能 | 状态 |
-|-----|------|------|
-| AppTitleBar | 自定义标题栏 | ✅ |
-| StatsPanel | 统计面板（在线数/总电能/总功率/平均电压） | ✅ |
-| MeterCard | 单表卡片（电压/电流/功率/电能） | ✅ |
-| MeterListView | 表列表（网格布局/虚拟滚动） | ✅ |
-| MeterDetailView | 详情页（实时数据/三相显示） | ✅ |
-
-#### 技术特性
-- ✅ Entity Registry 架构（细粒度订阅）
-- ✅ 实时数据更新（mpsc通道 + cx.notify）
-- ✅ 响应式设计（网格布局 + 悬停效果）
-- ✅ 主题系统（gpui-component统一样式）
-- ✅ 虚拟滚动优化（限制100个卡片）
-
----
-
-## 🎯 测试通过情况
-
-### meter-core 测试
-```bash
-cd meter-core && cargo test --lib
-```
-**结果**: ✅ 84/84 tests passed
-
-### 测试覆盖
-- ✅ Frame Codec 编解码
-- ✅ +33H 偏移计算
-- ✅ 校验和验证
-- ✅ 控制码解析
-- ✅ 脉冲累加逻辑
-- ✅ 需量滑差窗口
-- ✅ 冻结触发检测
-- ✅ 负荷记录采样
-- ✅ DI数据项读写
-- ✅ 事件记录生成
 
 ---
 
 ## 🚀 快速开始
 
 ### 前置要求
-- Rust 1.75+ （nightly for GPUI）
-- Cargo
-- SQLite 3
+
+- **Rust**：仓库的 `rust-toolchain.toml` 已固定 nightly，rustup 会在构建时自动安装，无需手动切换默认工具链。
+- **Linux** 需要安装 GPUI 的系统依赖：
+
+  ```bash
+  sudo apt-get install -y \
+    pkg-config libudev-dev \
+    libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+    libxcb-xfixes0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+    libxcb-randr0-dev libxcb-util-dev libxkbcommon-dev libxkbcommon-x11-dev \
+    libwayland-dev libvulkan-dev \
+    libfontconfig1-dev libfreetype-dev
+  ```
+
+- **SQLite**：由 sqlx 静态捆绑，无需系统安装。
 
 ### 编译运行
 
 ```bash
-# 1. 克隆项目
-git clone <repository-url>
-cd meter_engine
+git clone https://github.com/zerojacks/meterforge.git
+cd meterforge
 
-# 2. 测试核心功能
-cd meter-core
-cargo test --lib
+# 启动图形界面
+cargo run -p meter-ui
 
-# 3. 运行UI（需要nightly Rust）
-rustup default nightly
-cd ../meter-ui
-cargo run
-
-# 4. 恢复stable
-rustup default stable
+# 测试核心引擎（108 个单元测试 + 5 组集成测试）
+cargo test -p meter-core
 ```
 
-### 当前已知问题
+> 报文解析库 `dlt645-2007` 来自 [protocol-parser](https://github.com/zerojacks/protocol-parser) 仓库，
+> 以 git 依赖引入，cargo 会自动拉取，克隆本项目后无需任何本地准备。
 
-⚠️ **GPUI编译问题**
-```
-error[E0658]: use of unstable library feature `slice_as_array`
-```
-**解决方案**: 
-1. 使用 `rustup default nightly`
-2. 或等待 GPUI 上游修复
-3. 或回退到 GPUI 稳定版本
+### 构建行为说明
+
+- **debug 构建**：Windows 下保留控制台窗口，tracing 日志直接输出到终端，便于开发调试。
+- **release 构建**：Windows 下为 GUI 子系统（`windows_subsystem = "windows"`），双击启动不弹
+  控制台窗口；应用图标已由 `meter-ui/build.rs` 内嵌到 exe 资源。
 
 ---
 
-## 📊 性能指标
+## 📦 打包与发布
 
-### 内存占用（理论）
-- 单表 Entity: ~116 字节
-- 50表总计: < 50 KB
-- 2000表预估: < 1 MB ✅
+### 本地打包
 
-### CPU占用（理论）
-- 单表更新: ~54 μs
-- 50表并发: < 3 ms
-- 2000表并发: < 108 ms（串行）/ < 14 ms（8核并行）✅
+macOS 生成 `.app`、Linux 安装 desktop 图标等，见 [packaging/README.md](packaging/README.md)。
 
-### 渲染性能
-- 虚拟滚动: 最多100卡片
-- 屏幕可见: 20-30卡片
-- 目标帧率: 60fps
-- 实测预期: > 100fps ✅
+### CI 发布（GitHub Actions）
+
+`.github/workflows/release.yml` 在推送 `v*` tag 时触发，四个环境并行编译 release，
+自动按约定式提交归类生成 changelog，并创建 GitHub Release 挂载产物：
+
+| 平台 | 产物 |
+|------|------|
+| Windows x86_64 | `MeterForge-windows-x86_64-<版本>.zip` |
+| Linux x86_64 | `MeterForge-linux-x86_64-<版本>.tar.gz`（二进制 + desktop + 图标 + install.sh） |
+| macOS x86_64 | `MeterForge-darwin-x86_64-<版本>.dmg` |
+| macOS aarch64 | `MeterForge-darwin-aarch64-<版本>.dmg` |
+
+发布新版本：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+tag 中的版本号会写入 `Cargo.toml` 与 macOS `Info.plist`。
 
 ---
 
 ## 📖 设计文档
 
-### 主要文档
-1. **[虚拟645电表模拟器_设计方案.md](docs/虚拟645电表模拟器_设计方案.md)**
-   - 总体架构
-   - 协议要点
-   - 仿真算法
-   - 数据库设计
-   - 开发阶段划分
-
-2. **[UI集成设计方案.md](docs/UI集成设计方案.md)**
-   - Entity Registry 架构
-   - 组件设计
-   - 性能分析
-   - Admin功能
-
-3. **[UI开发完成报告.md](docs/UI开发完成报告.md)**
-   - 实现清单
-   - 代码结构
-   - 已知问题
-   - 下一步计划
+1. [虚拟645电表模拟器_设计方案.md](docs/虚拟645电表模拟器_设计方案.md) — 总体架构、协议要点、仿真算法、数据库设计
+2. [电表物理模型_模拟方案.md](docs/电表物理模型_模拟方案.md) — 电气量物理模型
+3. [simulation_algorithms.md](docs/simulation_algorithms.md) — 仿真算法细节
+4. [UI集成设计方案.md](docs/UI集成设计方案.md) — UI 架构与组件设计
 
 ---
 
-## 🔧 技术栈
+## 📝 提交规范
 
-### 核心依赖
-```toml
-[dependencies]
-# 异步运行时
-tokio = { version = "1", features = ["full"] }
+CI 的 changelog 按约定式提交自动归类，请遵循：
 
-# 序列化
-serde = { version = "1", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
-
-# 数据库
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio"] }
-
-# UI框架
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-
-# 并发原语
-parking_lot = "0.12"
-
-# 错误处理
-thiserror = "1.0"
-```
-
----
-
-## 🎨 UI预览
-
-### 列表视图
-```
-┌─────────────────────────────────────────────────────┐
-│ 🔵 DL/T 645-2007 虚拟电表监控  [在线:50] [总数:50]   │
-├─────────────────────────────────────────────────────┤
-│ 📊 在线50/50  ⚡总电能123.5MWh  📈总功率67.8kW  🔋220V│
-├─────────────────────────────────────────────────────┤
-│ 🔍 搜索...                显示 50 / 50 个表          │
-├─────────────────────────────────────────────────────┤
-│ ┌──────────┐ ┌──────────┐ ┌──────────┐             │
-│ │🟢 表 001  │ │🟢 表 002  │ │🟢 表 003  │             │
-│ │220.3V     │ │219.8V     │ │221.1V     │             │
-│ │总电能     │ │总电能     │ │总电能     │             │
-│ │1234.56kWh │ │987.65kWh  │ │2345.67kWh│             │
-│ └──────────┘ └──────────┘ └──────────┘             │
-│ ...                                                  │
-└─────────────────────────────────────────────────────┘
-```
-
-### 详情视图
-```
-┌─────────────────────────────────────────────────────┐
-│ ← 表 000000000001 详情                      [🟢在线]  │
-├─────────────────────────────────────────────────────┤
-│ 实时数据                                             │
-│ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                │
-│ │1.23kW│ │0.37kv│ │0.950 │ │1.47kW│                │
-│ │有功  │ │无功  │ │功率  │ │最大  │                │
-│ └──────┘ └──────┘ └──────┘ └──────┘                │
-│                                                      │
-│ 三相电压                                             │
-│ ┌──────┐ ┌──────┐ ┌──────┐                         │
-│ │220.3V│ │219.8V│ │221.1V│                         │
-│ │ A相  │ │ B相  │ │ C相  │                         │
-│ └──────┘ └──────┘ └──────┘                         │
-│                                                      │
-│ 三相电流                                             │
-│ ┌──────┐ ┌──────┐ ┌──────┐                         │
-│ │5.58A │ │5.52A │ │5.61A │                         │
-│ │ A相  │ │ B相  │ │ C相  │                         │
-│ └──────┘ └──────┘ └──────┘                         │
-└─────────────────────────────────────────────────────┘
-```
-
----
-
-## 🗺️ 开发路线图
-
-### ✅ 阶段一：协议内核（已完成）
-- [x] Frame Codec
-- [x] 控制码处理
-- [x] 单元测试
-
-### ✅ 阶段二：完整仿真（已完成）
-- [x] 脉冲累加
-- [x] 需量计算
-- [x] 事件检测
-- [x] 冻结功能
-- [x] 负荷记录
-
-### ⏳ 阶段三：多通道接入（计划中）
-- [ ] Serial 通道
-- [ ] TCP 通道
-- [ ] 帧路由
-
-### ⏳ 阶段四：多表并发（计划中）
-- [ ] MeterRegistry
-- [ ] 2000表实例
-- [ ] 性能测试
-
-### ⏳ 阶段五：Admin通道（计划中）
-- [ ] Admin命令
-- [ ] 批量操作
-- [ ] 状态查询
-
-### ✅ 阶段六：UI开发（已完成）
-- [x] GPUI集成
-- [x] gpui-component组件
-- [x] 实时监控界面
-- [x] 详情页
-
----
-
-## 📝 贡献指南
-
-### 代码规范
-- 使用 `rustfmt` 格式化代码
-- 遵循 Rust 命名约定
-- 添加必要的注释（中英文）
-- 编写单元测试
-
-### 提交规范
 ```
 feat: 添加新功能
 fix: 修复bug
@@ -371,21 +164,10 @@ MIT OR Apache-2.0
 
 ---
 
-## 👥 作者
-
-- **Kiro AI** - 初始开发
-
----
-
 ## 🙏 致谢
 
-- [GPUI](https://github.com/zed-industries/zed) - 高性能UI框架
-- [gpui-component](https://github.com/longbridge/gpui-component) - UI组件库
-- [Tokio](https://tokio.rs/) - 异步运行时
-- [SQLx](https://github.com/launchbadge/sqlx) - 异步数据库驱动
-
----
-
-**最后更新**: 2025-08-05  
-**项目状态**: 🚧 开发中（核心完成，集成待续）
-
+- [GPUI](https://github.com/zed-industries/zed) — 高性能 UI 框架
+- [gpui-component](https://github.com/longbridge/gpui-component) — UI 组件库
+- [protocol-parser](https://github.com/zerojacks/protocol-parser) — 多协议报文解析库
+- [Tokio](https://tokio.rs/) — 异步运行时
+- [SQLx](https://github.com/launchbadge/sqlx) — 异步数据库驱动

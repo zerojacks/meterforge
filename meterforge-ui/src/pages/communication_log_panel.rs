@@ -232,6 +232,7 @@ impl CommunicationLogPanel {
         };
         let handle = cx
             .open_window(options, |window, cx| {
+                window.set_window_title("MeterForgeParser");
                 cx.new(|cx| Root::new(root_view, window, cx))
             })
             .expect("failed to open communication log detail window");

@@ -1,3 +1,7 @@
+// release 构建下 Windows 使用 GUI 子系统：双击 exe 启动时不再弹出黑色控制台窗口。
+// debug 构建保留控制台子系统，tracing 日照常直接打到终端，方便开发调试。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Meter UI application entry point.
 //!
 //! Bootstrap is intentionally small: it wires the presentation store to the
@@ -52,10 +56,11 @@ fn main() {
                     height: px(480.),
                 }),
                 kind: WindowKind::Normal,
-                app_id: Some("meter-engine".to_string()),
+                app_id: Some("MeterForge".to_string()),
                 ..Default::default()
             };
             cx.open_window(options, |window, cx| {
+                window.set_window_title("MeterForge");
                 let workspace = cx.new(|cx| ApplicationWorkspace::new(window, cx));
                 cx.new(|cx| Root::new(workspace, window, cx))
             })

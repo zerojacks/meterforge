@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=MeterForge
+Comment=MeterForge virtual meter monitoring platform
+Exec=MeterForge
+Icon=meterforge
+Terminal=false
+Categories=Utility;

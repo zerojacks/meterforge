@@ -1,8 +1,9 @@
 [workspace]
 members = [
-    "meter-core",
-    "meter-ui",  # 启用 UI 开发
+    "meterforge-core",
+    "meterforge-ui",  # 启用 UI 开发
 ]
+default-members = ["meterforge-ui"]
 resolver = "2"
 
 [workspace.package]
@@ -33,6 +34,8 @@ gpui-component = { git = "https://github.com/longbridge/gpui-component" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 
 # 报文解析：完整帧解析（链路层 + 应用层），内部经 spec-engine 解析数据项内容
-dlt645-2007 = { path = "../protocol-parser/dlt645-2007" }
+# 来自独立仓库 protocol-parser；git 依赖必须写仓库根 URL，
+# cargo 会按包名 dlt645-2007 在仓库内自动定位，全新 clone / CI 无需本地兄弟目录
+dlt645-2007 = { git = "https://github.com/zerojacks/protocol-parser.git" }
 
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "json", "chrono", "migrate"] }

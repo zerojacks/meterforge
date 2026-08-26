@@ -1,0 +1,344 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update Cargo.toml version
+        run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+
+      # gpui 需要 X11/Wayland/Vulkan/字体等开发库；libudev 是 serialport(RS485 仿真) 的链接依赖
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libudev-dev \
+            libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
+            libxcb-randr0-dev libxcb-util-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev \
+            libfontconfig1-dev libfreetype-dev
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-
+
+      - name: Build
+        run: cargo build --release -p meter-ui
+
+      # tar 包内容: 二进制 + packaging/linux 的 desktop 入口/图标/install.sh
+      - name: Package tar.gz
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          STAGE="MeterForge-linux-x86_64-$VERSION"
+          mkdir -p "dist/$STAGE"
+          cp target/release/MeterForge "dist/$STAGE/"
+          cp packaging/linux/meterforge.desktop packaging/linux/install.sh "dist/$STAGE/"
+          cp -r packaging/linux/hicolor "dist/$STAGE/hicolor"
+          tar -czf "dist/$STAGE.tar.gz" -C dist "$STAGE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeterForge-linux-x86_64-${{ steps.version.outputs.VERSION }}
+          path: dist/*.tar.gz
+
+  # Windows
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Update Cargo.toml version
+        run: sed -i 's/^version = .*/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+        shell: bash
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: windows-
+
+      # release 下 MeterForge.exe 是 GUI 子系统（无控制台窗口），图标已由 build.rs 内嵌
+      - name: Build
+        run: cargo build --release -p meter-ui
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target\release\MeterForge.exe -DestinationPath "dist/MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}
+          path: dist/*.zip
+
+  # macOS x86_64（交叉编译）
+  build-macos-x86_64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update Cargo.toml version
+        run: sed -i '' 's/^version = .*/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-x86_64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-x86_64-
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build
+        run: cargo build --release -p meter-ui --target x86_64-apple-darwin
+
+      - name: Package DMG
+        run: |
+          export TARGET_TRIPLE=x86_64-apple-darwin
+          export APP_VERSION=${{ steps.version.outputs.VERSION }}
+          sh packaging/macos/build-app-bundle.sh
+
+          create-dmg \
+            --volname "MeterForge" \
+            --window-size 540 320 \
+            --icon-size 100 \
+            --icon "MeterForge.app" 140 160 \
+            --app-drop-link 400 160 \
+            "MeterForge-darwin-x86_64-$APP_VERSION.dmg" \
+            "target/release/MeterForge.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}
+          path: MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.dmg
+
+  # macOS aarch64（原生）
+  build-macos-aarch64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Update Cargo.toml version
+        run: sed -i '' 's/^version = .*/version = "${{ steps.version.outputs.VERSION }}"/' Cargo.toml
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-aarch64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-aarch64-
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build
+        run: cargo build --release -p meter-ui --target aarch64-apple-darwin
+
+      - name: Package DMG
+        run: |
+          export TARGET_TRIPLE=aarch64-apple-darwin
+          export APP_VERSION=${{ steps.version.outputs.VERSION }}
+          sh packaging/macos/build-app-bundle.sh
+
+          create-dmg \
+            --volname "MeterForge" \
+            --window-size 540 320 \
+            --icon-size 100 \
+            --icon "MeterForge.app" 140 160 \
+            --app-drop-link 400 160 \
+            "MeterForge-darwin-aarch64-$APP_VERSION.dmg" \
+            "target/release/MeterForge.app"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}
+          path: MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.dmg
+
+  # 汇总发布
+  release:
+    needs: [build-linux, build-windows, build-macos-x86_64, build-macos-aarch64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Get previous tag
+        id: prev_tag
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "PREV_TAG=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "Previous tag: $PREV_TAG"
+
+      # 按约定式提交（feat/fix/refactor/...）归类生成 changelog
+      - name: Generate changelog
+        run: |
+          FEATURES=""
+          FIXES=""
+          REFACTORS=""
+          DOCS=""
+          CHORES=""
+          BREAKING=""
+          OTHERS=""
+
+          if [ -n "${{ steps.prev_tag.outputs.PREV_TAG }}" ]; then
+            RANGE="${{ steps.prev_tag.outputs.PREV_TAG }}..HEAD"
+          else
+            RANGE="HEAD~50..HEAD"
+          fi
+
+          while IFS= read -r line; do
+            HASH=$(echo "$line" | cut -d'|' -f1)
+            MSG=$(echo "$line" | cut -d'|' -f2-)
+
+            if echo "$MSG" | grep -q "^Merge"; then
+              continue
+            fi
+
+            PR_NUM=$(echo "$MSG" | grep -oP '#\K\d+' | head -1)
+            PR_LINK=""
+            if [ -n "$PR_NUM" ]; then
+              PR_LINK=" ([#${PR_NUM}](https://github.com/${{ github.repository }}/pull/${PR_NUM}))"
+            fi
+
+            CLEAN_MSG=$(echo "$MSG" | sed 's/^[a-z]*: //' | sed 's/^[a-z]*([^)]*): //')
+
+            if echo "$MSG" | grep -qE '^feat(\(|:)|^feature(\(|:)'; then
+              FEATURES="${FEATURES}\n- ${CLEAN_MSG}${PR_LINK}"
+            elif echo "$MSG" | grep -qE '^fix(\(|:)'; then
+              FIXES="${FIXES}\n- ${CLEAN_MSG}${PR_LINK}"
+            elif echo "$MSG" | grep -qE '^refactor(\(|:)'; then
+              REFACTORS="${REFACTORS}\n- ${CLEAN_MSG}${PR_LINK}"
+            elif echo "$MSG" | grep -qE '^docs(\(|:)'; then
+              DOCS="${DOCS}\n- ${CLEAN_MSG}${PR_LINK}"
+            elif echo "$MSG" | grep -qE '^chore(\(|:)|^build(\(|:)|^ci(\(|:)|^test(\(|:)'; then
+              CHORES="${CHORES}\n- ${CLEAN_MSG}${PR_LINK}"
+            elif echo "$MSG" | grep -qE '^BREAKING CHANGE'; then
+              BREAKING="${BREAKING}\n- ${CLEAN_MSG}${PR_LINK}"
+            else
+              OTHERS="${OTHERS}\n- ${MSG}${PR_LINK}"
+            fi
+          done < <(git log "$RANGE" --pretty=format:"%H|%s" --no-merges)
+
+          MARKDOWN=""
+
+          if [ -n "$BREAKING" ]; then
+            MARKDOWN="${MARKDOWN}## ⚠️ Breaking Changes\n${BREAKING}\n\n"
+          fi
+          if [ -n "$FEATURES" ]; then
+            MARKDOWN="${MARKDOWN}## ✨ New Features\n${FEATURES}\n\n"
+          fi
+          if [ -n "$FIXES" ]; then
+            MARKDOWN="${MARKDOWN}## 🐛 Bug Fixes\n${FIXES}\n\n"
+          fi
+          if [ -n "$REFACTORS" ]; then
+            MARKDOWN="${MARKDOWN}## ♻️ Code Refactoring\n${REFACTORS}\n\n"
+          fi
+          if [ -n "$DOCS" ]; then
+            MARKDOWN="${MARKDOWN}## 📚 Documentation\n${DOCS}\n\n"
+          fi
+          if [ -n "$CHORES" ]; then
+            MARKDOWN="${MARKDOWN}## 🔧 Chores\n${CHORES}\n\n"
+          fi
+          if [ -n "$OTHERS" ]; then
+            MARKDOWN="${MARKDOWN}## 📦 Other Changes\n${OTHERS}\n\n"
+          fi
+
+          if [ -z "$MARKDOWN" ]; then
+            MARKDOWN="Initial release"
+          fi
+
+          echo -e "$MARKDOWN" > CHANGELOG.md
+          cat CHANGELOG.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/MeterForge-linux-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz
+            artifacts/MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip
+            artifacts/MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.dmg
+            artifacts/MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.dmg

@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=DL/T 645-2007 虚拟电表监控平台
-Comment=Meter Engine virtual meter monitoring platform
-Exec=meter-ui
-Icon=meter-engine
-Terminal=false
-Categories=Utility;

@@ -6,11 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "meter-ui"
+name = "MeterForge"
 path = "src/main.rs"
 
 [dependencies]
-meter-core = { path = "../meter-core" }
+meter-core = { path = "../meterforge-core" }
 
 tokio.workspace = true
 serde.workspace = true

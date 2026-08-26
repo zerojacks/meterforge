@@ -24,6 +24,10 @@ fn embed_windows_icon() {
     // 都是这个图标，而不是 Rust 默认的图标。
     let mut res = winres::WindowsResource::new();
     res.set_icon("assets/icon/app.ico");
+    res.set("ProductName", "MeterForge");
+    res.set("FileDescription", "MeterForge");
+    res.set("InternalName", "MeterForge");
+    res.set("OriginalFilename", "MeterForge.exe");
     if let Err(err) = res.compile() {
         println!("cargo:warning=未能嵌入应用图标: {err}");
     }

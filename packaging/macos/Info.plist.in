@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Meter Engine</string>
+    <string>MeterForge</string>
     <key>CFBundleDisplayName</key>
     <string>DL/T 645-2007 虚拟电表监控平台</string>
     <key>CFBundleIdentifier</key>
-    <string>com.meterengine.meter-ui</string>
+    <string>com.meterforge.meter-ui</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
