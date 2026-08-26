@@ -1,6 +1,12 @@
-#define AppVersion "0.1.0"
-#define SourceDir "..\..\target\release"
-#define OutputDir "..\..\dist"
+#ifndef AppVersion
+	#define AppVersion "0.1.0"
+#endif
+#ifndef SourceDir
+	#define SourceDir "..\..\target\release"
+#endif
+#ifndef OutputDir
+	#define OutputDir "..\..\dist"
+#endif
 
 [Setup]
 AppId={{8B8B7F7E-5E3D-4A31-9A3B-2FBB2E6F4F01}
@@ -29,4 +35,4 @@ Name: "{group}\MeterForge"; Filename: "{app}\MeterForge.exe"
 Name: "{autodesktop}\MeterForge"; Filename: "{app}\MeterForge.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\\MeterForge.exe"; Description: "启动 MeterForge"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\MeterForge.exe"; Description: "启动 MeterForge"; Flags: postinstall nowait skipifsilent
