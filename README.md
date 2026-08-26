@@ -116,12 +116,16 @@ macOS 生成 `.app`、Linux 安装 desktop 图标等，见 [packaging/README.md]
 `.github/workflows/release.yml` 在推送 `v*` tag 时触发，四个环境并行编译 release，
 自动按约定式提交归类生成 changelog，并创建 GitHub Release 挂载产物：
 
+Release 同时发布自定义格式的 `latest.json`，客户端可通过
+`https://github.com/zerojacks/meterforge/releases/latest/download/latest.json`
+检查新版本及对应平台安装包，并使用其中的 SHA-256 值校验下载文件。
+
 | 平台 | 产物 |
 |------|------|
-| Windows x86_64 | `MeterForge-windows-x86_64-<版本>.zip` |
-| Linux x86_64 | `MeterForge-linux-x86_64-<版本>.tar.gz`（二进制 + desktop + 图标 + install.sh） |
-| macOS x86_64 | `MeterForge-darwin-x86_64-<版本>.dmg` |
-| macOS aarch64 | `MeterForge-darwin-aarch64-<版本>.dmg` |
+| Windows x86_64 | `MeterForge-Setup-<版本>.exe`（安装包）和 `MeterForge-windows-x86_64-<版本>.zip`（便携版） |
+| Linux x86_64 | `MeterForge-linux-x86_64-<版本>.deb`（安装包）和 `MeterForge-linux-x86_64-<版本>.tar.gz`（便携版） |
+| macOS x86_64 | `MeterForge-darwin-x86_64-<版本>.pkg`（安装包）和 `.dmg`（拖拽安装） |
+| macOS aarch64 | `MeterForge-darwin-aarch64-<版本>.pkg`（安装包）和 `.dmg`（拖拽安装） |
 
 发布新版本：
 

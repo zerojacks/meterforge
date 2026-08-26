@@ -26,7 +26,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            pkg-config libudev-dev \
+            pkg-config jq libudev-dev \
             libx11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcb-icccm4-dev libxcb-keysyms1-dev \
             libxcb-randr0-dev libxcb-util-dev libxkbcommon-dev libxkbcommon-x11-dev \
@@ -50,7 +50,7 @@ jobs:
         run: cargo build --release -p meter-ui
 
       # tar 包内容: 二进制 + packaging/linux 的 desktop 入口/图标/install.sh
-      - name: Package tar.gz
+      - name: Package tar.gz and deb
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           STAGE="MeterForge-linux-x86_64-$VERSION"
@@ -59,12 +59,15 @@ jobs:
           cp packaging/linux/meterforge.desktop packaging/linux/install.sh "dist/$STAGE/"
           cp -r packaging/linux/hicolor "dist/$STAGE/hicolor"
           tar -czf "dist/$STAGE.tar.gz" -C dist "$STAGE"
+          sh packaging/linux/build-deb.sh "$VERSION"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MeterForge-linux-x86_64-${{ steps.version.outputs.VERSION }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
 
   # Windows
   build-windows:
@@ -98,17 +101,28 @@ jobs:
       - name: Build
         run: cargo build --release -p meter-ui
 
-      - name: Package zip
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+
+      - name: Package installer and zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=${{ steps.version.outputs.VERSION }}" `
+            "/DSourceDir=$((Get-Location).Path)\target\release" `
+            "/DOutputDir=$((Get-Location).Path)\dist" `
+            "packaging\windows\MeterForge.iss"
           Compress-Archive -Path target\release\MeterForge.exe -DestinationPath "dist/MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}
-          path: dist/*.zip
+          path: |
+            dist/*.zip
+            dist/*-Setup-*.exe
 
   # macOS x86_64（交叉编译）
   build-macos-x86_64:
@@ -149,6 +163,8 @@ jobs:
           export TARGET_TRIPLE=x86_64-apple-darwin
           export APP_VERSION=${{ steps.version.outputs.VERSION }}
           sh packaging/macos/build-app-bundle.sh
+          export DARWIN_ARCH=x86_64
+          sh packaging/macos/build-pkg.sh
 
           create-dmg \
             --volname "MeterForge" \
@@ -163,7 +179,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}
-          path: MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.dmg
+          path: |
+            MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.dmg
+            dist/MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.pkg
 
   # macOS aarch64（原生）
   build-macos-aarch64:
@@ -204,6 +222,8 @@ jobs:
           export TARGET_TRIPLE=aarch64-apple-darwin
           export APP_VERSION=${{ steps.version.outputs.VERSION }}
           sh packaging/macos/build-app-bundle.sh
+          export DARWIN_ARCH=aarch64
+          sh packaging/macos/build-pkg.sh
 
           create-dmg \
             --volname "MeterForge" \
@@ -218,7 +238,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}
-          path: MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.dmg
+          path: |
+            MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.dmg
+            dist/MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.pkg
 
   # 汇总发布
   release:
@@ -332,13 +354,25 @@ jobs:
       - name: List artifacts
         run: ls -la artifacts/
 
+      - name: Generate latest.json
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.VERSION }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          sh packaging/generate-latest-json.sh \
+            "$RELEASE_VERSION" "$RELEASE_REPOSITORY" artifacts CHANGELOG.md artifacts/latest.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: CHANGELOG.md
           fail_on_unmatched_files: true
           files: |
+            artifacts/latest.json
+            artifacts/MeterForge-linux-x86_64-${{ steps.version.outputs.VERSION }}.deb
             artifacts/MeterForge-linux-x86_64-${{ steps.version.outputs.VERSION }}.tar.gz
             artifacts/MeterForge-windows-x86_64-${{ steps.version.outputs.VERSION }}.zip
+            artifacts/MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.pkg
             artifacts/MeterForge-darwin-x86_64-${{ steps.version.outputs.VERSION }}.dmg
+            artifacts/MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.pkg
             artifacts/MeterForge-darwin-aarch64-${{ steps.version.outputs.VERSION }}.dmg

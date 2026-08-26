@@ -18,6 +18,15 @@
 已在 `meterforge-ui/build.rs` 里用 `winres` 把 `app.ico` 嵌入可执行文件资源，
 正常 `cargo build -p meter-ui` 即可，任务栏/资源管理器/Alt-Tab 会显示这个图标。
 
+Windows 安装包使用 Inno Setup 生成。安装 Inno Setup 6 后，在仓库根目录执行：
+
+```powershell
+iscc /DAppVersion=0.1.0 packaging/windows/MeterForge.iss
+```
+
+安装包会生成到 `dist/MeterForge-Setup-0.1.0.exe`，安装后会创建开始菜单入口，
+并提供可选的桌面快捷方式和卸载入口。
+
 ## macOS
 
 cargo 只产出裸的可执行文件，Dock 图标需要一层 `.app` 包装。构建完成后运行：
@@ -29,6 +38,16 @@ sh packaging/macos/build-app-bundle.sh
 
 会在 `target/release/MeterForge.app` 生成标准应用包（`Info.plist` 模板见
 `packaging/macos/Info.plist.in`），双击即可运行，Dock 显示的就是 `app.icns`。
+
+macOS 安装包使用系统自带的 `pkgbuild` 生成：
+
+```sh
+sh packaging/macos/build-app-bundle.sh
+APP_VERSION=0.1.0 DARWIN_ARCH=x86_64 sh packaging/macos/build-pkg.sh
+```
+
+安装包会生成到 `dist/MeterForge-darwin-x86_64-0.1.0.pkg`，安装目标为
+`/Applications/MeterForge.app`。`.dmg` 仍作为拖拽式安装包保留。
 
 ## Linux
 
@@ -46,18 +65,44 @@ sudo PREFIX=/usr/share sh install.sh   # 全局安装
 `.desktop` 里的 `Exec=MeterForge` 假设该二进制已在 `PATH` 上，
 按实际安装路径调整即可。
 
+Linux Debian/Ubuntu 用户可使用 `.deb` 安装包。构建命令：
+
+```sh
+cargo build --release -p meter-ui
+sh packaging/linux/build-deb.sh 0.1.0
+```
+
+安装包会生成到 `dist/MeterForge-linux-x86_64-0.1.0.deb`，可通过以下命令安装：
+
+```sh
+sudo apt install ./dist/MeterForge-linux-x86_64-0.1.0.deb
+```
+
 ## CI 发布（GitHub Actions）
 
 `.github/workflows/release.yml` 在推送 `v*` tag 时触发，四个环境并行编译
 release 并自动创建 GitHub Release（changelog 按约定式提交 feat/fix/... 归类生成）：
 
-- `MeterForge-windows-x86_64-<版本>.zip` — MeterForge.exe（图标已内嵌；release
+每次 Release 还会生成 `latest.json`，用于客户端检查更新。固定检查地址为：
+
+```text
+https://github.com/zerojacks/meterforge/releases/latest/download/latest.json
+```
+
+这是项目自定义的更新元数据格式，包含版本、更新说明、发布时间、下载地址、文件大小
+和 SHA-256 校验值。客户端下载安装包后应重新计算 SHA-256，并与 `sha256` 字段严格比对，
+校验成功后再执行安装或替换。
+
+- `MeterForge-windows-x86_64-<版本>.zip` — 便携版 MeterForge.exe（图标已内嵌；release
   构建为 GUI 子系统，启动不弹控制台窗口）
-- `MeterForge-linux-x86_64-<版本>.tar.gz` — 二进制 + `.desktop` + hicolor 图标 +
-  `install.sh`
+- `MeterForge-Setup-<版本>.exe` — Windows 安装包（开始菜单、可选桌面快捷方式和卸载）
+- `MeterForge-linux-x86_64-<版本>.deb` — Debian/Ubuntu 安装包
+- `MeterForge-linux-x86_64-<版本>.tar.gz` — 便携版二进制 + `.desktop` + hicolor 图标 + `install.sh`
 - `MeterForge-darwin-x86_64-<版本>.dmg` / `MeterForge-darwin-aarch64-<版本>.dmg`
   — `.app` 由 `packaging/macos/build-app-bundle.sh` 打包（CI 通过 `TARGET_TRIPLE` /
   `APP_VERSION` 环境变量驱动交叉编译和版本注入）
+- `MeterForge-darwin-x86_64-<版本>.pkg` / `MeterForge-darwin-aarch64-<版本>.pkg`
+  — macOS 安装包，安装到 `/Applications`
 
 发布新版本：
 
