@@ -604,7 +604,7 @@ impl MeterDetailView {
         let dialog_entity = cx.new(|_| {
             SyncConfirmDialog::new(
                 "将清空当前表的全部负荷记录历史采样（内存与数据库），负荷记录配置不受影响。此操作不可撤销。",
-                "清除历史数据",
+                "清除负荷记录数据",
             )
             .on_confirm(move |_, cx| {
                 let backend = cx.global::<AppBackend>().clone();
@@ -627,7 +627,7 @@ impl MeterDetailView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("清除历史数据").w(px(500.)).content({
+            dialog.title("清除负荷记录数据").w(px(500.)).content({
                 let dialog_entity = dialog_entity.clone();
                 move |content, _, _| content.child(dialog_entity.clone())
             })
@@ -968,7 +968,7 @@ impl MeterDetailView {
                     .child(Label::new("负荷记录").text_2xl().font_semibold())
                     .child(
                         Button::new("clear-load-profile-history")
-                            .label("清除历史数据")
+                            .label("清除负荷记录数据")
                             .small()
                             .danger()
                             .on_click(cx.listener(Self::show_clear_load_profile_history_dialog)),
