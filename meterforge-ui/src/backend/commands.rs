@@ -1,7 +1,7 @@
 use gpui::*;
 use meter_core::actor::{
     address_to_string, string_to_address, AdminCommand, MeterActor, MeterActorConfig,
-    MeterActorHandle, TickMsg,
+    MeterActorHandle, MeterRegistry, TickMsg,
 };
 use meter_core::persistence::{PersistRequest, PersistenceWorker};
 use meter_core::simulation::{LoadProfile, SimulationConfig, VirtualMeter, VirtualMeterConfig};
@@ -382,10 +382,11 @@ impl AppBackend {
         let targets: Vec<MeterActorHandle> = self.meters.read().values().cloned().collect();
         let total = targets.len();
         cx.background_executor().spawn(async move {
-            let results = futures::future::join_all(targets.iter().map(|handle| {
-                handle.send_admin_command(AdminCommand::ClearLoadProfileHistory)
-            }))
-            .await;
+            let results =
+                futures::future::join_all(targets.iter().map(|handle| {
+                    handle.send_admin_command(AdminCommand::ClearLoadProfileHistory)
+                }))
+                .await;
             let success = results.iter().filter(|r| r.is_ok()).count();
             (success, total)
         })
@@ -457,7 +458,11 @@ impl AppBackend {
                 if let (Some(src), Some(pool)) = (&source_for_db, &db_pool_for_db) {
                     if let Some(tx) = &persist_tx_for_barrier {
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                        if tx.send(PersistRequest::Barrier { ack: ack_tx }).await.is_ok() {
+                        if tx
+                            .send(PersistRequest::Barrier { ack: ack_tx })
+                            .await
+                            .is_ok()
+                        {
                             let _ = ack_rx.await;
                         }
                     }
@@ -488,9 +493,7 @@ impl AppBackend {
 
                 Ok::<VirtualMeter, String>(virtual_meter)
             });
-            let virtual_meter = join
-                .await
-                .map_err(|e| format!("任务执行失败: {e}"))??;
+            let virtual_meter = join.await.map_err(|e| format!("任务执行失败: {e}"))??;
 
             let initial_snapshot = crate::types::MeterSnapshot::from_state(
                 virtual_meter.state(),
@@ -519,14 +522,147 @@ impl AppBackend {
                 actor.run().await;
             });
 
-            meters.write().insert(new_address_for_task.clone(), handle.clone());
-            let _ = core_registry.lock().await.register(new_address_bytes, handle);
+            meters
+                .write()
+                .insert(new_address_for_task.clone(), handle.clone());
+            let _ = core_registry
+                .lock()
+                .await
+                .register(new_address_bytes, handle);
 
             Ok(NewMeterHandle {
                 address: new_address_for_task,
                 initial_snapshot,
                 snapshot_rx,
             })
+        })
+    }
+
+    /// 修改一块表的地址（电表列表"修改地址"入口），保留该表全部配置与历史
+    /// 数据，仅地址变化。需要同步内存与数据库两边的五处状态，顺序如下：
+    ///
+    /// 1. [`AdminCommand::SetAddress`] 切换 actor 内存地址（仿真状态 + actor
+    ///    配置）并等待回执——actor 单线程处理命令，回执后不再产生旧地址的
+    ///    持久化写；
+    /// 2. 核心路由表 re-key（新地址立即生效，旧地址的协议帧不再命中）；
+    /// 3. 在专属 tokio Runtime 上 Barrier 排空持久化队列后，单事务完成
+    ///    [`PersistenceWorker::rename_meter_data`]（复制旧→新 + 删除旧行）；
+    /// 4. UI 句柄表 re-key（同步句柄缓存的地址字段）。
+    ///
+    /// 若第 2/3 步失败则 best-effort 回滚（把 actor 与路由表改回旧地址），
+    /// 避免出现"内存里是新地址、数据库还是旧地址、重启后新旧两块表"的
+    /// 不一致。成功返回新地址字符串，供 UI 侧完成注册表 re-key 与选中态切换。
+    pub fn update_meter_address(
+        &self,
+        old_address: &str,
+        new_address_bytes: [u8; 6],
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let old_address = old_address.to_owned();
+        let new_address = address_to_string(&new_address_bytes);
+
+        let (handle, old_bytes) = {
+            let meters = self.meters.read();
+            if new_address == old_address {
+                return Task::ready(Err("新地址与当前地址相同".to_string()));
+            }
+            let Some(handle) = meters.get(&old_address).cloned() else {
+                return Task::ready(Err(format!("meter {old_address} not found")));
+            };
+            if meters.contains_key(&new_address) {
+                return Task::ready(Err(format!("地址 {new_address} 已存在")));
+            }
+            let Ok(old_bytes) = string_to_address(&old_address) else {
+                return Task::ready(Err(format!("旧地址格式非法: {old_address}")));
+            };
+            (handle, old_bytes)
+        };
+
+        let core_registry = self.connections.registry();
+        let runtime = self.connections.runtime_handle();
+        let db_pool = self.db_pool.clone();
+        let persist_tx = self.persist_tx.clone();
+        let meters = self.meters.clone();
+        let old_address_for_db = old_address.clone();
+        let new_address_for_db = new_address.clone();
+        let new_address_for_task = new_address.clone();
+
+        cx.background_executor().spawn(async move {
+            // 1. 切换 actor 内存地址；回执后 actor 只会产生新地址的持久化写
+            if let Err(error) = handle
+                .send_admin_command(AdminCommand::SetAddress {
+                    address: new_address_bytes,
+                })
+                .await
+            {
+                return Err(format!("切换电表地址失败: {error}"));
+            }
+
+            // 2. 路由表 re-key；失败（新地址已被注册等竞态）则把 actor 切回去
+            if let Err(error) = core_registry
+                .lock()
+                .await
+                .update_address(&old_bytes, new_address_bytes)
+            {
+                let _ = handle
+                    .send_admin_command(AdminCommand::SetAddress { address: old_bytes })
+                    .await;
+                return Err(format!("更新路由表失败: {error}"));
+            }
+
+            // 3. Barrier 排空 + 数据库改名（sqlx 需要 tokio 上下文）
+            let db_result = runtime
+                .spawn(async move {
+                    if let Some(tx) = persist_tx {
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                        if tx
+                            .send(PersistRequest::Barrier { ack: ack_tx })
+                            .await
+                            .is_ok()
+                        {
+                            let _ = ack_rx.await;
+                        }
+                    }
+                    if let Some(pool) = db_pool {
+                        PersistenceWorker::rename_meter_data(
+                            &pool,
+                            &old_address_for_db,
+                            &new_address_for_db,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .await
+                .map_err(|error| format!("任务执行失败: {error}"))?;
+
+            match db_result {
+                // 4. 句柄表 re-key（同步句柄缓存的地址字段，保持与路由表一致）。
+                // 必须只拿一次写锁：`if let` 条件里的临时写守卫会活到语句结束，
+                // 若在块内再次 `meters.write()`，不可重入的 RwLock 会在同一线程
+                // 上死锁——改名后 UI 不刷新（详情面板停留在旧地址）的根因。
+                Ok(()) => {
+                    let mut meters_guard = meters.write();
+                    if let Some(mut handle) = meters_guard.remove(&old_address) {
+                        handle.address = new_address_bytes;
+                        meters_guard.insert(new_address_for_task.clone(), handle);
+                    }
+                    drop(meters_guard);
+                    Ok(new_address_for_task)
+                }
+                // 数据库改名失败：回滚 actor 内存地址与路由表，恢复一致后报错
+                Err(error) => {
+                    let _ = handle
+                        .send_admin_command(AdminCommand::SetAddress { address: old_bytes })
+                        .await;
+                    let _ = core_registry
+                        .lock()
+                        .await
+                        .update_address(&new_address_bytes, old_bytes);
+                    Err(format!("数据库改名失败: {error}"))
+                }
+            }
         })
     }
 
@@ -537,12 +673,9 @@ impl AppBackend {
     /// 4. 清除该表在数据库的全部行——下次启动按 `meters` 表恢复存量表时，
     ///    被删除的表不会再被建回来。
     ///
-    /// 步骤 3/4 涉及 sqlx 与 oneshot 等待，必须跑在 ConnectionManager 的专属
-    /// tokio Runtime 上（GPUI 的 smol executor 缺 tokio 上下文会 panic）。
+    /// 具体流程在 [`Self::teardown_meter`] 里实现，与批量删除共用。
     pub fn remove_meter(&self, address: &str, cx: &App) -> Task<Result<(), String>> {
-        let Some(handle) = self.meters.write().remove(address) else {
-            return Task::ready(Err(format!("meter {address} not found")));
-        };
+        let meters = self.meters.clone();
         let core_registry = self.connections.registry();
         let runtime = self.connections.runtime_handle();
         let db_pool = self.db_pool.clone();
@@ -550,32 +683,103 @@ impl AppBackend {
         let address = address.to_owned();
 
         cx.background_executor().spawn(async move {
-            if let Ok(bytes) = string_to_address(&address) {
-                core_registry.lock().await.unregister(&bytes);
-            }
-            if let Err(error) = handle.send_admin_command(AdminCommand::Shutdown).await {
-                // actor 已退出时通道已关闭；数据库清理照常进行
-                tracing::warn!(%address, %error, "删除电表时关闭 actor 失败，继续清理数据");
-            }
-            let join = runtime.spawn(async move {
-                if let Some(tx) = persist_tx {
-                    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-                    if tx.send(PersistRequest::Barrier { ack: ack_tx })
-                        .await
-                        .is_ok()
-                    {
-                        let _ = ack_rx.await;
-                    }
-                }
-                if let Some(pool) = db_pool {
-                    PersistenceWorker::delete_meter_data(&pool, &address)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok::<(), String>(())
-            });
-            join.await.map_err(|error| error.to_string())?
+            Self::teardown_meter(
+                &meters,
+                &core_registry,
+                &runtime,
+                &db_pool,
+                &persist_tx,
+                &address,
+            )
+            .await
         })
+    }
+
+    /// 批量删除多块表（电表列表"删除选中"入口）。
+    ///
+    /// 与逐块 `remove_meter` 的差别只在编排：全部在同一个后台任务里**串行**
+    /// 逐表执行（每块都要走 Barrier + 数据库事务，并发会让 SQLite 互相锁），
+    /// 单块失败不中断——记录原因后继续删剩下的表。返回
+    /// `(成功数, 失败列表（地址, 原因）)`，供 UI 弹汇总通知。
+    pub fn remove_meters(
+        &self,
+        addresses: Vec<String>,
+        cx: &App,
+    ) -> Task<(usize, Vec<(String, String)>)> {
+        let meters = self.meters.clone();
+        let core_registry = self.connections.registry();
+        let runtime = self.connections.runtime_handle();
+        let db_pool = self.db_pool.clone();
+        let persist_tx = self.persist_tx.clone();
+
+        cx.background_executor().spawn(async move {
+            let mut success = 0usize;
+            let mut failures = Vec::new();
+            for address in addresses {
+                match Self::teardown_meter(
+                    &meters,
+                    &core_registry,
+                    &runtime,
+                    &db_pool,
+                    &persist_tx,
+                    &address,
+                )
+                .await
+                {
+                    Ok(()) => success += 1,
+                    Err(error) => failures.push((address, error)),
+                }
+            }
+            (success, failures)
+        })
+    }
+
+    /// `remove_meter` / `remove_meters` 共用的单表删除流程：
+    /// 摘句柄 → 注销路由 → 优雅关闭 actor → Barrier 排空 → 清库。
+    ///
+    /// Barrier 与数据库清理涉及 sqlx 与 oneshot 等待，必须跑在
+    /// ConnectionManager 的专属 tokio Runtime 上（GPUI 的 smol executor
+    /// 缺 tokio 上下文会 panic），因此 `runtime` 由调用方传入。
+    async fn teardown_meter(
+        meters: &Arc<RwLock<HashMap<String, MeterActorHandle>>>,
+        core_registry: &Arc<tokio::sync::Mutex<MeterRegistry>>,
+        runtime: &tokio::runtime::Handle,
+        db_pool: &Option<SqlitePool>,
+        persist_tx: &Option<mpsc::Sender<PersistRequest>>,
+        address: &str,
+    ) -> Result<(), String> {
+        let Some(handle) = meters.write().remove(address) else {
+            return Err(format!("meter {address} not found"));
+        };
+        if let Ok(bytes) = string_to_address(address) {
+            core_registry.lock().await.unregister(&bytes);
+        }
+        if let Err(error) = handle.send_admin_command(AdminCommand::Shutdown).await {
+            // actor 已退出时通道已关闭；数据库清理照常进行
+            tracing::warn!(address, %error, "删除电表时关闭 actor 失败，继续清理数据");
+        }
+        let address = address.to_owned();
+        let db_pool = db_pool.clone();
+        let persist_tx = persist_tx.clone();
+        let join = runtime.spawn(async move {
+            if let Some(tx) = persist_tx {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if tx
+                    .send(PersistRequest::Barrier { ack: ack_tx })
+                    .await
+                    .is_ok()
+                {
+                    let _ = ack_rx.await;
+                }
+            }
+            if let Some(pool) = db_pool {
+                PersistenceWorker::delete_meter_data(&pool, &address)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok::<(), String>(())
+        });
+        join.await.map_err(|error| error.to_string())?
     }
 
     /// Gracefully shutdown all meters (save virtual time and energy registers)

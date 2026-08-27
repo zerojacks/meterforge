@@ -564,7 +564,6 @@ impl SimulationConfigPanel {
         let this = cx.entity();
         let dialog_entity = cx.new(|_| {
             SyncConfirmDialog::new(
-                "同步模拟配置到所有表",
                 "确认后将当前表单的模拟计算、冻结、结算日、负荷记录配置覆盖所有电表（含当前表），并写入数据库。此操作不可撤销。",
                 "应用到所有表",
             )

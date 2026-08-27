@@ -1133,7 +1133,7 @@ impl MeterActor {
                 minute,
                 second,
             } => {
-                use chrono::{Utc, TimeZone};
+                use chrono::{TimeZone, Utc};
                 match Utc
                     .with_ymd_and_hms(
                         year as i32,
@@ -1198,14 +1198,18 @@ impl MeterActor {
                 if apply_res.is_ok() {
                     if let Some(pool) = &self.config.db_pool {
                         let addr = format_address(&self.config.address);
-                        if let Err(e) = crate::persistence::PersistenceWorker::save_simulation_config(
-                            pool,
-                            &addr,
-                            &config_for_persist,
-                        )
-                        .await
+                        if let Err(e) =
+                            crate::persistence::PersistenceWorker::save_simulation_config(
+                                pool,
+                                &addr,
+                                &config_for_persist,
+                            )
+                            .await
                         {
-                            warn!("[MeterActor {}] Failed to persist simulation config: {}", addr, e);
+                            warn!(
+                                "[MeterActor {}] Failed to persist simulation config: {}",
+                                addr, e
+                            );
                         }
                     }
                 }
@@ -1257,14 +1261,10 @@ impl MeterActor {
                 self.meter.state_mut().clear_all_freeze_snapshots();
                 if let Some(pool) = &self.config.db_pool {
                     let addr = format_address(&self.config.address);
-                    match crate::persistence::PersistenceWorker::delete_freeze_history(
-                        pool, &addr,
-                    )
-                    .await
+                    match crate::persistence::PersistenceWorker::delete_freeze_history(pool, &addr)
+                        .await
                     {
-                        Ok(count) => {
-                            Ok(format!("Freeze history cleared ({count} rows removed)"))
-                        }
+                        Ok(count) => Ok(format!("Freeze history cleared ({count} rows removed)")),
                         Err(e) => {
                             warn!(
                                 "[MeterActor {}] Failed to delete freeze history from DB: {}",
@@ -1285,9 +1285,9 @@ impl MeterActor {
                     match crate::persistence::PersistenceWorker::delete_load_records(pool, &addr)
                         .await
                     {
-                        Ok(count) => {
-                            Ok(format!("Load profile history cleared ({count} rows removed)"))
-                        }
+                        Ok(count) => Ok(format!(
+                            "Load profile history cleared ({count} rows removed)"
+                        )),
                         Err(e) => {
                             warn!(
                                 "[MeterActor {}] Failed to delete load records from DB: {}",
@@ -1370,7 +1370,10 @@ impl MeterActor {
                     )
                     .await
                     {
-                        warn!("[MeterActor {}] Failed to persist freeze config: {}", addr, e);
+                        warn!(
+                            "[MeterActor {}] Failed to persist freeze config: {}",
+                            addr, e
+                        );
                     }
                 }
                 Ok("Freeze configuration applied".to_string())
@@ -1390,14 +1393,14 @@ impl MeterActor {
                     if let Some(pool) = &self.config.db_pool {
                         let addr = format_address(&self.config.address);
                         if let Err(e) = crate::persistence::PersistenceWorker::save_settlement_days(
-                            pool,
-                            &addr,
-                            days,
-                            hours,
+                            pool, &addr, days, hours,
                         )
                         .await
                         {
-                            warn!("[MeterActor {}] Failed to persist settlement days: {}", addr, e);
+                            warn!(
+                                "[MeterActor {}] Failed to persist settlement days: {}",
+                                addr, e
+                            );
                         }
                     }
 
@@ -1419,15 +1422,14 @@ impl MeterActor {
                 if let Some(pool) = &self.config.db_pool {
                     let addr: String = format_address(&self.config.address);
                     if let Err(e) = crate::persistence::PersistenceWorker::save_load_record_config(
-                        pool,
-                        &addr,
-                        mode_word,
-                        start_time,
-                        intervals,
+                        pool, &addr, mode_word, start_time, intervals,
                     )
                     .await
                     {
-                        warn!("[MeterActor {}] Failed to persist load record config: {}", addr, e);
+                        warn!(
+                            "[MeterActor {}] Failed to persist load record config: {}",
+                            addr, e
+                        );
                     }
                 }
 
@@ -1493,10 +1495,18 @@ impl MeterActor {
                 Ok(format_address(&addr))
             }
 
+            AdminCommand::SetAddress { address } => {
+                self.meter.state_mut().address = address;
+                self.config.address = address;
+                // 立即推送一次快照，让 UI 马上看到新地址，不用等下一个 tick。
+                self.push_snapshot();
+                Ok(format_address(&address))
+            }
+
             AdminCommand::Shutdown => {
                 self.graceful_shutdown().await;
                 Ok("Shutting down...".to_string())
-            },
+            }
 
             AdminCommand::SaveState => {
                 // TODO: 触发最终flush
@@ -1568,7 +1578,8 @@ impl MeterActor {
                                         rate_number: r,
                                     })
                                     .collect();
-                                state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
+                                state.num_time_slots =
+                                    state.tou_config.day_table_1.slots.len() as u8;
                             }
                             self.persist_protocol_parameters().await;
                             // 虚拟时间单独走 save_virtual_time（带停机补时锚点语义）
@@ -1700,10 +1711,7 @@ impl MeterActor {
                                 ));
                             }
                             Err(e) => {
-                                warn!(
-                                    "[MeterActor {}] 冻结快照 payload 解析失败: {}",
-                                    address, e
-                                );
+                                warn!("[MeterActor {}] 冻结快照 payload 解析失败: {}", address, e);
                             }
                         }
                     }
@@ -1785,10 +1793,13 @@ impl MeterActor {
 
         // 强制flush电能寄存器和虚拟时间
         // 这里不仅发送到 PersistenceWorker 队列，还要直接写数据库确保数据保存
-        
+
         // 方案1：通过 PersistenceWorker 队列（异步，可能丢失）
         if let Some(_persist_tx) = self.meter.force_flush_energy() {
-            debug!("[MeterActor {}] Sent flush request to PersistenceWorker", address_str);
+            debug!(
+                "[MeterActor {}] Sent flush request to PersistenceWorker",
+                address_str
+            );
         }
 
         // 方案2：直接写数据库（同步，保证成功）
@@ -1796,7 +1807,10 @@ impl MeterActor {
             // 保存虚拟时钟
             match self.meter.save_virtual_time(pool).await {
                 Ok(_) => {
-                    debug!("[MeterActor {}] Saved virtual time to database", address_str);
+                    debug!(
+                        "[MeterActor {}] Saved virtual time to database",
+                        address_str
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -1999,6 +2013,46 @@ mod tests {
         println!("Snapshot: {}", result.unwrap());
 
         // 关闭
+        let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn test_set_address_updates_state_and_reply() {
+        let (tick_tx, tick_rx) = broadcast::channel(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+
+        let config = VirtualMeterConfig::default();
+        let old_address = config.address;
+        let meter = VirtualMeter::new(config.clone());
+
+        let actor_config = MeterActorConfig {
+            address: old_address,
+            ..Default::default()
+        };
+        let actor = MeterActor::new(meter, tick_rx, cmd_rx, actor_config);
+        let handle = MeterActorHandle::new(cmd_tx, old_address);
+        tokio::spawn(async move {
+            actor.run().await;
+        });
+
+        // 新地址与旧地址不同（默认地址是 123456789012 的 BCD 形式）
+        let new_address = [0x99, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let reply = handle
+            .send_admin_command(AdminCommand::SetAddress {
+                address: new_address,
+            })
+            .await
+            .expect("SetAddress must be acknowledged");
+        assert_eq!(reply, format_address(&new_address));
+
+        // 状态里的地址已经切换（GetAddress 读的是仿真状态）
+        let current = handle
+            .send_admin_command(AdminCommand::GetAddress)
+            .await
+            .expect("GetAddress must succeed");
+        assert_eq!(current, format_address(&new_address));
+        assert_ne!(current, format_address(&old_address));
+
         let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
     }
 
@@ -2956,7 +3010,10 @@ mod tests {
         assert!(parsed["virtual_time_ms"].as_i64().unwrap() >= virtual_time_ms);
         assert_eq!(parsed["baudrate"].as_u64().unwrap(), 0x08);
         assert_eq!(parsed["passwords"][3].to_string(), "[3,161,178,195]");
-        assert_eq!(parsed["time_slots"].to_string(), "[[0,0,1],[8,30,2],[18,0,1]]");
+        assert_eq!(
+            parsed["time_slots"].to_string(),
+            "[[0,0,1],[8,30,2],[18,0,1]]"
+        );
 
         let _ = handle.send_admin_command(AdminCommand::Shutdown).await;
     }

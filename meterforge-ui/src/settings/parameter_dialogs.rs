@@ -1,17 +1,17 @@
 // 参数设置对话框集合
 // 包含时间设置、密码修改、通信速率、费率时段表等所有配置对话框
 
+use crate::components::SettingsTitleBar;
 use chrono::{Datelike, TimeZone, Timelike, Utc};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::form::{field, v_form};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
-use gpui_component::select::{Select, SelectState};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::*;
-use crate::components::SettingsTitleBar;
 use gpui_component::notification::Notification;
+use gpui_component::scroll::ScrollableElement;
+use gpui_component::select::{Select, SelectState};
+use gpui_component::*;
 // ============================================================================
 // 时间设置对话框
 // ============================================================================
@@ -1032,7 +1032,6 @@ impl Render for TouConfigDialog {
 /// 无输入的轻量确认对话框："同步到所有表"这类批量覆盖操作共用，
 /// 只展示标题 + 警告文案 + 确认按钮（仿 `ClearOperationDialog` 简化版）。
 pub struct SyncConfirmDialog {
-    title: SharedString,
     warning: SharedString,
     confirm_label: SharedString,
     on_confirm: Option<Box<dyn Fn(&mut Window, &mut Context<Self>) + 'static>>,
@@ -1040,12 +1039,10 @@ pub struct SyncConfirmDialog {
 
 impl SyncConfirmDialog {
     pub fn new(
-        title: impl Into<SharedString>,
         warning: impl Into<SharedString>,
         confirm_label: impl Into<SharedString>,
     ) -> Self {
         Self {
-            title: title.into(),
             warning: warning.into(),
             confirm_label: confirm_label.into(),
             on_confirm: None,
@@ -1082,7 +1079,6 @@ impl Render for SyncConfirmDialog {
             .flex()
             .flex_col()
             .gap_4()
-            .child(Label::new(self.title.clone()).text_lg().font_semibold())
             .child(
                 div()
                     .p_3()
@@ -1141,13 +1137,12 @@ impl AddMeterView {
         cx: &mut Context<Self>,
     ) -> Self {
         let address_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("新表地址（十进制，不足12位自动补0，如 39）")
+            InputState::new(window, cx).placeholder("新表地址（十进制，不足12位自动补0，如 39）")
         });
-            let count_input = cx.new(|cx| InputState::new(window, cx).placeholder("创建数量，如 10"));
-            count_input.update(cx, |state, cx| {
-                state.set_value("1".to_string(), window, cx);
-            });
+        let count_input = cx.new(|cx| InputState::new(window, cx).placeholder("创建数量，如 10"));
+        count_input.update(cx, |state, cx| {
+            state.set_value("1".to_string(), window, cx);
+        });
 
         let source_items = std::iter::once(NO_COPY_SOURCE_LABEL.to_string())
             .chain(existing_addresses.iter().cloned())
@@ -1209,10 +1204,8 @@ impl AddMeterView {
         let end_value = match start_value.checked_add(u64::from(count - 1)) {
             Some(value) if value <= 999_999_999_999 => value,
             _ => {
-                window.push_notification(
-                    Notification::error("地址范围超出 12 位十进制地址上限"),
-                    cx,
-                );
+                window
+                    .push_notification(Notification::error("地址范围超出 12 位十进制地址上限"), cx);
                 return;
             }
         };
@@ -1224,14 +1217,22 @@ impl AddMeterView {
             .collect::<Vec<_>>();
 
         let mut seen = self.existing_addresses.clone();
-        if let Some(duplicate) = addresses.iter().map(meter_core::protocol::format::format_address).find(|address| seen.iter().any(|item| item == address)) {
+        if let Some(duplicate) = addresses
+            .iter()
+            .map(meter_core::protocol::format::format_address)
+            .find(|address| seen.iter().any(|item| item == address))
+        {
             window.push_notification(
                 Notification::error(format!("地址 {duplicate} 已存在，请调整起始地址或创建数量")),
                 cx,
             );
             return;
         }
-        seen.extend(addresses.iter().map(meter_core::protocol::format::format_address));
+        seen.extend(
+            addresses
+                .iter()
+                .map(meter_core::protocol::format::format_address),
+        );
         if seen.len() != self.existing_addresses.len() + addresses.len() {
             let duplicate = addresses
                 .iter()
@@ -1239,7 +1240,9 @@ impl AddMeterView {
                 .find(|address| {
                     addresses
                         .iter()
-                        .filter(|item| meter_core::protocol::format::format_address(item) == *address)
+                        .filter(|item| {
+                            meter_core::protocol::format::format_address(item) == *address
+                        })
                         .count()
                         > 1
                 })
@@ -1264,7 +1267,6 @@ impl AddMeterView {
         }
         window.remove_window();
     }
-
 }
 
 impl Render for AddMeterView {
@@ -1278,65 +1280,244 @@ impl Render for AddMeterView {
             .flex_col()
             .child(SettingsTitleBar::new("添加表"))
             .child(
-                div()
-                    .flex_1()
-                    .p_6()
-                    .child(
-                        v_flex()
-                            .gap_4()
-                            .child(
-                                v_form().gap_4().child(
-                                    field()
-                                        .label("新表地址")
-                                        .child(Input::new(&self.address_input)),
-                                ),
-                            )
-                            .child(
+                div().flex_1().p_6().child(
+                    v_flex()
+                        .gap_4()
+                        .child(
+                            v_form().gap_4().child(
                                 field()
-                                    .label("创建数量")
-                                    .child(Input::new(&self.count_input).w(px(180.))),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(Label::new("复制自").text_sm())
-                                    .child(
-                                        Select::new(&self.source_select)
-                                            .w_full()
-                                            .placeholder(NO_COPY_SOURCE_LABEL)
-                                            .menu_max_h(px(200.)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.colors.muted_foreground)
-                                    .child(
-                                        "选择\"复制自\"某块表时，新表会复制该表的仿真/协议/冻结/\
+                                    .label("新表地址")
+                                    .child(Input::new(&self.address_input)),
+                            ),
+                        )
+                        .child(
+                            field()
+                                .label("创建数量")
+                                .child(Input::new(&self.count_input).w(px(180.))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(Label::new("复制自").text_sm())
+                                .child(
+                                    Select::new(&self.source_select)
+                                        .w_full()
+                                        .placeholder(NO_COPY_SOURCE_LABEL)
+                                        .menu_max_h(px(200.)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.colors.muted_foreground)
+                                .child(
+                                    "选择\"复制自\"某块表时，新表会复制该表的仿真/协议/冻结/\
                                          负荷记录等全部配置及历史数据，仅地址不同；不选则新建\
                                          一块默认配置的表。",
-                                    ),
-                            )
-                            .children(error_msg.map(|msg| {
-                                div()
-                                    .p_3()
-                                    .rounded_lg()
-                                    .bg(theme.colors.danger.opacity(0.1))
-                                    .border_1()
-                                    .border_color(theme.colors.danger)
-                                    .child(div().text_sm().text_color(theme.colors.danger).child(msg))
-                            }))
-                            .child(
-                                div().flex().flex_row().gap_2().justify_end().mt_4().child(
-                                    Button::new("confirm-add-meter")
-                                        .label("确定")
-                                        .on_click(cx.listener(Self::handle_confirm)),
+                                ),
+                        )
+                        .children(error_msg.map(|msg| {
+                            div()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(theme.colors.danger.opacity(0.1))
+                                .border_1()
+                                .border_color(theme.colors.danger)
+                                .child(div().text_sm().text_color(theme.colors.danger).child(msg))
+                        }))
+                        .child(
+                            div().flex().flex_row().gap_2().justify_end().mt_4().child(
+                                Button::new("confirm-add-meter")
+                                    .label("确定")
+                                    .on_click(cx.listener(Self::handle_confirm)),
+                            ),
+                        ),
+                ),
+            )
+            .children(Root::render_notification_layer(window, cx))
+    }
+}
+
+// ============================================================================
+// 修改表地址对话框
+// ============================================================================
+
+/// 电表列表"修改地址"入口的对话框：显示当前地址，填一个新地址。
+///
+/// 地址格式与"添加表"（`AddMeterView`）一致：按 12 位十进制数字处理（右
+/// 对齐、左侧补 0、上限 999999999999），并校验不得与当前地址相同、不得与
+/// 其他已存在地址重复。仅换地址，该表的配置与历史数据全部保留——内存与
+/// 数据库的同步搬移由 `AppBackend::update_meter_address` 完成。
+pub struct ModifyAddressView {
+    current_address: String,
+    new_address_input: Entity<InputState>,
+    /// 除当前表外已存在的地址集合，用来做新地址判重。
+    existing_addresses: Vec<String>,
+    error_message: Option<SharedString>,
+    /// 监听输入变化：出错后用户一旦改动输入就撤销错误提示，
+    /// 避免过期的"地址已存在"一直挂着误导操作。
+    subscriptions: Vec<Subscription>,
+    on_confirm: Option<Box<dyn Fn(String, [u8; 6], &mut Window, &mut Context<Self>) + 'static>>,
+}
+
+impl ModifyAddressView {
+    pub fn new(
+        current_address: impl Into<String>,
+        existing_addresses: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let current_address: String = current_address.into();
+        let new_address_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("新地址（十进制，不足12位自动补0，如 39）")
+        });
+        // 判重集合排除当前地址本身：改成别的表的地址由这份数据拦截，
+        // "与当前地址相同"的情况单独给出更明确的提示。
+        let existing_addresses = existing_addresses
+            .into_iter()
+            .filter(|address| *address != current_address)
+            .collect();
+
+        let mut view = Self {
+            current_address,
+            new_address_input: new_address_input.clone(),
+            existing_addresses,
+            error_message: None,
+            subscriptions: Vec::new(),
+            on_confirm: None,
+        };
+        view.subscriptions.push(cx.subscribe(
+            &new_address_input,
+            |this, _, event, cx| {
+                if matches!(event, InputEvent::Change) && this.error_message.take().is_some() {
+                    cx.notify();
+                }
+            },
+        ));
+        view
+    }
+
+    pub fn on_confirm<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(String, [u8; 6], &mut Window, &mut Context<Self>) + 'static,
+    {
+        self.on_confirm = Some(Box::new(callback));
+        self
+    }
+
+    fn handle_confirm(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.error_message = None;
+
+        let mut addr_str = self
+            .new_address_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_uppercase();
+        // 与"添加表"一致：电表地址按 12 位十进制数字处理，右对齐并在左侧补 0。
+        if addr_str.len() < 12 {
+            addr_str = format!("{addr_str:0>12}");
+        }
+        let Ok(value) = addr_str.parse::<u64>() else {
+            self.error_message = Some("地址格式错误，需要 1~12 位十进制数字".into());
+            cx.notify();
+            return;
+        };
+        if addr_str.len() != 12 || value > 999_999_999_999 {
+            self.error_message = Some("地址格式错误，需要 1~12 位十进制数字".into());
+            cx.notify();
+            return;
+        }
+        let new_address_str = format!("{value:012}");
+        if new_address_str == self.current_address {
+            self.error_message = Some("新地址与当前地址相同".into());
+            cx.notify();
+            return;
+        }
+        if self
+            .existing_addresses
+            .iter()
+            .any(|address| *address == new_address_str)
+        {
+            self.error_message = Some(format!("地址 {new_address_str} 已存在").into());
+            cx.notify();
+            return;
+        }
+        let new_address = meter_core::protocol::format::parse_address(&new_address_str)
+            .expect("validated decimal address must be a valid BCD address");
+
+        if let Some(callback) = self.on_confirm.take() {
+            callback(self.current_address.clone(), new_address, window, cx);
+            self.on_confirm = Some(callback);
+        }
+        window.remove_window();
+    }
+}
+
+impl Render for ModifyAddressView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let error_msg = self.error_message.clone();
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(SettingsTitleBar::new("修改表地址"))
+            .child(
+                div().flex_1().p_6().child(
+                    v_flex()
+                        .gap_4()
+                        .child(
+                            v_form().gap_4().child(
+                                field().label("当前地址").child(
+                                    div()
+                                        .text_sm()
+                                        .py_1()
+                                        .text_color(theme.colors.muted_foreground)
+                                        .child(self.current_address.clone()),
                                 ),
                             ),
+                        )
+                        .child(
+                            field()
+                                .label("新地址")
+                                .child(Input::new(&self.new_address_input)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.colors.muted_foreground)
+                                .child(
+                                    "仅修改地址，该表的仿真/协议/冻结/负荷记录等全部配置\
+                                         及历史数据保持不变。",
+                                ),
+                        )
+                        .children(error_msg.map(|msg| {
+                            div()
+                                .p_3()
+                                .rounded_lg()
+                                .bg(theme.colors.danger.opacity(0.1))
+                                .border_1()
+                                .border_color(theme.colors.danger)
+                                .child(div().text_sm().text_color(theme.colors.danger).child(msg))
+                        }))
+                        .child(
+                            div().flex().flex_row().gap_2().justify_end().mt_4().child(
+                                Button::new("confirm-modify-address")
+                                    .label("确定")
+                                    .on_click(cx.listener(Self::handle_confirm)),
                             ),
+                        ),
+                ),
             )
-                    .children(Root::render_notification_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }

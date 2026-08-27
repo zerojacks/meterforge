@@ -134,6 +134,20 @@ impl MeterRegistry {
         self.meters.remove(address)
     }
 
+    /// 修改表地址（"修改地址"入口用）：把旧地址的 entity 原样搬到新地址下。
+    /// entity 本身与其后台更新循环都不变——actor 还是同一个，只是地址换了，
+    /// 快照通道里下一次推送就会带新地址。返回该 entity 供调用方更新内部
+    /// 缓存的地址字段。
+    pub fn update_address(
+        &mut self,
+        old_address: &str,
+        new_address: &str,
+    ) -> Option<Entity<MeterState>> {
+        let entity = self.meters.remove(old_address)?;
+        self.meters.insert(new_address.to_owned(), entity.clone());
+        Some(entity)
+    }
+
     pub fn all_addresses(&self) -> Vec<String> {
         let mut addresses: Vec<_> = self.meters.keys().cloned().collect();
         addresses.sort();

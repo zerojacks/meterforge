@@ -148,6 +148,12 @@ pub enum AdminCommand {
     /// 获取地址
     GetAddress,
 
+    /// 修改表地址（管理通道，绕过协议密码校验；由 UI"修改地址"入口使用）
+    ///
+    /// 处理时同步更新仿真状态与 actor 配置里的地址，并立即推送一次快照。
+    /// 调用方负责在收到回执后完成路由表/句柄表/数据库的 re-key。
+    SetAddress { address: [u8; 6] },
+
     /// 优雅关闭
     Shutdown,
 

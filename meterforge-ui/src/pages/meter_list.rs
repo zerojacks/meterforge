@@ -3,15 +3,18 @@
 use super::MeterDetailView;
 use crate::backend::AppBackend;
 use crate::components::MeterCard;
-use crate::settings::parameter_dialogs::{AddMeterView, SyncConfirmDialog};
+use crate::settings::parameter_dialogs::{AddMeterView, ModifyAddressView, SyncConfirmDialog};
 use crate::state::{GlobalMeterRegistry, MeterState};
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
 use gpui_component::notification::Notification;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::*;
+use std::collections::HashSet;
 
 /// 电表列表面板顶部"批量清除"入口区分的两种历史数据类型。
 #[derive(Clone, Copy)]
@@ -47,6 +50,9 @@ impl ClearAllKind {
 pub struct MeterListView {
     all_addresses: Vec<String>,
     selected_address: Option<String>,
+    /// 批量删除用的勾选集合（"删除选中"入口）。与单选的 `selected_address`
+    /// 相互独立：勾选只影响批量操作，行点击仍然只是切换右侧详情。
+    checked_addresses: HashSet<String>,
     subscriptions: Vec<Subscription>,
     detail_view: Option<Entity<MeterDetailView>>,
     address_search: Entity<InputState>,
@@ -69,6 +75,7 @@ impl MeterListView {
             filtered_items: all_addresses.clone(),
             all_addresses,
             selected_address,
+            checked_addresses: HashSet::new(),
             subscriptions: Vec::new(),
             detail_view: None,
             address_search: address_search.clone(),
@@ -117,7 +124,12 @@ impl MeterListView {
     /// （连同其仿真/协议/冻结/负荷记录配置与历史数据一起复制，仅地址不同）。
     /// 与删除相对称：确认后调用 `AppBackend::add_meter`，成功后在
     /// `add_new_meter` 里完成 UI 侧的 Entity 创建与注册。
-    fn show_add_meter_dialog(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn show_add_meter_dialog(
+        &mut self,
+        _: &ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let backend = cx.global::<AppBackend>().clone();
         let existing_addresses = backend.meter_addresses();
         let view = cx.entity().downgrade();
@@ -217,7 +229,7 @@ impl MeterListView {
         let (title, warning, confirm_label) = kind.dialog_text();
 
         let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(title, warning, confirm_label).on_confirm(move |_, cx| {
+            SyncConfirmDialog::new(warning, confirm_label).on_confirm(move |_, cx| {
                 let backend = cx.global::<AppBackend>().clone();
                 let task = match kind {
                     ClearAllKind::FreezeHistory => backend.clear_freeze_history_all(cx),
@@ -250,7 +262,7 @@ impl MeterListView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("清除历史数据").w(px(500.)).content({
+            dialog.title(title.to_string()).w(px(500.)).content({
                 let dialog_entity = dialog_entity.clone();
                 move |content, _, _| content.child(dialog_entity.clone())
             })
@@ -285,7 +297,6 @@ impl MeterListView {
         cx: &mut Context<Self>,
     ) {
         let view = cx.entity().downgrade();
-        let title: SharedString = format!("删除电表 {address}").into();
         let warning: SharedString = format!(
             "将停止电表 {address} 的仿真、从列表移除，并清除该表的全部数据\
              （配置、电能、冻结历史、负荷记录），重启后不会恢复。此操作不可撤销。"
@@ -293,7 +304,7 @@ impl MeterListView {
         .into();
 
         let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(title, warning, "删除").on_confirm({
+            SyncConfirmDialog::new(warning, "删除").on_confirm({
                 let view = view.clone();
                 let address = address.clone();
                 move |_, cx| {
@@ -307,10 +318,8 @@ impl MeterListView {
                             match result {
                                 Ok(()) => view.remove_deleted_meter(&address, cx),
                                 Err(error) => {
-                                    view.pending_notification = Some((
-                                        false,
-                                        format!("删除电表 {address} 失败：{error}"),
-                                    ))
+                                    view.pending_notification =
+                                        Some((false, format!("删除电表 {address} 失败：{error}")))
                                 }
                             }
                             cx.notify();
@@ -322,7 +331,8 @@ impl MeterListView {
         });
 
         window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("删除电表").w(px(500.)).content({
+            let title: SharedString = format!("删除电表 {address}").into();
+            dialog.title(title).w(px(500.)).content({
                 let dialog_entity = dialog_entity.clone();
                 move |content, _, _| content.child(dialog_entity.clone())
             })
@@ -338,23 +348,249 @@ impl MeterListView {
             self.selected_address = self.all_addresses.first().cloned();
             self.detail_view = None;
         }
+        self.checked_addresses.remove(address);
         self.subscriptions.clear();
         self.subscribe_to_meters(cx);
         self.pending_notification = Some((true, format!("电表 {address} 已删除")));
     }
 
+    /// 单个表项"修改地址"入口：弹独立窗口填新地址。确认后调用
+    /// `AppBackend::update_meter_address`（按序同步 actor 内存地址、路由表、
+    /// 数据库与句柄表），成功后在 `apply_address_change` 里完成 UI 侧注册表
+    /// re-key 与选中态切换；表的配置与历史数据全部保留，仅地址变化。
+    fn show_modify_address_dialog(
+        &mut self,
+        address: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = cx.global::<AppBackend>().clone();
+        let existing_addresses = backend.meter_addresses();
+        let view = cx.entity().downgrade();
+        let current_address = address;
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                // 高度与"添加表"对话框看齐：校验失败时的内联错误框会额外占
+                // 一行，窗口太矮会把"确定"按钮挤出可视区，导致没法点确认。
+                size(px(520.), px(430.)),
+                cx,
+            ))),
+            titlebar: Some(TitleBar::title_bar_options()),
+            app_owns_titlebar_drag: true,
+            window_min_size: Some(gpui::Size {
+                width: px(480.),
+                height: px(360.),
+            }),
+            kind: WindowKind::Normal,
+            app_id: Some("MeterForge-modify-address".to_string()),
+            ..Default::default()
+        };
+        cx.open_window(options, move |window, cx| {
+            window.set_window_title("修改表地址");
+            let dialog: Entity<ModifyAddressView> = cx.new(|cx| {
+                ModifyAddressView::new(current_address, existing_addresses, window, cx).on_confirm(
+                    move |old_address, new_address_bytes, _, cx| {
+                        let backend = cx.global::<AppBackend>().clone();
+                        let task =
+                            backend.update_meter_address(&old_address, new_address_bytes, cx);
+                        let view = view.clone();
+                        let old_address = old_address.clone();
+                        cx.spawn(async move |_, cx| match task.await {
+                            Ok(new_address) => {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.apply_address_change(&old_address, &new_address, cx);
+                                    cx.notify();
+                                });
+                            }
+                            Err(error) => {
+                                let _ = view.update(cx, |view, _| {
+                                    view.pending_notification = Some((
+                                        false,
+                                        format!("修改电表 {old_address} 地址失败：{error}"),
+                                    ));
+                                });
+                            }
+                        })
+                        .detach();
+                    },
+                )
+            });
+            cx.new(|cx| Root::new(dialog, window, cx))
+        })
+        .expect("failed to open modify address window");
+    }
+
+    /// 后端改地址成功后完成 UI 侧收尾：全局注册表 re-key（entity 原样搬到新
+    /// 地址下，更新其缓存的地址与快照地址，卡片不用等下一个 tick 才刷新）、
+    /// 重建本地地址列表与订阅；若改的是当前选中的表，选中态切到新地址
+    /// （右侧详情视图由 `selected_detail` 的地址比对自动重建）。勾选集合里
+    /// 的旧地址同步换键。
+    fn apply_address_change(
+        &mut self,
+        old_address: &str,
+        new_address: &str,
+        cx: &mut Context<Self>,
+    ) {
+        // 写锁守卫收在独立块里：若延续到 if-let 主体，`cx.global` 的不可变
+        // 借用会和 `entity.update(cx, ..)` 的可变借用冲突。
+        let renamed_entity = {
+            let mut registry = cx.global::<GlobalMeterRegistry>().0.write();
+            registry.update_address(old_address, new_address)
+        };
+        if let Some(entity) = renamed_entity {
+            entity.update(cx, |state, _| {
+                state.address = new_address.to_owned();
+                state.snapshot.address = new_address.to_owned();
+            });
+        }
+        self.all_addresses = cx.global::<GlobalMeterRegistry>().0.read().all_addresses();
+        if self.selected_address.as_deref() == Some(old_address) {
+            self.selected_address = Some(new_address.to_owned());
+            self.detail_view = None;
+        }
+        if self.checked_addresses.remove(old_address) {
+            self.checked_addresses.insert(new_address.to_owned());
+        }
+        self.subscriptions.clear();
+        self.subscribe_to_meters(cx);
+        self.pending_notification = Some((
+            true,
+            format!("电表地址已修改：{old_address} → {new_address}"),
+        ));
+    }
+
+    /// "删除选中"批量入口的确认弹窗：确认后调用 `AppBackend::remove_meters`
+    /// （单个后台任务里串行逐表：摘句柄、关 actor、排空持久化队列、清库，
+    /// 单块失败不中断），完成后按成功/失败情况更新 UI 并弹汇总通知。
+    fn show_batch_delete_dialog(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let targets: Vec<String> = self.checked_addresses.iter().cloned().collect();
+        if targets.is_empty() {
+            return;
+        }
+        let count = targets.len();
+        let view = cx.entity().downgrade();
+        let warning: SharedString = format!(
+            "将停止这 {count} 块电表的仿真、从列表移除，并清除它们的全部数据\
+             （配置、电能、冻结历史、负荷记录），重启后不会恢复。此操作不可撤销。"
+        )
+        .into();
+
+        let dialog_entity = cx.new(|_| {
+            SyncConfirmDialog::new(warning, "删除").on_confirm({
+                let view = view.clone();
+                move |_, cx| {
+                    let backend = cx.global::<AppBackend>().clone();
+                    let task = backend.remove_meters(targets.clone(), cx);
+                    let view = view.clone();
+                    let targets = targets.clone();
+                    cx.spawn(async move |_, cx| {
+                        let (_, failures) = task.await;
+                        let failed: Vec<String> = failures
+                            .iter()
+                            .map(|(address, _)| address.clone())
+                            .collect();
+                        let succeeded: Vec<String> = targets
+                            .iter()
+                            .filter(|address| !failed.contains(address))
+                            .cloned()
+                            .collect();
+                        let _ = view.update(cx, |view, cx| {
+                            view.remove_deleted_meters(succeeded, failures, cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+            })
+        });
+
+        window.open_dialog(cx, move |dialog, _, _| {
+            let title: SharedString = format!("删除选中的 {count} 块电表").into();
+            dialog.title(title).w(px(500.)).content({
+                let dialog_entity = dialog_entity.clone();
+                move |content, _, _| content.child(dialog_entity.clone())
+            })
+        })
+    }
+
+    /// 批量删除完成后清理 UI 侧状态：把成功的表从全局注册表移除、重建本地
+    /// 列表与订阅；若当前选中的表也被删了，回退到剩余的第一块（无剩余则
+    /// 显示占位）。失败的表保留在勾选集合里，方便直接重试；通知按成功/
+    /// 失败数汇总。
+    fn remove_deleted_meters(
+        &mut self,
+        succeeded: Vec<String>,
+        failures: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if !succeeded.is_empty() {
+            {
+                let mut registry = cx.global::<GlobalMeterRegistry>().0.write();
+                for address in &succeeded {
+                    registry.remove(address);
+                }
+            }
+            self.all_addresses = cx.global::<GlobalMeterRegistry>().0.read().all_addresses();
+            if self
+                .selected_address
+                .as_ref()
+                .is_some_and(|selected| succeeded.contains(selected))
+            {
+                self.selected_address = self.all_addresses.first().cloned();
+                self.detail_view = None;
+            }
+            self.subscriptions.clear();
+            self.subscribe_to_meters(cx);
+        }
+
+        // 勾选集合只保留删除失败的表，方便直接重试
+        self.checked_addresses
+            .retain(|address| failures.iter().any(|(failed, _)| failed == address));
+
+        let message = if failures.is_empty() {
+            format!("已删除 {} 块电表", succeeded.len())
+        } else {
+            let detail = failures
+                .iter()
+                .map(|(address, error)| format!("{address}（{error}）"))
+                .collect::<Vec<_>>()
+                .join("、");
+            format!(
+                "成功删除 {} 块，失败 {} 块：{detail}",
+                succeeded.len(),
+                failures.len()
+            )
+        };
+        self.pending_notification = Some((failures.is_empty(), message));
+    }
+
     /// 每次渲染前刷新过滤结果与 ListState 条目数（数量没变则不动，避免每帧
     /// 重建列表丢滚动位置）；搜索过滤导致数量变化时 reset 会回到顶部。
+    /// 顺带把勾选集合收敛到仍然存在的表：删除/改名后残留的地址清掉，避免
+    /// "删除选中"计数虚高或批量删除命中不存在的表。
     fn sync_meter_list(&mut self, cx: &App) {
         let filtered = self.filtered_addresses(cx);
         if self.list_state.item_count() != filtered.len() {
             self.list_state.reset(filtered.len());
         }
         self.filtered_items = filtered;
+        if !self.checked_addresses.is_empty() {
+            let live: HashSet<&String> = self.all_addresses.iter().collect();
+            self.checked_addresses
+                .retain(|address| live.contains(address));
+        }
     }
 
     /// 单个表项：从注册表取最新快照渲染 MeterCard，只渲染可见范围内的行。
-    /// 卡片右侧附带删除按钮，按下时先拦截冒泡，避免同时触发行选中。
+    /// 行首是批量删除用的勾选框，卡片右侧附"修改地址"与删除按钮，两者都先
+    /// 拦截冒泡，避免同时触发行选中。
     fn render_meter_item(
         &mut self,
         ix: usize,
@@ -365,6 +601,7 @@ impl MeterListView {
             return div().into_any_element();
         };
         let selected = self.selected_address.as_ref() == Some(&address);
+        let checked = self.checked_addresses.contains(&address);
         let snapshot = {
             let registry = cx.global::<GlobalMeterRegistry>().0.read();
             registry
@@ -374,6 +611,36 @@ impl MeterListView {
         let Some(snapshot) = snapshot else {
             return div().into_any_element();
         };
+        let checkbox_address = address.clone();
+        let checkbox = div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Checkbox::new(("meter-check", ix))
+                    .checked(checked)
+                    .on_click(cx.listener(move |view, checked: &bool, _, cx| {
+                        if *checked {
+                            view.checked_addresses.insert(checkbox_address.clone());
+                        } else {
+                            view.checked_addresses.remove(&checkbox_address);
+                        }
+                        cx.notify();
+                    })),
+            );
+        let modify_button = div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(("meter-modify-address", ix))
+                    .icon(IconName::Replace)
+                    .tooltip("修改地址")
+                    .ghost()
+                    .small()
+                    .on_click({
+                        let address = address.clone();
+                        cx.listener(move |view, _, window, cx| {
+                            view.show_modify_address_dialog(address.clone(), window, cx);
+                        })
+                    }),
+            );
         let delete_button = div()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
@@ -402,7 +669,14 @@ impl MeterListView {
             .child(
                 MeterCard::new(snapshot)
                     .selected(selected)
-                    .trailing(delete_button),
+                    .leading(checkbox)
+                    .trailing(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(modify_button)
+                            .child(delete_button),
+                    ),
             )
             .into_any_element()
     }
@@ -438,6 +712,12 @@ impl Render for MeterListView {
         let theme = cx.theme().clone();
         self.sync_meter_list(cx);
         let count = self.filtered_items.len();
+        let checked_count = self.checked_addresses.len();
+        let all_filtered_checked = count > 0
+            && self
+                .filtered_items
+                .iter()
+                .all(|address| self.checked_addresses.contains(address));
         let detail = self.selected_detail(window, cx);
 
         div().size_full().flex().flex_col().child(
@@ -478,6 +758,19 @@ impl Render for MeterListView {
                                                             )),
                                                     )
                                                     .child(
+                                                        Button::new("delete-checked-meters")
+                                                            .label(format!(
+                                                                "删除选中({checked_count})"
+                                                            ))
+                                                            .small()
+                                                            .danger()
+                                                            .w_full()
+                                                            .disabled(checked_count == 0)
+                                                            .on_click(cx.listener(
+                                                                Self::show_batch_delete_dialog,
+                                                            )),
+                                                    )
+                                                    .child(
                                                         Button::new("clear-freeze-history-all")
                                                             .label("清除历史数据")
                                                             .small()
@@ -499,6 +792,49 @@ impl Render for MeterListView {
                                                     ),
                                             ),
                                     )
+                                    // 列表头：全选（作用于当前搜索过滤结果）+ 已选计数，
+                                    // 作为"删除选中"批量入口的勾选开关。
+                                    .when(count > 0, |panel| {
+                                        panel.child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_3()
+                                                .py_1()
+                                                .border_b_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    Checkbox::new("meter-check-all")
+                                                        .label("全选")
+                                                        .checked(all_filtered_checked)
+                                                        .on_click(cx.listener(
+                                                            move |view,
+                                                                  checked: &bool,
+                                                                  _,
+                                                                  cx| {
+                                                                let filtered = view
+                                                                    .filtered_items
+                                                                    .clone();
+                                                                if *checked {
+                                                                    view.checked_addresses
+                                                                        .extend(filtered);
+                                                                } else {
+                                                                    for address in &filtered {
+                                                                        view.checked_addresses
+                                                                            .remove(address);
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Label::new(format!("已选 {checked_count} 块"))
+                                                        .text_xs()
+                                                        .text_color(theme.muted_foreground),
+                                                ),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .id("meter-list")

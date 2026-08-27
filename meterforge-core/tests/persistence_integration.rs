@@ -161,7 +161,7 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
         let snapshot_row = FreezeSnapshotRow {
             meter_address: address.to_string(),
             trigger_type: trigger.to_di2(), // 使用协议值（DI2）
-            category: 0xFF, // 完整快照摘要行（与 write_freeze_snapshot 一致）
+            category: 0xFF,                 // 完整快照摘要行（与 write_freeze_snapshot 一致）
             occurrence_idx: i,
             snapshot_time: chrono::Utc::now(),
             payload: serde_json::json!({
@@ -201,7 +201,10 @@ async fn test_freeze_snapshot_memory_vs_database_read() {
     // 存储，因此同步读取内存未命中的快照应该返回错误）
     let di_database = [0x05, 0x01, 0x00, 0x05]; // DI0=05, DI1=01(正向有功), DI2=00(定时), DI3=05
     let result_db_sync = handler.handle_read(di_database, &state);
-    assert!(result_db_sync.is_err(), "同步方法读取内存未命中的快照应该返回错误");
+    assert!(
+        result_db_sync.is_err(),
+        "同步方法读取内存未命中的快照应该返回错误"
+    );
     assert!(
         result_db_sync.unwrap_err().contains("数据库支持"),
         "错误消息应提示使用异步版本"
@@ -393,6 +396,115 @@ async fn test_query_nonexistent_snapshot() {
         result.unwrap_err().contains("无此冻结快照"),
         "错误消息应明确说明快照不存在"
     );
+
+    pool.close().await;
+}
+
+/// 修改表地址：rename_meter_data 应在同一事务里把全部持久化表的数据从旧地址
+/// 搬到新地址并删除旧行；目标地址若已有残留行（改名瞬间迟到的写入）会被清掉。
+#[tokio::test]
+async fn test_rename_meter_data_moves_all_rows_and_drops_old() {
+    let (_temp_dir, pool, _config) = setup_test_db().await;
+
+    let old_address = "000000000001";
+    let new_address = "000000000002";
+
+    // 旧地址的 meters 配置行（必填列全部显式给值）
+    sqlx::query(
+        r#"INSERT INTO meters (
+            address, meter_constant, rated_voltage_mv, rated_current_ma,
+            demand_period_min, sliding_window_min, freeze_mode_word,
+            load_record_mode_word, settlement_days_json, tou_config_json,
+            passwords_json, comm_baud_json, load_model_json, virtual_time_ms,
+            time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms
+        ) VALUES (?, 800, 220000, 6000, 15, 5, 0, 0, '[]', '{}', '[]', '{}', '{}', 1000, 1.0, 50.0, 0.95, 1)"#,
+    )
+    .bind(old_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 旧地址的数据行：电能寄存器 / 冻结快照 / 最大需量
+    sqlx::query(
+        "INSERT INTO energy_registers (address, energy_kind, rate_index, settlement_day, value_fp, updated_at_ms) \
+         VALUES (?, 1, 0, 0, 12345, 1)",
+    )
+    .bind(old_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO freeze_snapshots (address, trigger_type, category, occurrence_idx, snapshot_time_ms, payload_json, created_at_ms) \
+         VALUES (?, 0, 1, 1, 1000, '{}', 1)",
+    )
+    .bind(old_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO max_demand (address, demand_kind, rate_index, value_fp, occurred_at_ms) \
+         VALUES (?, 1, 0, 999, 1)",
+    )
+    .bind(old_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 新地址预置一条"残留"电能行（模拟改名瞬间迟到的写入），改名后应被旧数据替换
+    sqlx::query(
+        "INSERT INTO energy_registers (address, energy_kind, rate_index, settlement_day, value_fp, updated_at_ms) \
+         VALUES (?, 1, 0, 0, 1, 1)",
+    )
+    .bind(new_address)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    PersistenceWorker::rename_meter_data(&pool, old_address, new_address)
+        .await
+        .unwrap();
+
+    // 旧地址在全部表里都不再有行
+    for table in [
+        "meters",
+        "energy_registers",
+        "max_demand",
+        "freeze_snapshots",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE address = ?"))
+                .bind(old_address)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "{table} 不应残留旧地址行");
+    }
+
+    // 新地址：配置行、电能行（值来自旧地址而非残留行）、冻结与需量行都齐全
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meters WHERE address = ?")
+        .bind(new_address)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "meters 配置行应搬到新地址");
+
+    let value_fp: i64 =
+        sqlx::query_scalar("SELECT value_fp FROM energy_registers WHERE address = ?")
+            .bind(new_address)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(value_fp, 12345, "电能行应是旧地址的数据（残留行被清掉）");
+
+    for table in ["max_demand", "freeze_snapshots"] {
+        let count: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE address = ?"))
+                .bind(new_address)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1, "{table} 的行应搬到新地址");
+    }
 
     pool.close().await;
 }

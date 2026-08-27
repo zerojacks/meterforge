@@ -222,7 +222,11 @@ impl MeterRegistry {
         Ok(count)
     }
 
-    /// 更新电表地址（用于15H写通信地址命令）
+    /// 更新电表地址（15H 写通信地址 / UI"修改地址"入口共用的路由表 re-key）。
+    ///
+    /// 只负责搬移 HashMap entry 并同步句柄缓存的 `address` 字段；actor 内部
+    /// 状态（仿真状态与 actor 配置）由调用方先行通过
+    /// `AdminCommand::SetAddress` 切换，数据库 re-key 亦由调用方完成。
     ///
     /// # 参数
     /// - `old_address`: 旧地址
@@ -245,13 +249,13 @@ impl MeterRegistry {
         }
 
         // 移除旧地址，插入新地址
-        let handle = self
+        let mut handle = self
             .meters
             .remove(&old_str)
             .ok_or_else(|| format!("Old address not found: {}", old_str))?;
 
-        // 通知Actor更新内部地址
-        // TODO: 通过AdminCommand通知Actor
+        // 句柄里缓存的地址一并同步，避免路由表 key 与句柄字段不一致
+        handle.address = new_address;
 
         self.meters.insert(new_str, handle);
         Ok(())
@@ -375,8 +379,9 @@ mod tests {
         // 验证旧地址不存在
         assert!(registry.get(&old_address).is_none());
 
-        // 验证新地址存在
-        assert!(registry.get(&new_address).is_some());
+        // 验证新地址存在，且句柄缓存的地址字段同步更新
+        let handle = registry.get(&new_address).unwrap();
+        assert_eq!(handle.address, new_address);
     }
 
     #[test]

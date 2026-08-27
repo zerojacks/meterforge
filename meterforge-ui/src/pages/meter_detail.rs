@@ -514,7 +514,6 @@ impl MeterDetailView {
 
         let dialog_entity = cx.new(|_| {
             SyncConfirmDialog::new(
-                "一键同步参数到所有表",
                 "将把当前表的电表时间、密码、通信速率、费率时段表同步到其他所有电表，并写入数据库覆盖其现有值。此操作不可撤销。",
                 "开始同步",
             )
@@ -559,7 +558,6 @@ impl MeterDetailView {
 
         let dialog_entity = cx.new(|_| {
             SyncConfirmDialog::new(
-                "清除冻结历史数据",
                 "将清空当前表的全部冻结历史快照（内存与数据库），冻结相关配置不受影响。此操作不可撤销。",
                 "清除历史数据",
             )
@@ -605,7 +603,6 @@ impl MeterDetailView {
 
         let dialog_entity = cx.new(|_| {
             SyncConfirmDialog::new(
-                "清除负荷记录数据",
                 "将清空当前表的全部负荷记录历史采样（内存与数据库），负荷记录配置不受影响。此操作不可撤销。",
                 "清除历史数据",
             )

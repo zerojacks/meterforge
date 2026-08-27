@@ -286,9 +286,7 @@ impl PersistenceWorker {
 
             PersistRequest::UpdateMaxDemand(entry) => self.update_max_demand(tx, entry).await,
 
-            PersistRequest::WriteLoadRecord(row) => {
-                self.write_load_record_tx(tx, row).await
-            }
+            PersistRequest::WriteLoadRecord(row) => self.write_load_record_tx(tx, row).await,
 
             PersistRequest::WriteSettlementEnergies(row) => {
                 self.write_settlement_energies(tx, row).await
@@ -578,7 +576,7 @@ impl PersistenceWorker {
     /// 批量写入结算日历史电能数据（settlement_day=1~24）
     ///
     /// 结算日转存后，将所有结算日槽位的历史电能数据写入 energy_registers 表。
-    /// 
+    ///
     /// 设计说明：
     /// - 只写入 settlement_day > 0 的历史数据（当前结算周期 settlement_day=0 由 write_energy_register 处理）
     /// - 使用 REPLACE INTO 或 ON CONFLICT REPLACE 语义，确保每次转存后覆盖旧值
@@ -629,7 +627,7 @@ impl PersistenceWorker {
     }
 
     /// 在事务内保存虚拟时间和配置（用于定期持久化）
-    /// 
+    ///
     /// 此函数会更新所有仿真相关的配置参数，但不会覆盖协议相关的配置（如冻结模式、负荷记录模式等）
     async fn save_virtual_time_tx(
         &self,
@@ -664,7 +662,9 @@ impl PersistenceWorker {
             crate::simulation::physics_engine::LoadProfile::Commercial => {
                 serde_json::Value::String("Commercial".into())
             }
-            crate::simulation::physics_engine::LoadProfile::Fixed(f) => serde_json::json!({"Fixed": f}),
+            crate::simulation::physics_engine::LoadProfile::Fixed(f) => {
+                serde_json::json!({"Fixed": f})
+            }
         };
 
         let load_model_json = serde_json::json!({
@@ -695,7 +695,7 @@ impl PersistenceWorker {
                 initial_power_factor = ?,
                 updated_at_ms = ?
             WHERE address = ?
-            "#
+            "#,
         )
         .bind(meter_constant)
         .bind(rated_voltage_mv)
@@ -1153,10 +1153,10 @@ impl PersistenceWorker {
     ///
     /// 从 energy_registers 表中读取所有结算日历史数据（settlement_day > 0），
     /// 返回 HashMap<(settlement_day, energy_kind, rate_index), value>。
-    /// 
+    ///
     /// 调用时机：
     /// - 虚拟电表启动时，从数据库恢复结算日历史数据到内存的 settlement_energies HashMap
-    /// 
+    ///
     /// 设计说明：
     /// - 只查询 settlement_day > 0 的记录（0 表示当前结算周期，由 restore_energy_registers 处理）
     /// - Key = (settlement_day, energy_kind, rate_index)
@@ -1319,24 +1319,29 @@ impl PersistenceWorker {
         Ok(rows.into_iter().map(|row| row.get("address")).collect())
     }
 
+    /// 地址作为主键、需要跟随表数据一起搬移的全部持久化表（`meters` 配置行 +
+    /// 6 张数据表；含 `max_demand`——需量数据同样按地址存储，删除/复制/改名
+    /// 时必须一并处理，否则会残留孤儿行）。
+    const ADDRESS_KEYED_TABLES: [&str; 7] = [
+        "meters",
+        "energy_registers",
+        "max_demand",
+        "freeze_snapshots",
+        "event_records",
+        "event_summary",
+        "load_profile_records",
+    ];
+
     /// 删除一块表的全部持久化数据：`meters` 配置行、电能寄存器（含结算日
-    /// 历史）、冻结快照、事件记录/汇总、负荷记录，全部在一个事务里完成。
+    /// 历史）、最大需量、冻结快照、事件记录/汇总、负荷记录，全部在一个
+    /// 事务里完成。
     ///
     /// 调用方（删除电表入口）必须先等持久化队列排空（发一个
     /// [`PersistRequest::Barrier`] 并等待 ack），否则 Shutdown 产生的最终
     /// flush 可能在本函数之后落库，把刚删掉的行复活。
     pub async fn delete_meter_data(pool: &SqlitePool, address: &str) -> Result<(), sqlx::Error> {
-        const PER_ADDRESS_TABLES: [&str; 6] = [
-            "meters",
-            "energy_registers",
-            "freeze_snapshots",
-            "event_records",
-            "event_summary",
-            "load_profile_records",
-        ];
-
         let mut tx = pool.begin().await?;
-        for table in PER_ADDRESS_TABLES {
+        for table in Self::ADDRESS_KEYED_TABLES {
             sqlx::query(&format!("DELETE FROM {table} WHERE address = ?"))
                 .bind(address)
                 .execute(&mut *tx)
@@ -1366,20 +1371,64 @@ impl PersistenceWorker {
         target_address: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
+        Self::copy_all_tables(&mut tx, source_address, target_address).await?;
+        tx.commit().await?;
 
+        info!(
+            "已将电表 {} 的全部持久化数据复制到 {}",
+            source_address, target_address
+        );
+        Ok(())
+    }
+
+    /// 修改表地址（供"修改地址"功能使用）：把 `old_address` 在全部持久化表
+    /// 里的数据整体搬到 `new_address`，并在同一事务里删除旧行——任一步失败
+    /// 整体回滚，数据库不会出现新旧两份。
+    ///
+    /// 调用约定（`AppBackend::update_meter_address` 负责保证）：
+    /// 1. 先通过 `AdminCommand::SetAddress` 切换 actor 内存地址并收到回执，
+    ///    此后 actor 不再产生旧地址的持久化写；
+    /// 2. 再发 [`PersistRequest::Barrier`] 排空队列后调用本函数，避免迟到
+    ///    的旧地址写入把刚删掉的行复活（Barrier ack 时这批写入已提交）。
+    pub async fn rename_meter_data(
+        pool: &SqlitePool,
+        old_address: &str,
+        new_address: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        Self::copy_all_tables(&mut tx, old_address, new_address).await?;
+        for table in Self::ADDRESS_KEYED_TABLES {
+            sqlx::query(&format!("DELETE FROM {table} WHERE address = ?"))
+                .bind(old_address)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        info!(
+            "已将电表 {} 的持久化数据改名为 {}",
+            old_address, new_address
+        );
+        Ok(())
+    }
+
+    /// 在一个已开启的事务里把 `source_address` 的全部持久化数据复制到
+    /// `target_address`：先清空目标残留行，再逐列显式复制（不含 `address`
+    /// 列，改绑目标地址），不依赖任何 Rust 结构体的序列化。
+    ///
+    /// 不负责提交/回滚事务——`copy_meter_data`（复制表）与
+    /// `rename_meter_data`（修改地址）共用这套语句，后者还要在同一事务里
+    /// 删除旧行。
+    async fn copy_all_tables(
+        conn: &mut sqlx::SqliteConnection,
+        source_address: &str,
+        target_address: &str,
+    ) -> Result<(), sqlx::Error> {
         // 先清空目标地址在全部相关表里的旧数据
-        for table in [
-            "meters",
-            "energy_registers",
-            "max_demand",
-            "freeze_snapshots",
-            "event_records",
-            "event_summary",
-            "load_profile_records",
-        ] {
+        for table in Self::ADDRESS_KEYED_TABLES {
             sqlx::query(&format!("DELETE FROM {table} WHERE address = ?"))
                 .bind(target_address)
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
         }
 
@@ -1404,7 +1453,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1418,7 +1467,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1432,7 +1481,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1448,7 +1497,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1464,7 +1513,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1478,7 +1527,7 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         sqlx::query(
@@ -1492,15 +1541,9 @@ impl PersistenceWorker {
         )
         .bind(target_address)
         .bind(source_address)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
-        tx.commit().await?;
-
-        info!(
-            "已将电表 {} 的全部持久化数据复制到 {}",
-            source_address, target_address
-        );
         Ok(())
     }
 
@@ -1534,7 +1577,7 @@ impl PersistenceWorker {
                 time_scale = ?,
                 updated_at_ms = ?
             WHERE address = ?
-            "#
+            "#,
         )
         .bind(virtual_time_ms)
         .bind(synced_at_ms)
@@ -1559,7 +1602,10 @@ impl PersistenceWorker {
             names.insert(name);
         }
 
-        for (column, default) in [("rated_frequency_hz", "50.0"), ("initial_power_factor", "0.95")] {
+        for (column, default) in [
+            ("rated_frequency_hz", "50.0"),
+            ("initial_power_factor", "0.95"),
+        ] {
             if !names.contains(column) {
                 let sql = format!(
                     "ALTER TABLE meters ADD COLUMN {} REAL NOT NULL DEFAULT {}",
@@ -1573,7 +1619,7 @@ impl PersistenceWorker {
     }
 
     /// 确保 `meters` 表存在该地址的默认行（INSERT OR IGNORE）
-    /// 
+    ///
     /// 使用的默认值：
     /// - meter_constant: 1600 (脉冲常数)
     /// - rated_voltage: 220V
@@ -1581,7 +1627,7 @@ impl PersistenceWorker {
     /// - demand_period: 15min
     /// - rated_frequency: 50Hz
     /// - initial_power_factor: 0.95
-    /// 
+    ///
     /// 注意：这些默认值仅在首次创建记录时使用，后续会通过 save_simulation_config 等函数更新
     async fn ensure_meter_row(pool: &SqlitePool, address: &str) -> Result<(), sqlx::Error> {
         let now_ms = Utc::now().timestamp_millis();
@@ -1634,10 +1680,7 @@ impl PersistenceWorker {
                 _ => LoadProfile::Residential,
             },
             Value::Object(map) if map.contains_key("Fixed") => {
-                let factor = map
-                    .get("Fixed")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.5);
+                let factor = map.get("Fixed").and_then(|v| v.as_f64()).unwrap_or(0.5);
                 LoadProfile::Fixed(factor)
             }
             _ => LoadProfile::Residential,
@@ -1651,11 +1694,7 @@ impl PersistenceWorker {
         let factors: Vec<f64> = v
             .get("phase_current_factors")
             .and_then(|a| a.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|x| x.as_f64())
-                    .collect::<Vec<_>>()
-            })
+            .map(|arr| arr.iter().filter_map(|x| x.as_f64()).collect::<Vec<_>>())
             .unwrap_or_default();
         let mut phase = default.phase_current_factors;
         for (i, value) in factors.into_iter().take(3).enumerate() {
@@ -1714,17 +1753,9 @@ impl PersistenceWorker {
         }
     }
 
-    fn freeze_fields_from_json(freeze: &Value) -> (
-        u8,
-        u8,
-        u8,
-        u8,
-        u8,
-        [u8; 2],
-        [u8; 5],
-        u8,
-        [u8; 5],
-    ) {
+    fn freeze_fields_from_json(
+        freeze: &Value,
+    ) -> (u8, u8, u8, u8, u8, [u8; 2], [u8; 5], u8, [u8; 5]) {
         let u8_at = |key: &str| freeze.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as u8;
         let arr2 = |key: &str| -> [u8; 2] {
             let a = freeze
@@ -1736,7 +1767,10 @@ impl PersistenceWorker {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            [a.first().copied().unwrap_or(0), a.get(1).copied().unwrap_or(0)]
+            [
+                a.first().copied().unwrap_or(0),
+                a.get(1).copied().unwrap_or(0),
+            ]
         };
         let arr5 = |key: &str| -> [u8; 5] {
             let a = freeze
@@ -2035,7 +2069,8 @@ impl PersistenceWorker {
 
         let settlement: Value = {
             let raw: String = row.get("settlement_days_json");
-            serde_json::from_str(&raw).unwrap_or_else(|_| json!({"days": [0, 0, 0], "hours": [0, 0, 0]}))
+            serde_json::from_str(&raw)
+                .unwrap_or_else(|_| json!({"days": [0, 0, 0], "hours": [0, 0, 0]}))
         };
         let mut settlement_days = [0u8; 3];
         let mut settlement_hours = [0u8; 3];
@@ -2050,7 +2085,10 @@ impl PersistenceWorker {
             }
         }
 
-        let load_record = extra.get("load_record").cloned().unwrap_or_else(|| json!({}));
+        let load_record = extra
+            .get("load_record")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let load_record_mode_word: i64 = row.get("load_record_mode_word");
         let mut load_record_start_time = [0u8; 4];
         if let Some(st) = load_record.get("start_time").and_then(|v| v.as_array()) {
@@ -2133,5 +2171,4 @@ impl PersistenceWorker {
             tou_time_slots,
         }))
     }
-
 }
