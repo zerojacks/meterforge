@@ -5,4 +5,4 @@ mod bootstrap;
 mod commands;
 
 pub use bootstrap::initialize;
-pub use commands::{AppBackend, MeterAction};
+pub use commands::{AppBackend, MeterAction, NewMeterHandle};

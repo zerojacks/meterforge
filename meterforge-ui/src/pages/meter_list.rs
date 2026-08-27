@@ -3,7 +3,7 @@
 use super::MeterDetailView;
 use crate::backend::AppBackend;
 use crate::components::MeterCard;
-use crate::settings::parameter_dialogs::SyncConfirmDialog;
+use crate::settings::parameter_dialogs::{AddMeterView, SyncConfirmDialog};
 use crate::state::{GlobalMeterRegistry, MeterState};
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -111,6 +111,95 @@ impl MeterListView {
     fn select_meter(&mut self, address: String, _window: &mut Window, cx: &mut Context<Self>) {
         self.selected_address = Some(address);
         cx.notify();
+    }
+
+    /// 电表列表面板顶部"添加表"入口：填新地址，可选"复制自"某块已有表
+    /// （连同其仿真/协议/冻结/负荷记录配置与历史数据一起复制，仅地址不同）。
+    /// 与删除相对称：确认后调用 `AppBackend::add_meter`，成功后在
+    /// `add_new_meter` 里完成 UI 侧的 Entity 创建与注册。
+    fn show_add_meter_dialog(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let backend = cx.global::<AppBackend>().clone();
+        let existing_addresses = backend.meter_addresses();
+        let view = cx.entity().downgrade();
+
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(560.), px(430.)),
+                cx,
+            ))),
+            titlebar: Some(TitleBar::title_bar_options()),
+            app_owns_titlebar_drag: true,
+            window_min_size: Some(gpui::Size {
+                width: px(480.),
+                height: px(360.),
+            }),
+            kind: WindowKind::Normal,
+            app_id: Some("MeterForge-add-meter".to_string()),
+            ..Default::default()
+        };
+        cx.open_window(options, move |window, cx| {
+            window.set_window_title("添加表");
+            let dialog: Entity<AddMeterView> = cx.new(|cx| {
+                AddMeterView::new(existing_addresses, window, cx).on_confirm(
+                    move |addresses, source_address, _, cx| {
+                        let backend = cx.global::<AppBackend>().clone();
+                        let tasks = addresses
+                            .into_iter()
+                            .map(|address| backend.add_meter(address, source_address.clone(), cx))
+                            .collect::<Vec<_>>();
+                        let view = view.clone();
+                        cx.spawn(async move |_, cx| {
+                            for task in tasks {
+                                match task.await {
+                                    Ok(handle) => {
+                                        let _ = view.update(cx, |view, cx| {
+                                            view.add_new_meter(handle, cx);
+                                            cx.notify();
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let _ = view.update(cx, |view, _| {
+                                            view.pending_notification =
+                                                Some((false, format!("添加表失败：{error}")));
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                        .detach();
+                    },
+                )
+            });
+            cx.new(|cx| Root::new(dialog, window, cx))
+        })
+        .expect("failed to open add meter window");
+    }
+
+    /// 后端 spawn 成功后完成 UI 侧收尾：创建 Entity、挂 update loop、注册进
+    /// 全局注册表、刷新本地地址列表与订阅、选中新表。与
+    /// `remove_deleted_meter` 对称，只是这边是新增。
+    fn add_new_meter(&mut self, handle: crate::backend::NewMeterHandle, cx: &mut Context<Self>) {
+        let crate::backend::NewMeterHandle {
+            address,
+            initial_snapshot,
+            snapshot_rx,
+        } = handle;
+        let entity = cx.new(|_| MeterState::with_snapshot(initial_snapshot));
+        entity.update(cx, |_, cx| {
+            MeterState::start_update_loop(entity.clone(), snapshot_rx, cx)
+        });
+        cx.global::<GlobalMeterRegistry>()
+            .0
+            .write()
+            .register(address.clone(), entity);
+        self.all_addresses = cx.global::<GlobalMeterRegistry>().0.read().all_addresses();
+        self.selected_address = Some(address.clone());
+        self.detail_view = None;
+        self.subscriptions.clear();
+        self.subscribe_to_meters(cx);
+        self.pending_notification = Some((true, format!("已添加表 {address}")));
     }
 
     /// 批量清除入口共用的确认弹窗：`kind` 区分冻结历史 / 负荷记录历史，
@@ -376,13 +465,24 @@ impl Render for MeterListView {
                                             .border_color(theme.border)
                                             .child(Input::new(&self.address_search).small())
                                             .child(
-                                                h_flex()
+                                                v_flex()
                                                     .gap_2()
+                                                    .child(
+                                                        Button::new("add-meter")
+                                                            .label("添加表")
+                                                            .small()
+                                                            .primary()
+                                                            .w_full()
+                                                            .on_click(cx.listener(
+                                                                Self::show_add_meter_dialog,
+                                                            )),
+                                                    )
                                                     .child(
                                                         Button::new("clear-freeze-history-all")
                                                             .label("清除历史数据")
                                                             .small()
                                                             .danger()
+                                                            .w_full()
                                                             .on_click(cx.listener(
                                                                 Self::show_clear_freeze_history_all_dialog,
                                                             )),
@@ -392,6 +492,7 @@ impl Render for MeterListView {
                                                             .label("清除负荷记录数据")
                                                             .small()
                                                             .danger()
+                                                            .w_full()
                                                             .on_click(cx.listener(
                                                                 Self::show_clear_load_profile_history_all_dialog,
                                                             )),

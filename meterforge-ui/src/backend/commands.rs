@@ -1,13 +1,16 @@
 use gpui::*;
-use meter_core::actor::{string_to_address, AdminCommand, MeterActorHandle};
+use meter_core::actor::{
+    address_to_string, string_to_address, AdminCommand, MeterActor, MeterActorConfig,
+    MeterActorHandle, TickMsg,
+};
 use meter_core::persistence::{PersistRequest, PersistenceWorker};
-use meter_core::simulation::SimulationConfig;
+use meter_core::simulation::{LoadProfile, SimulationConfig, VirtualMeter, VirtualMeterConfig};
 use meter_core::snapshot::FreezeSnapshotSummary;
 use meter_core::ConnectionManager;
 use parking_lot::RwLock;
 use sqlx::SqlitePool;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 /// A presentation-level intent.  It deliberately contains no GPUI types and
 /// lets views stay independent from the actor protocol.
@@ -159,10 +162,13 @@ pub struct ProtocolParameters {
 pub struct AppBackend {
     pub connections: ConnectionManager,
     meters: Arc<RwLock<HashMap<String, MeterActorHandle>>>,
-    /// 持久化句柄（`ENABLE_PERSISTENCE = false` 时为 None）：删除电表时
-    /// 用于排空批量写队列并清理数据库。
+    /// 持久化句柄（`ENABLE_PERSISTENCE = false` 时为 None）：删除/添加电表时
+    /// 用于排空批量写队列并读写数据库。
     db_pool: Option<SqlitePool>,
     persist_tx: Option<mpsc::Sender<PersistRequest>>,
+    /// 全局 tick 广播源；"添加表"运行时新 spawn 的 actor 需要订阅它才能
+    /// 跟其余表一起走时（`bootstrap.rs::spawn_demo_meters` 里同一份）。
+    tick_tx: broadcast::Sender<TickMsg>,
 }
 
 impl AppBackend {
@@ -170,13 +176,23 @@ impl AppBackend {
         connections: ConnectionManager,
         meters: Arc<RwLock<HashMap<String, MeterActorHandle>>>,
         persistence: Option<(SqlitePool, mpsc::Sender<PersistRequest>)>,
+        tick_tx: broadcast::Sender<TickMsg>,
     ) -> Self {
         Self {
             connections,
             meters,
             db_pool: persistence.as_ref().map(|(pool, _)| pool.clone()),
             persist_tx: persistence.map(|(_, tx)| tx),
+            tick_tx,
         }
+    }
+
+    /// 当前已存在的表地址集合（已排序），供"添加表"对话框做唯一性校验、
+    /// 以及"复制自"下拉列出可选来源。
+    pub fn meter_addresses(&self) -> Vec<String> {
+        let mut addresses: Vec<String> = self.meters.read().keys().cloned().collect();
+        addresses.sort();
+        addresses
     }
 
     /// Dispatch a backend command from GPUI's executor.
@@ -372,6 +388,145 @@ impl AppBackend {
             .await;
             let success = results.iter().filter(|r| r.is_ok()).count();
             (success, total)
+        })
+    }
+}
+
+/// `AppBackend::add_meter` 成功后交给调用方（UI 视图）用于完成剩余 Entity
+/// 创建 + 注册的产物。Entity 创建必须在 GPUI 主线程做（`cx.new`），所以
+/// `add_meter` 本身不在内部创建 UI Entity——它只负责 spawn actor、注册进
+/// 路由表/句柄表，把"造 Entity 用得着的东西"打包返回，剩下的交给调用方在
+/// `.update()` 回调里做，与 `remove_meter` 之后的 UI 清理（`MeterListView::
+/// remove_deleted_meter`）是对称的分工。
+pub struct NewMeterHandle {
+    pub address: String,
+    /// 初始快照，用于构造 `MeterState` Entity 的起始值（不用等第一次 tick）。
+    pub initial_snapshot: crate::types::MeterSnapshot,
+    /// 后续 tick 由 actor 持续推送到这里，交给 `MeterState::start_update_loop`
+    /// 消费。
+    pub snapshot_rx: mpsc::UnboundedReceiver<crate::types::MeterSnapshot>,
+}
+
+impl AppBackend {
+    /// 新增一块表（可选从某个已存在的表复制配置和历史数据）。
+    ///
+    /// `source_address` 为 `Some` 时，先对源表走一次持久化队列排空
+    /// （[`PersistRequest::Barrier`]，与 `remove_meter` 删除前的做法一致），
+    /// 再把它在数据库层面的全部持久化数据复制到新地址，然后用
+    /// `VirtualMeter::restore_from_database` 把这份数据读回新建的
+    /// `VirtualMeter`——跟 bootstrap 启动时"从数据库恢复上次状态"走的是
+    /// 同一条路径，只是数据来源换成了刚复制过来的另一块表。为 `None` 时是
+    /// 全新表，使用默认仿真配置（居民负荷）。
+    ///
+    /// 数据库相关的部分（复制 + 恢复）用 `runtime.spawn(...).await` 跑在
+    /// ConnectionManager 的专属 tokio Runtime 上——与 `remove_meter` 的
+    /// db_pool/oneshot 处理同一手法，因为 sqlx 需要真正的 tokio 上下文，
+    /// GPUI 的 smol background_executor 没有这个上下文。
+    ///
+    /// 成功后返回 [`NewMeterHandle`]，由调用方在 GPUI 主线程完成 Entity
+    /// 创建与注册。
+    pub fn add_meter(
+        &self,
+        new_address_bytes: [u8; 6],
+        source_address: Option<String>,
+        cx: &App,
+    ) -> Task<Result<NewMeterHandle, String>> {
+        let new_address = address_to_string(&new_address_bytes);
+        if self.meters.read().contains_key(&new_address) {
+            return Task::ready(Err(format!("地址 {new_address} 已存在")));
+        }
+
+        let runtime = self.connections.runtime_handle();
+        let db_pool = self.db_pool.clone();
+        let persist_tx = self.persist_tx.clone();
+        let core_registry = self.connections.registry();
+        let tick_tx = self.tick_tx.clone();
+        let meters = self.meters.clone();
+        let new_address_for_task = new_address.clone();
+
+        cx.background_executor().spawn(async move {
+            let persist_tx_for_barrier = persist_tx.clone();
+            let source_for_db = source_address.clone();
+            let db_pool_for_db = db_pool.clone();
+            let new_address_for_db = new_address_for_task.clone();
+
+            let join = runtime.spawn(async move {
+                // 复制前先排空持久化队列：保证源表最新的批量写入（电能/
+                // 负荷记录等）已经落库，不会被漏拷贝——跟删除电表前的
+                // Barrier 用法一致。
+                if let (Some(src), Some(pool)) = (&source_for_db, &db_pool_for_db) {
+                    if let Some(tx) = &persist_tx_for_barrier {
+                        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                        if tx.send(PersistRequest::Barrier { ack: ack_tx }).await.is_ok() {
+                            let _ = ack_rx.await;
+                        }
+                    }
+                    PersistenceWorker::copy_meter_data(pool, src, &new_address_for_db)
+                        .await
+                        .map_err(|e| format!("复制数据库数据失败: {e}"))?;
+                }
+
+                let mut config = VirtualMeterConfig::default();
+                config.address = new_address_bytes;
+                if source_for_db.is_none() {
+                    config.physics_config.load_model.profile = LoadProfile::Residential;
+                }
+
+                let mut virtual_meter = match &persist_tx_for_barrier {
+                    Some(tx) => VirtualMeter::with_persistence(config, tx.clone()),
+                    None => VirtualMeter::new(config),
+                };
+
+                if let Some(pool) = &db_pool_for_db {
+                    if source_for_db.is_some() {
+                        virtual_meter
+                            .restore_from_database(pool)
+                            .await
+                            .map_err(|e| format!("从数据库恢复新表状态失败: {e}"))?;
+                    }
+                }
+
+                Ok::<VirtualMeter, String>(virtual_meter)
+            });
+            let virtual_meter = join
+                .await
+                .map_err(|e| format!("任务执行失败: {e}"))??;
+
+            let initial_snapshot = crate::types::MeterSnapshot::from_state(
+                virtual_meter.state(),
+                virtual_meter.load_model_config(),
+                true,
+            );
+            let (snapshot_tx, snapshot_rx) =
+                mpsc::unbounded_channel::<crate::types::MeterSnapshot>();
+
+            let (command_tx, command_rx) = mpsc::channel(100);
+            let actor = MeterActor::new(
+                virtual_meter,
+                tick_tx.subscribe(),
+                command_rx,
+                MeterActorConfig {
+                    address: new_address_bytes,
+                    cmd_queue_capacity: 100,
+                    enable_persistence: db_pool.is_some(),
+                    db_pool,
+                    registry_tx: None,
+                    snapshot_tx: Some(snapshot_tx),
+                },
+            );
+            let handle = MeterActorHandle::new(command_tx, new_address_bytes);
+            runtime.spawn(async move {
+                actor.run().await;
+            });
+
+            meters.write().insert(new_address_for_task.clone(), handle.clone());
+            let _ = core_registry.lock().await.register(new_address_bytes, handle);
+
+            Ok(NewMeterHandle {
+                address: new_address_for_task,
+                initial_snapshot,
+                snapshot_rx,
+            })
         })
     }
 

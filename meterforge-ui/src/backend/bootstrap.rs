@@ -53,10 +53,12 @@ pub fn initialize(registry: Arc<RwLock<MeterRegistry>>, cx: &mut App) {
     };
 
     let handles = Arc::new(RwLock::new(HashMap::new()));
+    let (tick_tx, _) = broadcast::channel::<TickMsg>(16);
     cx.set_global(AppBackend::new(
         connections.clone(),
         handles.clone(),
         persistence.clone(),
+        tick_tx.clone(),
     ));
     spawn_demo_meters(
         registry,
@@ -64,6 +66,7 @@ pub fn initialize(registry: Arc<RwLock<MeterRegistry>>, cx: &mut App) {
         handles,
         connections,
         persistence,
+        tick_tx,
         cx,
     );
 }
@@ -77,9 +80,9 @@ fn spawn_demo_meters(
         SqlitePool,
         mpsc::Sender<meter_core::persistence::PersistRequest>,
     )>,
+    tick_tx: broadcast::Sender<TickMsg>,
     cx: &mut App,
 ) {
-    let (tick_tx, _) = broadcast::channel::<TickMsg>(16);
     let mut registrations = Vec::new();
     let mut rng = rand::thread_rng();
 

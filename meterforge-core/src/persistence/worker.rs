@@ -1348,6 +1348,162 @@ impl PersistenceWorker {
         Ok(())
     }
 
+    /// 复制某地址在全部持久化表里的数据到新地址（供"复制表"功能使用）。
+    ///
+    /// 覆盖 `meters`（仿真/协议/冻结/负荷记录配置 + 虚拟时钟）、
+    /// `energy_registers`（含结算日历史电能）、`max_demand`、
+    /// `freeze_snapshots`、`event_records`、`event_summary`、
+    /// `load_profile_records` 共 7 张表，逐列显式复制（不含 `address` 列，
+    /// 改绑目标地址），不依赖任何 Rust 结构体的序列化。
+    ///
+    /// 目标地址若已有残留数据会先清空，保证"复制"结果干净、不与旧数据混合。
+    /// 调用方应先对源表走一次 [`PersistRequest::Barrier`] 排空持久化队列
+    /// （与 `delete_meter_data` 调用约定一致），确保源表最新的批量写入已经
+    /// 落库，不会漏拷贝。
+    pub async fn copy_meter_data(
+        pool: &SqlitePool,
+        source_address: &str,
+        target_address: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // 先清空目标地址在全部相关表里的旧数据
+        for table in [
+            "meters",
+            "energy_registers",
+            "max_demand",
+            "freeze_snapshots",
+            "event_records",
+            "event_summary",
+            "load_profile_records",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE address = ?"))
+                .bind(target_address)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO meters (
+                address, meter_constant, rated_voltage_mv, rated_current_ma,
+                demand_period_min, sliding_window_min, freeze_mode_word,
+                load_record_mode_word, settlement_days_json, tou_config_json,
+                passwords_json, comm_baud_json, load_model_json, virtual_time_ms,
+                time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms,
+                virtual_time_synced_at_ms
+            )
+            SELECT ?, meter_constant, rated_voltage_mv, rated_current_ma,
+                demand_period_min, sliding_window_min, freeze_mode_word,
+                load_record_mode_word, settlement_days_json, tou_config_json,
+                passwords_json, comm_baud_json, load_model_json, virtual_time_ms,
+                time_scale, rated_frequency_hz, initial_power_factor, updated_at_ms,
+                virtual_time_synced_at_ms
+            FROM meters WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO energy_registers (
+                address, energy_kind, rate_index, settlement_day, value_fp, updated_at_ms
+            )
+            SELECT ?, energy_kind, rate_index, settlement_day, value_fp, updated_at_ms
+            FROM energy_registers WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO max_demand (
+                address, demand_kind, rate_index, value_fp, occurred_at_ms
+            )
+            SELECT ?, demand_kind, rate_index, value_fp, occurred_at_ms
+            FROM max_demand WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO freeze_snapshots (
+                address, trigger_type, category, occurrence_idx, snapshot_time_ms,
+                payload_json, created_at_ms
+            )
+            SELECT ?, trigger_type, category, occurrence_idx, snapshot_time_ms,
+                payload_json, created_at_ms
+            FROM freeze_snapshots WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_records (
+                address, event_kind, sub_kind, occurrence_idx, start_time_ms,
+                end_time_ms, payload_json, created_at_ms
+            )
+            SELECT ?, event_kind, sub_kind, occurrence_idx, start_time_ms,
+                end_time_ms, payload_json, created_at_ms
+            FROM event_records WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_summary (
+                address, event_kind, sub_kind, total_count, total_duration_min, updated_at_ms
+            )
+            SELECT ?, event_kind, sub_kind, total_count, total_duration_min, updated_at_ms
+            FROM event_summary WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO load_profile_records (
+                address, class_id, sample_time_ms, payload_json, created_at_ms
+            )
+            SELECT ?, class_id, sample_time_ms, payload_json, created_at_ms
+            FROM load_profile_records WHERE address = ?
+            "#,
+        )
+        .bind(target_address)
+        .bind(source_address)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        info!(
+            "已将电表 {} 的全部持久化数据复制到 {}",
+            source_address, target_address
+        );
+        Ok(())
+    }
+
     /// 保存虚拟时间和时间倍率
     ///
     /// 用于快速保存虚拟时钟状态，不更新其他配置字段
