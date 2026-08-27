@@ -224,6 +224,8 @@ impl CommunicationLogPanel {
                 cx,
             ))),
             titlebar: Some(TitleBar::title_bar_options()),
+            #[cfg(target_os = "linux")]
+            window_decorations: Some(WindowDecorations::Client),
             app_owns_titlebar_drag: true,
             window_min_size: Some(DETAIL_WINDOW_MIN),
             kind: WindowKind::Normal,

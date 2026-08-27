@@ -50,6 +50,8 @@ fn main() {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(window_bounds)),
                 titlebar: Some(TitleBar::title_bar_options()),
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(gpui::WindowDecorations::Client),
                 app_owns_titlebar_drag: true,
                 window_min_size: Some(gpui::Size {
                     width: px(640.),
