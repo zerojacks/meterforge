@@ -122,7 +122,7 @@ Release 同时发布自定义格式的 `latest.json`，客户端可通过
 
 | 平台 | 产物 |
 |------|------|
-| Windows x86_64 | `MeterForge-Setup-<版本>.exe`（安装包）和 `MeterForge-windows-x86_64-<版本>.zip`（便携版） |
+| Windows x86_64 | `MeterForge-windows-x86_64-<版本>-setup.exe`（安装包）和 `MeterForge-windows-x86_64-<版本>.zip`（便携版） |
 | Linux x86_64 | `MeterForge-linux-x86_64-<版本>.deb`（安装包）和 `MeterForge-linux-x86_64-<版本>.tar.gz`（便携版） |
 | macOS x86_64 | `MeterForge-darwin-x86_64-<版本>.pkg`（安装包）和 `.dmg`（拖拽安装） |
 | macOS aarch64 | `MeterForge-darwin-aarch64-<版本>.pkg`（安装包）和 `.dmg`（拖拽安装） |

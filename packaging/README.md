@@ -24,7 +24,7 @@ Windows 安装包使用 Inno Setup 生成。安装 Inno Setup 6 后，在仓库�
 iscc /DAppVersion=0.1.0 packaging/windows/MeterForge.iss
 ```
 
-安装包会生成到 `dist/MeterForge-Setup-0.1.0.exe`，安装后会创建开始菜单入口，
+安装包会生成到 `dist/MeterForge-windows-x86_64-0.1.0-setup.exe`，安装后会创建开始菜单入口，
 并提供可选的桌面快捷方式和卸载入口。
 
 ## macOS
@@ -95,7 +95,7 @@ https://github.com/zerojacks/meterforge/releases/latest/download/latest.json
 
 - `MeterForge-windows-x86_64-<版本>.zip` — 便携版 MeterForge.exe（图标已内嵌；release
   构建为 GUI 子系统，启动不弹控制台窗口）
-- `MeterForge-Setup-<版本>.exe` — Windows 安装包（开始菜单、可选桌面快捷方式和卸载）
+- `MeterForge-windows-x86_64-<版本>-setup.exe` — Windows 安装包（开始菜单、可选桌面快捷方式和卸载）
 - `MeterForge-linux-x86_64-<版本>.deb` — Debian/Ubuntu 安装包
 - `MeterForge-linux-x86_64-<版本>.tar.gz` — 便携版二进制 + `.desktop` + hicolor 图标 + `install.sh`
 - `MeterForge-darwin-x86_64-<版本>.dmg` / `MeterForge-darwin-aarch64-<版本>.dmg`

@@ -34,7 +34,7 @@ asset_json() {
     '{url: $url, sha256: $sha256, size: $size}'
 }
 
-WINDOWS_FILE="MeterForge-Setup-$VERSION.exe"
+WINDOWS_FILE="MeterForge-windows-x86_64-$VERSION-setup.exe"
 LINUX_FILE="MeterForge-linux-x86_64-$VERSION.deb"
 MAC_X86_FILE="MeterForge-darwin-x86_64-$VERSION.pkg"
 MAC_X86_DMG="MeterForge-darwin-x86_64-$VERSION.dmg"
