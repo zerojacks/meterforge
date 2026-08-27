@@ -27,7 +27,8 @@ rand = "0.8"
 # GPUI 相关
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_macros = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
+# Linux 运行时至少需要一个窗口后端；同时启用 X11/Wayland，兼容不同桌面环境。
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["x11", "wayland"] }
 
 # gpui-component 组件库
 gpui-component = { git = "https://github.com/longbridge/gpui-component" }

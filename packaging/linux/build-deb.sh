@@ -39,6 +39,7 @@ printf '%s\n' \
   'Maintainer: MeterForge Team' \
   'Section: utils' \
   'Priority: optional' \
+  'Depends: libfontconfig1, libfreetype6, libvulkan1, libxkbcommon0, libxcb1, libwayland-client0' \
   'Description: MeterForge virtual meter monitoring platform' \
   ' DL/T 645-2007 virtual electricity meter simulator and monitor.' \
   > "$PACKAGE_ROOT/DEBIAN/control"
