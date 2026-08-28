@@ -4,8 +4,50 @@ use super::di_handler::DIHandler;
 use super::physics_engine::{PhysicsConfig, PhysicsEngine, SimulationConfig};
 use super::state::MeterState;
 use crate::persistence::{PersistRequest, PersistedMeterSettings};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::warn;
+
+/// 自定义数据项开关（数据项自定义功能）
+///
+/// 收到读命令时，先按 DI（精确匹配，不做转换）在自定义数据项表里查找：
+/// - 命中：直接使用配置的原始内容回复，不再走 DIHandler / 模拟数据。
+/// - 未命中：按当前开关模式决定后续行为（见各变体说明）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomDataMode {
+    /// 优先使用自定义数据项：未命中时回退到模拟数据
+    PreferCustom,
+    /// 完全使用自定义数据项：未命中时直接应答"无数据"错误，不回退模拟数据
+    CustomOnly,
+    /// 使用模拟数据：完全不查自定义数据项（默认，兼容原有行为）
+    SimulatedOnly,
+}
+
+impl Default for CustomDataMode {
+    fn default() -> Self {
+        CustomDataMode::SimulatedOnly
+    }
+}
+
+impl CustomDataMode {
+    /// 从数据库/协议编码的 u8 还原（0=优先自定义 1=完全自定义 2=使用模拟数据，未知值兜底为使用模拟数据）
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => CustomDataMode::PreferCustom,
+            1 => CustomDataMode::CustomOnly,
+            _ => CustomDataMode::SimulatedOnly,
+        }
+    }
+
+    /// 编码为 u8，供持久化 / 协议层使用
+    pub fn as_u8(self) -> u8 {
+        match self {
+            CustomDataMode::PreferCustom => 0,
+            CustomDataMode::CustomOnly => 1,
+            CustomDataMode::SimulatedOnly => 2,
+        }
+    }
+}
 
 /// 虚拟电表
 ///
@@ -43,6 +85,12 @@ pub struct VirtualMeter {
 
     /// 虚拟时钟的墙钟锚点（见 [`TimeAnchor`]）
     time_anchor: TimeAnchor,
+
+    /// 自定义数据项开关（见 [`CustomDataMode`]）
+    custom_data_mode: CustomDataMode,
+
+    /// 自定义数据项：DI -> 原始应答内容（跳过 DIHandler 编解码，直接回复）
+    custom_data: HashMap<[u8; 4], Vec<u8>>,
 }
 
 /// 虚拟时钟的墙钟锚点。
@@ -102,6 +150,8 @@ impl VirtualMeter {
             last_energy_flush: std::time::Instant::now(),
             last_flushed_energy: 0.0,
             time_anchor,
+            custom_data_mode: CustomDataMode::default(),
+            custom_data: HashMap::new(),
         }
     }
 
@@ -216,6 +266,26 @@ impl VirtualMeter {
             Err(e) => {
                 // 非致命错误，只记录警告，不阻止启动
                 eprintln!("Warning: Failed to restore settlement_energies: {}", e);
+            }
+        }
+
+        // 2.6 恢复自定义数据项（DI -> 原始应答内容）
+        match PersistenceWorker::restore_custom_data_items(pool, &address_str).await {
+            Ok(items) => {
+                // 无论是否为空都打印，方便排查"启动后没有恢复"问题：如果这行
+                // 显示 0 但数据库里确实有数据，说明 restore_custom_data_items
+                // 的查询本身有问题（比如地址格式不一致）；如果显示的数量正确，
+                // 但 UI 切到 tab 还是看不到，问题就在 UI 侧的加载/展示逻辑。
+                println!(
+                    "[VirtualMeter] {} custom data item(s) loaded from DB for {}",
+                    items.len(),
+                    address_str
+                );
+                self.custom_data = items;
+            }
+            Err(e) => {
+                // 非致命错误，只记录警告，不阻止启动
+                eprintln!("Warning: Failed to restore custom data items: {}", e);
             }
         }
 
@@ -365,6 +435,15 @@ impl VirtualMeter {
                 state.num_time_slots = state.tou_config.day_table_1.slots.len() as u8;
             }
         }
+
+        // 自定义数据项开关（老库没保存过时是 None，保留默认：使用模拟数据）
+        if let Some(mode) = settings.custom_data_mode {
+            self.custom_data_mode = CustomDataMode::from_u8(mode);
+        }
+        println!(
+            "[VirtualMeter] custom_data_mode after restore = {:?} (raw column value: {:?})",
+            self.custom_data_mode, settings.custom_data_mode
+        );
     }
 
     /// 创建默认虚拟电表
@@ -389,12 +468,72 @@ impl VirtualMeter {
         data: &[u8],
         db_pool: Option<&sqlx::SqlitePool>,
     ) -> Result<Vec<u8>, String> {
+        if data.len() < 4 {
+            return Err("数据长度不足（至少需要4字节DI）".to_string());
+        }
+        let di = [data[0], data[1], data[2], data[3]];
+
+        // 自定义数据项优先处理：按 DI 精确匹配（不做协议转换），命中则直接
+        // 用配置的原始内容回复；未命中时的行为由开关模式决定。
+        if self.custom_data_mode != CustomDataMode::SimulatedOnly {
+            if let Some(custom) = self.custom_data.get(&di) {
+                // 645协议多字节数据低字节在前传输，用户按人类习惯的正常顺序
+                // 配置内容，回复前需要整体逆序（与 DIHandler 各处 `data.reverse()`
+                // 的约定一致）。
+                let mut reply = custom.clone();
+                reply.reverse();
+                return Ok(reply);
+            }
+            if self.custom_data_mode == CustomDataMode::CustomOnly {
+                return Err(format!(
+                    "DI {:02X}{:02X}{:02X}{:02X} 无自定义数据（完全使用自定义数据项模式）",
+                    di[3], di[2], di[1], di[0]
+                ));
+            }
+            // PreferCustom 且未命中：继续走下面的模拟数据路径
+        }
+
         let address = address_to_string(&self.state.address);
-        
+
         // 委托给DIHandler处理（包括DI解析、数据库查询等所有逻辑）
         self.handler
             .handle_read_async(data, &self.state, &address, db_pool)
             .await
+    }
+
+    /// 获取当前自定义数据项开关
+    pub fn custom_data_mode(&self) -> CustomDataMode {
+        self.custom_data_mode
+    }
+
+    /// 设置自定义数据项开关（仅更新内存，落库由调用方负责）
+    pub fn set_custom_data_mode(&mut self, mode: CustomDataMode) {
+        self.custom_data_mode = mode;
+    }
+
+    /// 新增/覆盖一条自定义数据项（原始应答字节，不做协议转换）
+    pub fn set_custom_data_item(&mut self, di: [u8; 4], data: Vec<u8>) {
+        self.custom_data.insert(di, data);
+    }
+
+    /// 删除一条自定义数据项
+    pub fn remove_custom_data_item(&mut self, di: [u8; 4]) {
+        self.custom_data.remove(&di);
+    }
+
+    /// 清空所有自定义数据项（仅内存）
+    pub fn clear_custom_data_items(&mut self) {
+        self.custom_data.clear();
+    }
+
+    /// 列出所有自定义数据项（DI -> 原始应答内容）
+    pub fn list_custom_data_items(&self) -> &HashMap<[u8; 4], Vec<u8>> {
+        &self.custom_data
+    }
+
+    /// 批量恢复自定义数据项（启动时从数据库加载）
+    pub fn restore_custom_data_items(&mut self, items: HashMap<[u8; 4], Vec<u8>>) {
+        self.custom_data = items;
     }
 
     /// 处理 DL/T645 写数据命令

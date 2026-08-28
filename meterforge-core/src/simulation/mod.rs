@@ -13,4 +13,6 @@ pub use state::{
     local_now_as_utc, EnergyType, FreezeData, FreezeTrigger, FreezeType, MeterState, TimeSlot,
     TimeSlotTable, TouConfig,
 };
-pub use virtual_meter::{address_to_string, string_to_address, VirtualMeter, VirtualMeterConfig};
+pub use virtual_meter::{
+    address_to_string, string_to_address, CustomDataMode, VirtualMeter, VirtualMeterConfig,
+};

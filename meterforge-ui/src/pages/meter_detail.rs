@@ -2,16 +2,18 @@
 //! The tab bodies and dialogs live in their own components.
 
 use crate::{
-    backend::{AppBackend, MeterAction},
+    backend::{AppBackend, CustomDataItemsInfo, MeterAction},
     state::GlobalMeterRegistry,
     types::MeterSnapshot,
 };
 use chrono::{Datelike, Timelike, Utc};
 use gpui::*;
+use gpui_component::input::{InputState};
 use gpui_component::scroll::ScrollableElement;
 use gpui_component::{
     badge::Badge,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariant, ButtonVariants},
+    dialog::DialogButtonProps,
     label::Label,
     resizable::{resizable_panel, v_resizable},
     tab::{Tab, TabBar},
@@ -21,8 +23,8 @@ use gpui_component::{
 use super::communication_log_panel::CommunicationLogPanel;
 use super::meter_history::{self, FreezeFilter};
 use crate::settings::parameter_dialogs::{
-    BaudrateDialog, ClearOperationDialog, ClearType, PasswordDialog, SyncConfirmDialog,
-    TimeSettingDialog, TouConfigDialog,
+    BaudrateDialog, ClearOperationDialog, ClearType, PasswordDialog, TimeSettingDialog,
+    TouConfigDialog,
 };
 use crate::settings::SimulationConfigPanel;
 use gpui_component::notification::Notification;
@@ -42,6 +44,7 @@ enum DetailTab {
     Events,
     Freezes,
     LoadProfile,
+    CustomData,
 }
 
 impl DetailTab {
@@ -52,6 +55,7 @@ impl DetailTab {
             3 => Self::Events,
             4 => Self::Freezes,
             5 => Self::LoadProfile,
+            6 => Self::CustomData,
             _ => Self::RealTime,
         }
     }
@@ -63,6 +67,7 @@ impl DetailTab {
             Self::Events => 3,
             Self::Freezes => 4,
             Self::LoadProfile => 5,
+            Self::CustomData => 6,
         }
     }
 }
@@ -95,6 +100,18 @@ pub struct MeterDetailView {
     /// 异步任务（参数同步）完成后待弹的通知：(是否成功, 文案)。
     /// `Notification` 不是 Send，只能在主线程构建，所以这里只存消息。
     pending_notification: Option<(bool, String)>,
+
+    // ---- "自定义数据项" tab 状态 ----
+    /// 当前开关（0=优先自定义 1=完全自定义 2=使用模拟数据）+ 全部自定义数据项；
+    /// 切到该 tab 时按需异步加载，加载完成前用 `None` 表示"尚未加载"。
+    pub(super) custom_data_info: Option<CustomDataItemsInfo>,
+    pub(super) custom_data_loading: bool,
+    pub(super) custom_data_list_state: ListState,
+    pub(super) custom_data_items: Vec<crate::backend::CustomDataItemEntry>,
+    /// 新增数据项表单：DI（8位HEX，如 00000100）
+    pub(super) custom_data_di_input: Entity<InputState>,
+    /// 新增数据项表单：应答内容（HEX，如 01020304，可为空）
+    pub(super) custom_data_value_input: Entity<InputState>,
 }
 
 impl MeterDetailView {
@@ -264,6 +281,16 @@ impl MeterDetailView {
             load_profile_list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             load_profile_items: Vec::new(),
             pending_notification: None,
+            custom_data_info: None,
+            custom_data_loading: false,
+            custom_data_list_state: ListState::new(0, ListAlignment::Top, px(120.)),
+            custom_data_items: Vec::new(),
+            custom_data_di_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("DI，如 00000100（DI3DI2DI1DI0）")
+            }),
+            custom_data_value_input: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("应答内容 HEX，按正常顺序输入，如 64000000（可为空）")
+            }),
         }
     }
 
@@ -346,7 +373,151 @@ impl MeterDetailView {
             .detach();
         }
 
+        // 同理，"自定义数据项"tab 也只在首次切入、且还没加载过/没有正在加载时打库。
+        if matches!(self.active_tab, DetailTab::CustomData)
+            && self.custom_data_info.is_none()
+            && !self.custom_data_loading
+        {
+            self.load_custom_data_items(cx);
+        }
+
         cx.notify();
+    }
+
+    /// 发起一次"自定义数据项"数据拉取（首次切入 tab / 手动刷新 / 增删改后都会调用）。
+    pub(super) fn load_custom_data_items(&mut self, cx: &mut Context<Self>) {
+        self.custom_data_loading = true;
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.load_custom_data_items(address, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.custom_data_loading = false;
+                match result {
+                    Ok(info) => {
+                            if this.custom_data_list_state.item_count() != info.items.len() {
+                                this.custom_data_list_state.reset(info.items.len());
+                            }
+                            this.custom_data_items = info.items.clone();
+                        this.custom_data_info = Some(info);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "加载自定义数据项失败");
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 切换自定义数据项开关（0=优先自定义 1=完全自定义 2=使用模拟数据）。
+    pub(super) fn apply_custom_data_mode(&mut self, mode: u8, cx: &mut Context<Self>) {
+        // 乐观更新：立刻在本地把开关切过去，请求失败时靠下面的通知提醒用户重试。
+        if let Some(info) = self.custom_data_info.as_mut() {
+            info.mode = mode;
+        }
+        cx.notify();
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.set_custom_data_mode(address, mode, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.pending_notification =
+                        Some((false, format!("切换自定义数据项开关失败：{error}")));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 新增/覆盖一条自定义数据项：读取表单输入并校验，成功后清空输入框、刷新列表。
+    pub(super) fn add_custom_data_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let di_text = self.custom_data_di_input.read(cx).value().to_string();
+        let data_text = self.custom_data_value_input.read(cx).value().to_string();
+
+        let di = match parse_di_hex(&di_text) {
+            Ok(di) => di,
+            Err(error) => {
+                self.pending_notification = Some((false, error));
+                cx.notify();
+                return;
+            }
+        };
+        let data = match parse_data_hex(&data_text) {
+            Ok(data) => data,
+            Err(error) => {
+                self.pending_notification = Some((false, error));
+                cx.notify();
+                return;
+            }
+        };
+
+        // 输入已通过校验：立刻清空表单（乐观更新），落库失败时靠通知提醒用户。
+        self.custom_data_di_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.custom_data_value_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.set_custom_data_item(address, di, data, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(_) => this.load_custom_data_items(cx),
+                Err(error) => {
+                    this.pending_notification = Some((false, format!("新增自定义数据项失败：{error}")));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 删除一条自定义数据项。
+    pub(super) fn remove_custom_data_item(&mut self, di: [u8; 4], cx: &mut Context<Self>) {
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.remove_custom_data_item(address, di, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(_) => this.load_custom_data_items(cx),
+                Err(error) => {
+                    this.pending_notification = Some((false, format!("删除自定义数据项失败：{error}")));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 清空当前表全部自定义数据项。
+    pub(super) fn clear_custom_data_items(&mut self, cx: &mut Context<Self>) {
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.clear_custom_data_items(address, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(message) => {
+                    this.pending_notification = Some((true, message));
+                    this.load_custom_data_items(cx);
+                }
+                Err(error) => {
+                    this.pending_notification = Some((false, format!("清空自定义数据项失败：{error}")));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn show_time_setting_dialog(
@@ -512,16 +683,18 @@ impl MeterDetailView {
         let address = self.address.clone();
         let view = cx.entity().downgrade();
 
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(
-                "将把当前表的电表时间、密码、通信速率、费率时段表同步到其他所有电表，并写入数据库覆盖其现有值。此操作不可撤销。",
-                "开始同步",
-            )
-            .on_confirm(move |_, cx| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let address = address.clone();
+            alert
+                .title("同步参数")
+                .description("将把当前表的电表时间、密码、通信速率、费率时段表同步到其他所有电表，并写入数据库覆盖其现有值。此操作不可撤销。")
+                .button_props(DialogButtonProps::default().ok_text("开始同步").cancel_text("取消").show_cancel(true))
+                .on_ok(move |_, _, cx| {
                 let backend = cx.global::<AppBackend>().clone();
                 let task = backend.sync_protocol_parameters(address.clone(), cx);
                 let view = view.clone();
-                cx.spawn(async move |_, cx| {
+                cx.spawn(async move |cx| {
                     // Notification 不是 Send，异步侧只回传 (成功?, 文案)，
                     // 由视图在主线程 render 时构建并弹出。
                     let result = match task.await {
@@ -534,14 +707,47 @@ impl MeterDetailView {
                     });
                 })
                 .detach();
-            })
-        });
+                    true
+                })
+        })
+    }
 
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("参数同步").w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
-            })
+    /// "自定义数据项"tab 的一键同步入口：确认后读取当前表已生效的开关 + 全部
+    /// 自定义数据项，覆盖式同步给其他所有表（目标表现有自定义数据项会被
+    /// 先清空再套用源表配置）并落库。
+    pub(crate) fn show_sync_custom_data_dialog(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let address = self.address.clone();
+        let view = cx.entity().downgrade();
+
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let address = address.clone();
+            alert
+                .title("同步自定义数据项")
+                .description("将把当前表的自定义数据项开关与全部数据项同步到其他所有电表：目标表现有的自定义数据项会被先清空，再套用当前表的配置，并写入数据库。此操作不可撤销。")
+                .button_props(DialogButtonProps::default().ok_text("开始同步").cancel_text("取消").show_cancel(true))
+                .on_ok(move |_, _, cx| {
+                let backend = cx.global::<AppBackend>().clone();
+                let task = backend.sync_custom_data_items(address.clone(), cx);
+                let view = view.clone();
+                cx.spawn(async move |cx| {
+                    let result = match task.await {
+                        Ok(count) => (true, format!("自定义数据项同步完成：已同步到 {count} 块表")),
+                        Err(error) => (false, format!("自定义数据项同步失败：{error}")),
+                    };
+                    let _ = view.update(cx, |view, cx| {
+                        view.pending_notification = Some(result);
+                        cx.notify();
+                    });
+                })
+                .detach();
+                    true
+                })
         })
     }
 
@@ -553,41 +759,47 @@ impl MeterDetailView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let address = self.address.clone();
         let view = cx.entity().downgrade();
-
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(
-                "将清空当前表的全部冻结历史快照（内存与数据库），冻结相关配置不受影响。此操作不可撤销。",
-                "清除历史数据",
-            )
-            .on_confirm(move |_, cx| {
-                let backend = cx.global::<AppBackend>().clone();
-                let task = backend.clear_freeze_history(address.clone(), cx);
-                let view = view.clone();
-                cx.spawn(async move |_, cx| {
-                    let result = match task.await {
-                        Ok(message) => (true, format!("冻结历史已清除：{message}")),
-                        Err(error) => (false, format!("冻结历史清除失败：{error}")),
-                    };
-                    let _ = view.update(cx, |view, cx| {
-                        // 清空本地缓存的历史与列表，避免残留旧数据直到下次切 tab 才刷新。
-                        view.freeze_history = Some(Vec::new());
-                        view.freeze_history_loading = false;
-                        view.pending_notification = Some(result);
-                        cx.notify();
-                    });
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            alert
+                .title("清除冻结历史数据？")
+                .description("当前表的全部冻结历史快照将从内存和数据库中删除，冻结配置不受影响。此操作不可撤销。")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("清除历史数据")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.clear_freeze_history_after_confirm(cx);
+                        });
+                    }
+                    true
                 })
-                .detach();
-            })
-        });
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("清除历史数据").w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
-            })
         })
+    }
+
+    fn clear_freeze_history_after_confirm(&mut self, cx: &mut Context<Self>) {
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.clear_freeze_history(address, cx);
+        cx.spawn(async move |this, cx| {
+            let result = match task.await {
+                Ok(message) => (true, format!("冻结历史已清除：{message}")),
+                Err(error) => (false, format!("冻结历史清除失败：{error}")),
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.freeze_history = Some(Vec::new());
+                view.freeze_history_loading = false;
+                view.pending_notification = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// "负荷记录"tab 的"清除历史数据"入口：确认后清空当前表的负荷记录历史
@@ -598,40 +810,47 @@ impl MeterDetailView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let address = self.address.clone();
         let view = cx.entity().downgrade();
-
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(
-                "将清空当前表的全部负荷记录历史采样（内存与数据库），负荷记录配置不受影响。此操作不可撤销。",
-                "清除负荷记录数据",
-            )
-            .on_confirm(move |_, cx| {
-                let backend = cx.global::<AppBackend>().clone();
-                let task = backend.clear_load_profile_history(address.clone(), cx);
-                let view = view.clone();
-                cx.spawn(async move |_, cx| {
-                    let result = match task.await {
-                        Ok(message) => (true, format!("负荷记录已清除：{message}")),
-                        Err(error) => (false, format!("负荷记录清除失败：{error}")),
-                    };
-                    let _ = view.update(cx, |view, cx| {
-                        view.load_profile_history = Some(Vec::new());
-                        view.load_profile_history_loading = false;
-                        view.pending_notification = Some(result);
-                        cx.notify();
-                    });
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            alert
+                .title("清除负荷记录数据？")
+                .description("当前表的全部负荷记录历史采样将从内存和数据库中删除，负荷记录配置不受影响。此操作不可撤销。")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("清除负荷记录数据")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, _, cx| {
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.clear_load_profile_history_after_confirm(cx);
+                        });
+                    }
+                    true
                 })
-                .detach();
-            })
-        });
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("清除负荷记录数据").w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
-            })
         })
+    }
+
+    fn clear_load_profile_history_after_confirm(&mut self, cx: &mut Context<Self>) {
+        let address = self.address.clone();
+        let backend = cx.global::<AppBackend>().clone();
+        let task = backend.clear_load_profile_history(address, cx);
+        cx.spawn(async move |this, cx| {
+            let result = match task.await {
+                Ok(message) => (true, format!("负荷记录已清除：{message}")),
+                Err(error) => (false, format!("负荷记录清除失败：{error}")),
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.load_profile_history = Some(Vec::new());
+                view.load_profile_history_loading = false;
+                view.pending_notification = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_clear_dialog(
@@ -1048,6 +1267,7 @@ impl Render for MeterDetailView {
             DetailTab::Events => self.render_events_tab(cx),
             DetailTab::Freezes => self.render_freezes_tab(cx),
             DetailTab::LoadProfile => self.render_load_profile_tab(cx),
+            DetailTab::CustomData => self.render_custom_data_tab_extracted(cx),
         };
         let uses_virtual_list = matches!(
             self.active_tab,
@@ -1106,7 +1326,8 @@ impl Render for MeterDetailView {
                     .child(Tab::new().label("模拟配置"))
                     .child(Tab::new().label("事件记录"))
                     .child(Tab::new().label("冻结数据"))
-                    .child(Tab::new().label("负荷记录")),
+                    .child(Tab::new().label("负荷记录"))
+                    .child(Tab::new().label("自定义数据项")),
             )
             .child(
                 div().flex_1().min_h_0().child(
@@ -1136,4 +1357,43 @@ impl Render for MeterDetailView {
                 ),
             )
     }
+}
+
+/// 解析自定义数据项的 DI 输入：期望恰好 8 位 HEX（对应 DI3DI2DI1DI0），
+/// 还原为协议内存序 [DI0, DI1, DI2, DI3]。
+pub(super) fn parse_di_hex(text: &str) -> Result<[u8; 4], String> {
+    let text = text.trim();
+    if text.len() != 8 {
+        return Err("DI 需为 8 位 HEX，例如 00000100".to_string());
+    }
+    let bytes = decode_hex(text)?;
+    Ok([bytes[3], bytes[2], bytes[1], bytes[0]])
+}
+
+/// 解析自定义数据项的应答内容输入：允许为空（表示空 DATA），否则必须是偶数长度 HEX。
+fn parse_data_hex(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    decode_hex(text)
+}
+
+/// 偶数长度 HEX 字符串解码为字节数组，格式不对时给出中文错误提示。
+fn decode_hex(text: &str) -> Result<Vec<u8>, String> {
+    if text.len() % 2 != 0 {
+        return Err(format!("\"{text}\" 不是合法的HEX（长度需为偶数）"));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("\"{text}\" 不是合法的HEX"))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("\"{text}\" 不是合法的HEX"))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
 }

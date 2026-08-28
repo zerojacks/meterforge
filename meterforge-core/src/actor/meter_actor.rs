@@ -1597,6 +1597,113 @@ impl MeterActor {
                     }
                 }
             }
+
+            AdminCommand::SetCustomDataMode { mode } => {
+                let mode = crate::simulation::CustomDataMode::from_u8(mode);
+                self.meter.set_custom_data_mode(mode);
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    if let Err(e) = crate::persistence::PersistenceWorker::save_custom_data_mode(
+                        pool,
+                        &addr,
+                        mode.as_u8(),
+                    )
+                    .await
+                    {
+                        warn!(
+                            "[MeterActor {}] Failed to persist custom data mode: {}",
+                            addr, e
+                        );
+                    }
+                }
+                Ok("Custom data mode updated".to_string())
+            }
+
+            AdminCommand::SetCustomDataItem { di, data } => {
+                self.meter.set_custom_data_item(di, data.clone());
+                let mut result = Ok(format!(
+                    "DI {:02X}{:02X}{:02X}{:02X} custom data updated",
+                    di[3], di[2], di[1], di[0]
+                ));
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    if let Err(e) = crate::persistence::PersistenceWorker::upsert_custom_data_item(
+                        pool, &addr, di, &data,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "[MeterActor {}] Failed to persist custom data item: {}",
+                            addr, e
+                        );
+                        result = Err(format!("内存已更新，但数据库写入失败: {e}"));
+                    }
+                }
+                result
+            }
+
+            AdminCommand::RemoveCustomDataItem { di } => {
+                self.meter.remove_custom_data_item(di);
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    if let Err(e) = crate::persistence::PersistenceWorker::delete_custom_data_item(
+                        pool, &addr, di,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "[MeterActor {}] Failed to delete custom data item from DB: {}",
+                            addr, e
+                        );
+                    }
+                }
+                Ok(format!(
+                    "DI {:02X}{:02X}{:02X}{:02X} custom data removed",
+                    di[3], di[2], di[1], di[0]
+                ))
+            }
+
+            AdminCommand::ClearCustomDataItems => {
+                self.meter.clear_custom_data_items();
+                if let Some(pool) = &self.config.db_pool {
+                    let addr = format_address(&self.config.address);
+                    match crate::persistence::PersistenceWorker::clear_custom_data_items(
+                        pool, &addr,
+                    )
+                    .await
+                    {
+                        Ok(count) => Ok(format!("自定义数据项已清空（删除 {count} 条）")),
+                        Err(e) => {
+                            warn!(
+                                "[MeterActor {}] Failed to clear custom data items from DB: {}",
+                                addr, e
+                            );
+                            Err(format!("内存已清空，但数据库清除失败: {e}"))
+                        }
+                    }
+                } else {
+                    Ok("自定义数据项已清空（仅清理内存，未启用持久化）".to_string())
+                }
+            }
+
+            AdminCommand::GetCustomDataItems => {
+                let items: Vec<serde_json::Value> = self
+                    .meter
+                    .list_custom_data_items()
+                    .iter()
+                    .map(|(di, data)| {
+                        serde_json::json!({
+                            "di": format!("{:02X}{:02X}{:02X}{:02X}", di[3], di[2], di[1], di[0]),
+                            "data": data.iter().map(|b| format!("{:02X}", b)).collect::<String>(),
+                        })
+                    })
+                    .collect();
+                let snapshot = serde_json::json!({
+                    "mode": self.meter.custom_data_mode().as_u8(),
+                    "items": items,
+                });
+                Ok(snapshot.to_string())
+            }
         };
 
         // 命令执行后立即推送快照（反映最新状态）

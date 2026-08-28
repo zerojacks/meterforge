@@ -1615,7 +1615,30 @@ impl PersistenceWorker {
             }
         }
 
+        // custom_data_mode: 0=优先自定义 1=完全自定义 2=使用模拟数据（默认，兼容旧库/旧行为）
+        if !names.contains("custom_data_mode") {
+            sqlx::query("ALTER TABLE meters ADD COLUMN custom_data_mode INTEGER NOT NULL DEFAULT 2")
+                .execute(pool)
+                .await?;
+        }
+
         Ok(())
+    }
+
+    /// 将偶数长度的大写/小写HEX字符串解码为字节数组（无外部依赖的最小实现）
+    fn hex_decode(s: &str) -> Option<Vec<u8>> {
+        let s = s.trim();
+        if s.len() % 2 != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        for chunk in bytes.chunks(2) {
+            let hi = (chunk[0] as char).to_digit(16)?;
+            let lo = (chunk[1] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        Some(out)
     }
 
     /// 确保 `meters` 表存在该地址的默认行（INSERT OR IGNORE）
@@ -2007,6 +2030,117 @@ impl PersistenceWorker {
         Ok(())
     }
 
+    /// 保存自定义数据项开关（`custom_data_mode`：0=优先自定义 1=完全自定义 2=使用模拟数据）
+    pub async fn save_custom_data_mode(
+        pool: &SqlitePool,
+        address: &str,
+        mode: u8,
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        Self::ensure_meter_row(pool, address).await?;
+        sqlx::query(
+            r#"
+            UPDATE meters
+            SET custom_data_mode = ?, updated_at_ms = ?
+            WHERE address = ?
+            "#,
+        )
+        .bind(mode as i64)
+        .bind(now_ms)
+        .bind(address)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 新增/覆盖一条自定义数据项（DI 精确匹配，原始应答字节，不做协议转换）
+    pub async fn upsert_custom_data_item(
+        pool: &SqlitePool,
+        address: &str,
+        di: [u8; 4],
+        data: &[u8],
+    ) -> Result<(), sqlx::Error> {
+        let now_ms = Utc::now().timestamp_millis();
+        let di_hex = format!("{:02X}{:02X}{:02X}{:02X}", di[3], di[2], di[1], di[0]);
+        let data_hex = data.iter().map(|b| format!("{:02X}", b)).collect::<String>();
+
+        sqlx::query(
+            r#"
+            INSERT INTO custom_data_items (address, di, data_hex, updated_at_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(address, di)
+            DO UPDATE SET data_hex = excluded.data_hex, updated_at_ms = excluded.updated_at_ms
+            "#,
+        )
+        .bind(address)
+        .bind(&di_hex)
+        .bind(&data_hex)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除一条自定义数据项
+    pub async fn delete_custom_data_item(
+        pool: &SqlitePool,
+        address: &str,
+        di: [u8; 4],
+    ) -> Result<(), sqlx::Error> {
+        let di_hex = format!("{:02X}{:02X}{:02X}{:02X}", di[3], di[2], di[1], di[0]);
+        sqlx::query("DELETE FROM custom_data_items WHERE address = ? AND di = ?")
+            .bind(address)
+            .bind(&di_hex)
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 清空某块表的所有自定义数据项
+    pub async fn clear_custom_data_items(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM custom_data_items WHERE address = ?")
+            .bind(address)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 恢复一表所有自定义数据项（DI -> 原始应答字节），用于启动时加载
+    pub async fn restore_custom_data_items(
+        pool: &SqlitePool,
+        address: &str,
+    ) -> Result<std::collections::HashMap<[u8; 4], Vec<u8>>, sqlx::Error> {
+        use std::collections::HashMap;
+
+        let rows = sqlx::query("SELECT di, data_hex FROM custom_data_items WHERE address = ?")
+            .bind(address)
+            .fetch_all(pool)
+            .await?;
+
+        let mut items = HashMap::new();
+        for row in rows {
+            let di_hex: String = row.get("di");
+            let data_hex: String = row.get("data_hex");
+
+            let Some(di_bytes) = Self::hex_decode(&di_hex) else {
+                continue;
+            };
+            if di_bytes.len() != 4 {
+                continue;
+            }
+            // 存储顺序为 DI3DI2DI1DI0（人类可读），还原为 [DI0, DI1, DI2, DI3]
+            let di = [di_bytes[3], di_bytes[2], di_bytes[1], di_bytes[0]];
+
+            let data = Self::hex_decode(&data_hex).unwrap_or_default();
+            items.insert(di, data);
+        }
+
+        Ok(items)
+    }
+
     /// 从 `meters` 表恢复一表完整配置
     pub async fn restore_meter_config(
         pool: &SqlitePool,
@@ -2018,7 +2152,7 @@ impl PersistenceWorker {
                    time_scale, rated_frequency_hz, initial_power_factor,
                    load_model_json, settlement_days_json, tou_config_json,
                    freeze_mode_word, load_record_mode_word,
-                   comm_baud_json, passwords_json
+                   comm_baud_json, passwords_json, custom_data_mode
             FROM meters
             WHERE address = ?
             "#,
@@ -2150,6 +2284,13 @@ impl PersistenceWorker {
                     .collect::<Vec<_>>()
             });
 
+        // custom_data_mode: 老库升级上来但还没跑过 ensure_meter_schema 时，
+        // 列可能还不存在——用 try_get 兜底为 None，调用方保留默认（模拟数据）
+        let custom_data_mode: Option<u8> = row
+            .try_get::<i64, _>("custom_data_mode")
+            .ok()
+            .map(|v| v as u8);
+
         Ok(Some(PersistedMeterSettings {
             simulation,
             timed_freeze_mode: timed_mode,
@@ -2169,6 +2310,7 @@ impl PersistenceWorker {
             baudrate,
             passwords,
             tou_time_slots,
+            custom_data_mode,
         }))
     }
 }

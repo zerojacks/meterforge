@@ -29,6 +29,9 @@ pub struct PersistedMeterSettings {
     pub passwords: Option<[[u8; 4]; 10]>,
     /// 费率时段表（`tou_config_json["tou"]`）。老库从未写过时为 `None`，保持默认。
     pub tou_time_slots: Option<Vec<(u8, u8, u8)>>,
+    /// 自定义数据项开关（`custom_data_mode`：0=优先自定义 1=完全自定义 2=使用模拟数据）。
+    /// 老库从未写过该列时为 `None`，保持默认（使用模拟数据，兼容原有行为）。
+    pub custom_data_mode: Option<u8>,
 }
 
 /// 从数据库恢复出的虚拟时钟状态：virtual_time 本身 + 落盘时对应的本地

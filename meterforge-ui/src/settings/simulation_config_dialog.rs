@@ -1,15 +1,16 @@
 //! 仿真与电表参数配置面板：物理引擎参数、冻结、结算日、负荷记录、故障注入。
-use super::parameter_dialogs::SyncConfirmDialog;
 use gpui::*;
 use gpui_component::select::{Select, SelectState};
 use gpui_component::{
     button::{Button, ButtonVariants},
+    dialog::DialogButtonProps,
     form::field,
     group_box::{GroupBox, GroupBoxVariants as _},
     input::{Input, InputState},
     label::Label,
     *,
 };
+use gpui_component::WindowExt;
 use meter_core::simulation::{LoadModelConfig, LoadProfile, SimulationConfig};
 use meter_core::snapshot::SimulationSnapshot;
 
@@ -559,28 +560,28 @@ impl SimulationConfigPanel {
                 return;
             }
         };
-        // 对话框确认发生在 SyncConfirmDialog 的上下文里，需要回到本面板
-        // 才能拿到 on_sync_all 回调。
         let this = cx.entity();
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(
-                "确认后将当前表单的模拟计算、冻结、结算日、负荷记录配置覆盖所有电表（含当前表），并写入数据库。此操作不可撤销。",
-                "应用到所有表",
-            )
-            .on_confirm(move |window, cx| {
-                this.update(cx, |panel, cx| {
-                    if let Some(callback) = panel.on_sync_all.take() {
-                        callback(settings.clone(), window, cx);
-                        panel.on_sync_all = Some(callback);
-                    }
-                });
-            })
-        });
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title("同步模拟配置").w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
-            })
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let settings = settings.clone();
+            alert
+                .title("同步模拟配置")
+                .description("确认后将当前表单的模拟计算、冻结、结算日、负荷记录配置覆盖所有电表（含当前表），并写入数据库。此操作不可撤销。")
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("应用到所有表")
+                        .cancel_text("取消")
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    this.update(cx, |panel, cx| {
+                        if let Some(callback) = panel.on_sync_all.take() {
+                            callback(settings.clone(), window, cx);
+                            panel.on_sync_all = Some(callback);
+                        }
+                    });
+                    true
+                })
         });
     }
 

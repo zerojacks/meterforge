@@ -5,4 +5,6 @@ mod bootstrap;
 mod commands;
 
 pub use bootstrap::initialize;
-pub use commands::{AppBackend, MeterAction, NewMeterHandle};
+pub use commands::{
+	AppBackend, CustomDataItemEntry, CustomDataItemsInfo, MeterAction, NewMeterHandle,
+};

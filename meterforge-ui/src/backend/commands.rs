@@ -64,6 +64,17 @@ pub enum MeterAction {
         phase: u8,
         active: bool,
     },
+    SetCustomDataMode {
+        mode: u8,
+    },
+    SetCustomDataItem {
+        di: [u8; 4],
+        data: Vec<u8>,
+    },
+    RemoveCustomDataItem {
+        di: [u8; 4],
+    },
+    ClearCustomDataItems,
 }
 
 impl From<MeterAction> for AdminCommand {
@@ -140,6 +151,14 @@ impl From<MeterAction> for AdminCommand {
                 phase,
                 active,
             },
+            MeterAction::SetCustomDataMode { mode } => AdminCommand::SetCustomDataMode { mode },
+            MeterAction::SetCustomDataItem { di, data } => {
+                AdminCommand::SetCustomDataItem { di, data }
+            }
+            MeterAction::RemoveCustomDataItem { di } => {
+                AdminCommand::RemoveCustomDataItem { di }
+            }
+            MeterAction::ClearCustomDataItems => AdminCommand::ClearCustomDataItems,
         }
     }
 }
@@ -152,6 +171,22 @@ pub struct ProtocolParameters {
     pub baudrate: u8,
     pub passwords: [[u8; 4]; 10],
     pub time_slots: Vec<(u8, u8, u8)>,
+}
+
+/// 单条自定义数据项（`AdminCommand::GetCustomDataItems` 返回 JSON 里
+/// `items` 数组的元素）：`di`/`data` 均为大写HEX字符串。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CustomDataItemEntry {
+    pub di: String,
+    pub data: String,
+}
+
+/// `AdminCommand::GetCustomDataItems` 返回 JSON 的反序列化目标。
+/// `mode`：0=优先使用自定义数据项 1=完全使用自定义数据项 2=使用模拟数据。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CustomDataItemsInfo {
+    pub mode: u8,
+    pub items: Vec<CustomDataItemEntry>,
 }
 
 /// Long-lived backend services exposed to the presentation layer.
@@ -356,6 +391,163 @@ impl AppBackend {
             handle
                 .send_admin_command(AdminCommand::ClearLoadProfileHistory)
                 .await
+        })
+    }
+
+    /// 异步加载某块表当前的自定义数据项开关 + 全部自定义数据项列表。
+    /// 调用方（UI 视图）应在切换到"自定义数据项"标签页时调用一次。
+    pub fn load_custom_data_items(
+        &self,
+        address: String,
+        cx: &App,
+    ) -> Task<Result<CustomDataItemsInfo, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            let json = handle
+                .send_admin_command(AdminCommand::GetCustomDataItems)
+                .await?;
+            serde_json::from_str(&json).map_err(|e| e.to_string())
+        })
+    }
+
+    /// 设置自定义数据项开关（0=优先自定义 1=完全自定义 2=使用模拟数据）。
+    /// 返回 actor 侧的结果文案，供 UI 弹通知。
+    pub fn set_custom_data_mode(
+        &self,
+        address: String,
+        mode: u8,
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::SetCustomDataMode { mode })
+                .await
+        })
+    }
+
+    /// 新增/覆盖一条自定义数据项（DI 精确匹配，`data` 为原始应答字节，
+    /// 命中时不做协议转换直接回复）。
+    pub fn set_custom_data_item(
+        &self,
+        address: String,
+        di: [u8; 4],
+        data: Vec<u8>,
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::SetCustomDataItem { di, data })
+                .await
+        })
+    }
+
+    /// 删除一条自定义数据项。
+    pub fn remove_custom_data_item(
+        &self,
+        address: String,
+        di: [u8; 4],
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::RemoveCustomDataItem { di })
+                .await
+        })
+    }
+
+    /// 清空某块表的全部自定义数据项（内存 + 数据库 `custom_data_items` 表）。
+    pub fn clear_custom_data_items(
+        &self,
+        address: String,
+        cx: &App,
+    ) -> Task<Result<String, String>> {
+        let Some(handle) = self.meters.read().get(&address).cloned() else {
+            return Task::ready(Err(format!("meter {address} not found")));
+        };
+        cx.background_executor().spawn(async move {
+            handle
+                .send_admin_command(AdminCommand::ClearCustomDataItems)
+                .await
+        })
+    }
+
+    /// 一键同步自定义数据项：读取源表（自定义数据项页的当前表）已生效的
+    /// 开关 + 全部数据项，覆盖式同步给其余所有表——目标表会先清空自身现有
+    /// 自定义数据项，再套用源表的开关与条目，确保同步后与源表完全一致。
+    ///
+    /// 与 `sync_protocol_parameters` 同一模式：只走 mpsc/oneshot 通道，落库
+    /// 在各目标表 MeterActor 的 tokio 上下文里完成。返回成功同步的表数。
+    pub fn sync_custom_data_items(&self, source: String, cx: &App) -> Task<Result<usize, String>> {
+        let meters = self.meters.read().clone();
+        let Some(origin) = meters.get(&source).cloned() else {
+            return Task::ready(Err(format!("meter {source} not found")));
+        };
+        let targets: Vec<(String, MeterActorHandle)> = meters
+            .into_iter()
+            .filter(|(address, _)| address != &source)
+            .collect();
+        cx.background_executor().spawn(async move {
+            let json = origin
+                .send_admin_command(AdminCommand::GetCustomDataItems)
+                .await?;
+            let info: CustomDataItemsInfo =
+                serde_json::from_str(&json).map_err(|e| e.to_string())?;
+
+            let mut items = Vec::with_capacity(info.items.len());
+            for entry in &info.items {
+                let di = decode_di_hex(&entry.di)?;
+                let data = decode_hex_bytes(&entry.data)?;
+                items.push((di, data));
+            }
+
+            let mut synced = 0usize;
+            for (address, handle) in targets {
+                // 先清空目标表现有自定义数据项，确保同步后与源表完全一致
+                // （而不是叠加/合并）。
+                if let Err(error) = handle
+                    .send_admin_command(AdminCommand::ClearCustomDataItems)
+                    .await
+                {
+                    tracing::warn!(%address, %error, "自定义数据项同步失败（清空目标表失败）");
+                    continue;
+                }
+                if let Err(error) = handle
+                    .send_admin_command(AdminCommand::SetCustomDataMode { mode: info.mode })
+                    .await
+                {
+                    tracing::warn!(%address, %error, "自定义数据项同步失败（设置开关失败）");
+                    continue;
+                }
+                let mut ok = true;
+                for (di, data) in &items {
+                    if let Err(error) = handle
+                        .send_admin_command(AdminCommand::SetCustomDataItem {
+                            di: *di,
+                            data: data.clone(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(%address, %error, "自定义数据项同步失败（写入条目失败）");
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    synced += 1;
+                }
+            }
+            Ok(synced)
         })
     }
 
@@ -825,3 +1017,35 @@ impl AppBackend {
 }
 
 impl Global for AppBackend {}
+
+/// 偶数长度HEX字符串解码为字节数组，格式不对时给出中文错误提示。
+/// 与 `meter_detail.rs` 里同名逻辑保持一致，这里单独存一份是因为后端层
+/// 不依赖 UI 页面模块。
+fn decode_hex_bytes(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if text.len() % 2 != 0 {
+        return Err(format!("\"{text}\" 不是合法的HEX（长度需为偶数）"));
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let bytes = text.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("\"{text}\" 不是合法的HEX"))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("\"{text}\" 不是合法的HEX"))?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Ok(out)
+}
+
+/// 解析 `GetCustomDataItems` 返回的 DI 字符串（8位HEX，DI3DI2DI1DI0 顺序），
+/// 还原为协议内存序 `[DI0, DI1, DI2, DI3]`。
+fn decode_di_hex(text: &str) -> Result<[u8; 4], String> {
+    let bytes = decode_hex_bytes(text)?;
+    if bytes.len() != 4 {
+        return Err(format!("DI \"{text}\" 长度不正确（应为8位HEX）"));
+    }
+    Ok([bytes[3], bytes[2], bytes[1], bytes[0]])
+}

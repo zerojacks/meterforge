@@ -1,6 +1,7 @@
 // 页面级视图:主工作区、仪表列表、仪表详情及其标签页。
 
 mod application_workspace;
+mod custom_data;
 mod communication_log_panel;
 mod meter_detail;
 mod meter_history;

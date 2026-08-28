@@ -3,15 +3,16 @@
 use super::MeterDetailView;
 use crate::backend::AppBackend;
 use crate::components::MeterCard;
-use crate::settings::parameter_dialogs::{AddMeterView, ModifyAddressView, SyncConfirmDialog};
+use crate::settings::parameter_dialogs::{AddMeterView, ModifyAddressView};
 use crate::state::{GlobalMeterRegistry, MeterState};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::label::Label;
 use gpui_component::notification::Notification;
+use gpui_component::dialog::DialogButtonProps;
 use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::*;
 use std::collections::HashSet;
@@ -230,15 +231,18 @@ impl MeterListView {
         let view = cx.entity().downgrade();
         let (title, warning, confirm_label) = kind.dialog_text();
 
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(warning, confirm_label).on_confirm(move |_, cx| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            alert.title(title.to_string()).description(warning.to_string()).button_props(
+                DialogButtonProps::default().ok_text(confirm_label).ok_variant(ButtonVariant::Danger).cancel_text("取消").show_cancel(true),
+            ).on_ok(move |_, _, cx| {
                 let backend = cx.global::<AppBackend>().clone();
                 let task = match kind {
                     ClearAllKind::FreezeHistory => backend.clear_freeze_history_all(cx),
                     ClearAllKind::LoadProfileHistory => backend.clear_load_profile_history_all(cx),
                 };
                 let view = view.clone();
-                cx.spawn(async move |_, cx| {
+                cx.spawn(async move |cx| {
                     let (success, total) = task.await;
                     let message = format!("{}：{success}/{total} 块表清除成功", kind.label());
                     let _ = view.update(cx, |view, cx| {
@@ -260,13 +264,7 @@ impl MeterListView {
                     });
                 })
                 .detach();
-            })
-        });
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog.title(title.to_string()).w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
+                true
             })
         })
     }
@@ -305,38 +303,31 @@ impl MeterListView {
         )
         .into();
 
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(warning, "删除").on_confirm({
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let address = address.clone();
+            alert.title(format!("删除电表 {address}？")).description(warning.to_string()).button_props(
+                DialogButtonProps::default().ok_text("删除").ok_variant(ButtonVariant::Danger).cancel_text("取消").show_cancel(true),
+            ).on_ok(move |_, _, cx| {
+                let backend = cx.global::<AppBackend>().clone();
+                let task = backend.remove_meter(&address, cx);
                 let view = view.clone();
                 let address = address.clone();
-                move |_, cx| {
-                    let backend = cx.global::<AppBackend>().clone();
-                    let task = backend.remove_meter(&address, cx);
-                    let view = view.clone();
-                    let address = address.clone();
-                    cx.spawn(async move |_, cx| {
-                        let result = task.await;
-                        let _ = view.update(cx, |view, cx| {
-                            match result {
-                                Ok(()) => view.remove_deleted_meter(&address, cx),
-                                Err(error) => {
-                                    view.pending_notification =
-                                        Some((false, format!("删除电表 {address} 失败：{error}")))
-                                }
+                cx.spawn(async move |cx| {
+                    let result = task.await;
+                    let _ = view.update(cx, |view, cx| {
+                        match result {
+                            Ok(()) => view.remove_deleted_meter(&address, cx),
+                            Err(error) => {
+                                view.pending_notification =
+                                    Some((false, format!("删除电表 {address} 失败：{error}")))
                             }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                }
-            })
-        });
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            let title: SharedString = format!("删除电表 {address}").into();
-            dialog.title(title).w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                true
             })
         })
     }
@@ -486,15 +477,17 @@ impl MeterListView {
         )
         .into();
 
-        let dialog_entity = cx.new(|_| {
-            SyncConfirmDialog::new(warning, "删除").on_confirm({
-                let view = view.clone();
-                move |_, cx| {
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let view = view.clone();
+            let targets = targets.clone();
+            alert.title(format!("删除选中的 {count} 块电表？")).description(warning.to_string()).button_props(
+                DialogButtonProps::default().ok_text("删除").ok_variant(ButtonVariant::Danger).cancel_text("取消").show_cancel(true),
+            ).on_ok(move |_, _, cx| {
                     let backend = cx.global::<AppBackend>().clone();
                     let task = backend.remove_meters(targets.clone(), cx);
                     let view = view.clone();
                     let targets = targets.clone();
-                    cx.spawn(async move |_, cx| {
+                    cx.spawn(async move |cx| {
                         let (_, failures) = task.await;
                         let failed: Vec<String> = failures
                             .iter()
@@ -511,15 +504,7 @@ impl MeterListView {
                         });
                     })
                     .detach();
-                }
-            })
-        });
-
-        window.open_dialog(cx, move |dialog, _, _| {
-            let title: SharedString = format!("删除选中的 {count} 块电表").into();
-            dialog.title(title).w(px(500.)).content({
-                let dialog_entity = dialog_entity.clone();
-                move |content, _, _| content.child(dialog_entity.clone())
+                true
             })
         })
     }

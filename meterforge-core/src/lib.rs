@@ -21,8 +21,8 @@ pub use snapshot::MeterSnapshot;
 
 // 导出核心类型
 pub use simulation::{
-    EnergyType, FreezeType, LoadProfile, PhysicsConfig, PhysicsEngine, VirtualMeter,
-    VirtualMeterConfig,
+    CustomDataMode, EnergyType, FreezeType, LoadProfile, PhysicsConfig, PhysicsEngine,
+    VirtualMeter, VirtualMeterConfig,
 };
 
 /// 快速创建默认虚拟电表
