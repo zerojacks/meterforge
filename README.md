@@ -56,7 +56,7 @@ meter_engine/
 │   └── build.rs                # Windows 图标内嵌 + 主线程栈配置
 │
 ├── packaging/                  # 各平台打包脚本与资源（见其 README）
-├── data/                       # 运行时 SQLite 数据库（meters.db）
+├── data/                       # 开发环境运行数据（正式版使用系统用户数据目录）
 └── docs/                       # 设计文档
 ```
 

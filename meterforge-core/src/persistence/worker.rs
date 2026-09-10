@@ -35,8 +35,14 @@ pub struct PersistenceConfig {
 
 impl Default for PersistenceConfig {
     fn default() -> Self {
+        let data_dir = dirs::data_local_dir()
+            .or_else(dirs::data_dir)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("MeterForge")
+            .join("data");
+
         Self {
-            db_path: "./data/meters.db".to_string(),
+            db_path: data_dir.join("meters.db").to_string_lossy().into_owned(),
             batch_max_size: 200,
             batch_timeout_ms: 1000, // 1秒超时
             max_connections: 4,
