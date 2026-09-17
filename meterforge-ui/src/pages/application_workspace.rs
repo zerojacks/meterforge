@@ -3,8 +3,8 @@ use super::MeterListView;
 use crate::components::AppTitleBar;
 use crate::settings::ConnectionConfigView;
 use crate::state::{GlobalConnectionStatus, GlobalMeterRegistry, MeterState};
-use gpui::*;
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::*;
 
 pub struct ApplicationWorkspace {
     meter_workspace: Entity<MeterListView>,

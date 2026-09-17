@@ -5,16 +5,16 @@ use crate::backend::AppBackend;
 use crate::components::MeterCard;
 use crate::settings::parameter_dialogs::{AddMeterView, ModifyAddressView};
 use crate::state::{GlobalMeterRegistry, MeterState};
-use gpui::prelude::FluentBuilder as _;
-use gpui::*;
-use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::label::Label;
-use gpui_component::notification::Notification;
-use gpui_component::dialog::DialogButtonProps;
-use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::*;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::dialog::DialogButtonProps;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::*;
 use std::collections::HashSet;
 
 /// 电表列表面板顶部"批量清除"入口区分的两种历史数据类型。

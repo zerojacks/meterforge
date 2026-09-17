@@ -5,9 +5,9 @@
 //! 负责“一条记录长什么样”，不关心分页/虚拟化。
 
 use chrono::Utc;
-use gpui::*;
-use gpui_component::StyledExt;
-use gpui_component::{h_flex, label::Label, Theme};
+use gpui_kit::*;
+use gpui_kit::component::StyledExt;
+use gpui_kit::component::{h_flex, label::Label, Theme};
 use meter_core::snapshot::{EventSnapshot, FreezeSnapshotSummary, LoadRecordSnapshot};
 /// 冻结触发类型筛选（对应协议 DI2 的几大类），用于“冻结数据”tab 的筛选条。
 ///

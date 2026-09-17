@@ -1,6 +1,6 @@
-//! 本地静态资源:优先加载 meter-ui 内置资源,再回退到 gpui-component 资源。
+//! 本地静态资源:优先加载 meter-ui 内置资源,再回退到 gpui-kit 资源。
 
-use gpui::{AssetSource, Result, SharedString};
+use gpui_kit::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
 /// 内置的自定义图标,路径需以 `icons/` 开头供 `Icon::path` 使用。
@@ -22,11 +22,11 @@ impl AssetSource for Assets {
         if let Some((_, data)) = LOCAL_ASSETS.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(data)));
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_kit::assets::Assets.load(path)
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut entries = gpui_component_assets::Assets.list(path)?;
+        let mut entries = gpui_kit::assets::Assets.list(path)?;
         entries.extend(
             LOCAL_ASSETS
                 .iter()

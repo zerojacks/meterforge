@@ -3,18 +3,18 @@
 use crate::backend::AppBackend;
 use crate::components::SettingsTitleBar;
 use crate::state::GlobalConnectionStatus;
-use gpui::prelude::FluentBuilder;
-use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::input::{Input, InputState};
-use gpui_component::label::Label;
-use gpui_component::notification::Notification;
-use gpui_component::resizable::{h_resizable, resizable_panel};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
-use gpui_component::spinner::Spinner;
-use gpui_component::*;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::sidebar::{Sidebar, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::*;
 use meter_core::{
     ConnectionCommand, ConnectionResult, ConnectionStatus, SerialDataBits, SerialParity,
     SerialSettings, SerialStopBits,

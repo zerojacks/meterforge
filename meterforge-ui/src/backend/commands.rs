@@ -1,4 +1,4 @@
-use gpui::*;
+use gpui_kit::*;
 use meter_core::actor::{
     address_to_string, string_to_address, AdminCommand, MeterActor, MeterActorConfig,
     MeterActorHandle, MeterRegistry, TickMsg,

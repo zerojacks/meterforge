@@ -3,7 +3,7 @@ use crate::{
     state::{MeterRegistry, MeterState, UI_TICK_INTERVAL},
     types::MeterSnapshot,
 };
-use gpui::*;
+use gpui_kit::*;
 use meter_core::{
     actor::{
         string_to_address, MeterActor, MeterActorConfig, MeterActorHandle,

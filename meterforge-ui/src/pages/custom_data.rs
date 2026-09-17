@@ -1,7 +1,7 @@
 use super::meter_detail::MeterDetailView;
-use gpui::*;
-use gpui_component::input::Input;
-use gpui_component::{
+use gpui_kit::*;
+use gpui_kit::component::input::Input;
+use gpui_kit::component::{
     button::{Button, ButtonVariant, ButtonVariants},
     dialog::DialogButtonProps,
     label::Label,

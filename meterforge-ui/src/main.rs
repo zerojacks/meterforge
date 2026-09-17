@@ -17,8 +17,8 @@ mod types;
 
 use assets::Assets;
 
-use gpui::*;
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::*;
 use pages::ApplicationWorkspace;
 use parking_lot::RwLock;
 use state::{ConnectionStatusStore, GlobalConnectionStatus, GlobalMeterRegistry, MeterRegistry};
@@ -28,10 +28,10 @@ fn main() {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    let app = gpui_platform::application().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(Assets);
 
     app.run(move |cx| {
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
 
         let meter_store = Arc::new(RwLock::new(MeterRegistry::new()));
         cx.set_global(GlobalMeterRegistry(meter_store.clone()));

@@ -1,7 +1,7 @@
 // UI 状态管理 - 被动接收 meter-core 推送的数据更新
 
 use crate::types::MeterSnapshot;
-use gpui::*;
+use gpui_kit::*;
 use meter_core::ConnectionStatus;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};

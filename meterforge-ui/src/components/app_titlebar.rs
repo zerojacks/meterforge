@@ -1,10 +1,11 @@
 // 顶部状态栏：保持与监控工作台一致的紧凑信息密度。
 
-use gpui::prelude::FluentBuilder;
-use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::label::Label;
-use gpui_component::*;
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::*;
+use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use meter_core::ConnectionStatus;
 use std::rc::Rc;
 

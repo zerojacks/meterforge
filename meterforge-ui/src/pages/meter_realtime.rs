@@ -1,9 +1,9 @@
 //! 实时数据展示区域，仅消费快照，不包含命令或窗口状态。
 use crate::state::RealtimeSample;
 use crate::types::MeterSnapshot;
-use gpui::*;
-use gpui_component::chart::AreaChart;
-use gpui_component::{label::Label, *};
+use gpui_kit::*;
+use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::{label::Label, *};
 use std::collections::VecDeque;
 
 fn metric(

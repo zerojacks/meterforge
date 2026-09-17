@@ -7,10 +7,10 @@ use crate::{
     types::MeterSnapshot,
 };
 use chrono::{Datelike, Timelike, Utc};
-use gpui::*;
-use gpui_component::input::{InputState};
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::{
+use gpui_kit::*;
+use gpui_kit::component::input::{InputState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::{
     badge::Badge,
     button::{Button, ButtonVariant, ButtonVariants},
     dialog::DialogButtonProps,
@@ -27,7 +27,7 @@ use crate::settings::parameter_dialogs::{
     TouConfigDialog,
 };
 use crate::settings::SimulationConfigPanel;
-use gpui_component::notification::Notification;
+use gpui_kit::component::notification::Notification;
 use meter_core::communication_log::BROADCAST_ADDRESS;
 use meter_core::protocol::format::parse_address;
 use meter_core::snapshot::{EventSnapshot, FreezeSnapshotSummary, LoadRecordSnapshot};

@@ -1,9 +1,9 @@
 // 左侧表列表中的紧凑表项。
 
 use crate::types::MeterSnapshot;
-use gpui::*;
-use gpui_component::label::Label;
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::label::Label;
+use gpui_kit::component::*;
 
 #[derive(IntoElement)]
 pub struct MeterCard {

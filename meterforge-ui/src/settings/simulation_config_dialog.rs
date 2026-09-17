@@ -1,7 +1,7 @@
 //! 仿真与电表参数配置面板：物理引擎参数、冻结、结算日、负荷记录、故障注入。
-use gpui::*;
-use gpui_component::select::{Select, SelectState};
-use gpui_component::{
+use gpui_kit::*;
+use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::{
     button::{Button, ButtonVariants},
     dialog::DialogButtonProps,
     form::field,
@@ -10,7 +10,7 @@ use gpui_component::{
     label::Label,
     *,
 };
-use gpui_component::WindowExt;
+use gpui_kit::component::WindowExt;
 use meter_core::simulation::{LoadModelConfig, LoadProfile, SimulationConfig};
 use meter_core::snapshot::SimulationSnapshot;
 

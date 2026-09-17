@@ -2,8 +2,8 @@
 use super::meter_detail::MeterDetailView;
 use crate::types::MeterSnapshot;
 use chrono::{Datelike, Timelike};
-use gpui::*;
-use gpui_component::{
+use gpui_kit::*;
+use gpui_kit::component::{
     badge::Badge,
     button::{Button, ButtonVariants},
     group_box::{GroupBox, GroupBoxVariants as _},

@@ -31,9 +31,8 @@ gpui_macros = { git = "https://github.com/zed-industries/zed" }
 # Linux 运行时至少需要一个窗口后端；同时启用 X11/Wayland，兼容不同桌面环境。
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["x11", "wayland"] }
 
-# gpui-component 组件库
-gpui-component = { git = "https://github.com/longbridge/gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
+# gpui-kit 组件库（包含 gpui-component 和 assets）
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit" }
 
 # 报文解析：完整帧解析（链路层 + 应用层），内部经 spec-engine 解析数据项内容
 # 来自独立仓库 protocol-parser；git 依赖必须写仓库根 URL，

@@ -3,15 +3,15 @@
 
 use crate::components::SettingsTitleBar;
 use chrono::{Datelike, TimeZone, Timelike, Utc};
-use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::form::{field, v_form};
-use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::label::Label;
-use gpui_component::notification::Notification;
-use gpui_component::scroll::ScrollableElement;
-use gpui_component::select::{Select, SelectState};
-use gpui_component::*;
+use gpui_kit::*;
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::form::{field, v_form};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::label::Label;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::*;
 // ============================================================================
 // 时间设置对话框
 // ============================================================================

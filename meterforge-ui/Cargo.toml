@@ -25,9 +25,8 @@ gpui.workspace = true
 gpui_macros.workspace = true
 gpui_platform.workspace = true
 
-# gpui-component
-gpui-component.workspace = true
-gpui-component-assets.workspace = true
+# gpui-kit (包含 gpui-component 和 assets)
+gpui-kit.workspace = true
 
 # 并发原语
 parking_lot = "0.12"
